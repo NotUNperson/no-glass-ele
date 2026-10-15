@@ -433,26 +433,44 @@ class TaskRunner:
         s["log"].add("[ui] 注入器已结束。目标应用不受影响。")
         return {"ok": True, "graceful": False}
 
+    def stop_task_only(self):
+        """
+        只停「短任务」（probe / build / doctor），**绝不碰任何注入会话**。
+
+        为什么单独拆出来：界面上的「停止」按钮原来是转调 stop()，而它会
+        在「当前应用没有会话」时顺手停掉字典里第一个活会话 —— 那是个与
+        用户意图无关的会话。现在按钮语义明确为"停当前应用"，短任务走这里。
+
+        这里的 taskkill 带 /T：短任务只跑 `node gen.js <子命令>`，不启动
+        目标应用，所以沿进程树杀是安全的（注入会话那条路径才是绝不能 /T，
+        因为应用是注入器 detached 启动的、进程表里仍算它的子进程）。
+        """
+        with self._lock:
+            p = self._task_proc
+        if not p or p.poll() is not None:
+            return False, "当前没有在运行的任务。"
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                               capture_output=True, timeout=10)
+            else:
+                p.terminate()
+        except Exception as e:                           # noqa: BLE001
+            return False, f"停止失败：{e}"
+        return True, ""
+
     def stop(self):
-        """兼容旧调用：停止「任意一个」运行中的注入会话。"""
+        """遗留：停止「任意一个」运行中的注入会话。
+
+        前端已不再调用（它停谁取决于字典插入序，与界面语义无关）。
+        保留是为了兼容可能存在的旧调用方。
+        """
         with self._lock:
             for lid, s in self._sessions.items():
                 if s.get("proc") and s["proc"].poll() is None:
                     return self.stop_session(lid)
         # 没有注入会话时，若有短任务在跑就结束它
-        with self._lock:
-            p = self._task_proc
-        if p and p.poll() is None:
-            try:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                                   capture_output=True, timeout=10)
-                else:
-                    p.terminate()
-            except Exception as e:                       # noqa: BLE001
-                return False, f"停止失败：{e}"
-            return True, ""
-        return False, "当前没有在运行的任务。"
+        return self.stop_task_only()
 
     def status(self):
         """短任务状态 + 所有注入会话的概要。"""
@@ -1002,7 +1020,7 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     def stop_task(self):
-        ok, err = RUNNER.stop()
+        ok, err = RUNNER.stop_task_only()
         return {"ok": ok, "error": err} if not ok else {"ok": True}
 
     def get_task_status(self):

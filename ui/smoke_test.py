@@ -140,6 +140,212 @@ def run():
             check("会话标签容器存在",
                   win.evaluate_js("!!document.getElementById('sessionTabs')"), True)
 
+            # 15b) 日志隔离：伪造两个会话，来回切，内容应各自独立且完整保留。
+            # 用伪造会话而不是真启动两个应用 —— 这样测试是确定性的、秒级完成，
+            # 且不依赖任何外部程序。
+            iso = win.evaluate_js("""
+              (() => {
+                // 造两个会话 + 各自的缓冲
+                STATE.sessions = [
+                  { key: 'sess:A', profile: 'A', displayName: 'A', running: true, port: 1 },
+                  { key: 'sess:B', profile: 'B', displayName: 'B', running: true, port: 2 },
+                ];
+                STATE.logBuffers['sess:A'] = { lines: ['A-第一行', 'A-第二行'], cursor: 2, scrollTop: null, atBottom: true };
+                STATE.logBuffers['sess:B'] = { lines: ['B-第一行', 'B-第二行', 'B-第三行'], cursor: 3, scrollTop: null, atBottom: true };
+
+                // 切到 A
+                switchSession('sess:A', { silent: true });
+                const textA1 = document.getElementById('log').textContent;
+                // 切到 B
+                switchSession('sess:B', { silent: true });
+                const textB = document.getElementById('log').textContent;
+                // 切回 A —— 历史应完整回来（这正是用户报的 bug）
+                switchSession('sess:A', { silent: true });
+                const textA2 = document.getElementById('log').textContent;
+
+                return JSON.stringify({
+                  a1HasA: textA1.includes('A-第一行') && textA1.includes('A-第二行'),
+                  a1HasB: textA1.includes('B-第一行'),
+                  bHasB: textB.includes('B-第一行') && textB.includes('B-第三行'),
+                  bHasA: textB.includes('A-第一行'),
+                  // 切回来应仍有 A 的两行（旧实现里这里只剩空或新内容）
+                  aBackKeeps: textA2.includes('A-第一行') && textA2.includes('A-第二行'),
+                  bufCount: Object.keys(STATE.logBuffers).length
+                });
+              })()
+            """)
+            try:
+                import json as _json
+                iso_d = _json.loads(iso) if iso else {}
+            except Exception:
+                iso_d = {}
+            check("切标签显示各自内容", iso_d.get("a1HasA") and iso_d.get("bHasB"), True, str(iso_d))
+            check("切标签不串内容", not iso_d.get("a1HasB") and not iso_d.get("bHasA"), True, str(iso_d))
+            check("切回后历史仍在（原 bug）", iso_d.get("aBackKeeps") is True, True, str(iso_d))
+
+            # 15c) 过期响应不污染当前视图：
+            # 模拟"请求发出后用户切走了" —— 过期响应应只充实缓冲、不动 DOM。
+            #
+            # 为什么用"结果写全局变量 + 轮询读"而不是直接求值 async：
+            # pywebview 的 evaluate_js 拿不到 Promise 的解析值（会返回 None），
+            # 那样断言会被静默跳过 —— 测试看起来通过其实没跑。这是本测试自己
+            # 踩过的坑：把异步结果落到 window 上再同步读出来。
+            win.evaluate_js("""
+              (() => {
+                window.__smokeStale = null;
+                // 冻结后台轮询：这两个定时器会调 pruneLogBuffers，
+                // 把下面伪造的会话缓冲清掉，导致断言偶发失败。
+                // 冻结方式就是让 startPolling 的两个回调都提前 return。
+                window.__smokeReadySave = STATE.ready;
+                STATE.ready = false;
+                STATE.sessions = [
+                  { key: 'sess:X', profile: 'X', displayName: 'X', running: true, localId: 'x#1' },
+                  { key: 'sess:Y', profile: 'Y', displayName: 'Y', running: true, localId: 'y#1' },
+                ];
+                STATE.logBuffers = {
+                  'sess:X': { lines: ['X-OLD'], cursor: 1, scrollTop: null, atBottom: true },
+                  'sess:Y': { lines: ['Y-OLD'], cursor: 1, scrollTop: null, atBottom: true },
+                };
+
+                // 造一个"慢"的 api：X 的请求挂 50ms 才返回
+                const realApi = window.pywebview.api;
+                const fake = Object.create(realApi);
+                fake.get_session_log = (localId) =>
+                  new Promise((res) => setTimeout(() => res({
+                    ok: true, live: true, cursor: 99,
+                    lines: [localId === 'x#1' ? 'X-LATE' : 'Y-LATE'],
+                  }), 50));
+                window.pywebview.api = fake;
+
+                (async () => {
+                  STATE.activeSession = 'sess:X';
+                  const p = pollSessionLog();          // 请求 X（慢）
+                  switchSession('sess:Y', { silent: true });  // 还没回来就切到 Y
+                  await p;
+                  await new Promise((r) => setTimeout(r, 150));
+                  window.pywebview.api = realApi;
+                  STATE.ready = window.__smokeReadySave;   // 解冻
+                  const dom = document.getElementById('log').textContent;
+                  window.__smokeStale = JSON.stringify({
+                    domHasY: dom.includes('Y-OLD'),
+                    domHasXLate: dom.includes('X-LATE'),
+                    xBufHasLate: (STATE.logBuffers['sess:X']?.lines || []).includes('X-LATE'),
+                  });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(40):     # 最多等 4 秒
+                if win.evaluate_js("window.__smokeStale"):
+                    break
+                time.sleep(0.1)
+            raw_stale = win.evaluate_js("window.__smokeStale")
+            try:
+                import json as _json2
+                stale_d = _json2.loads(raw_stale) if raw_stale else {}
+            except Exception:
+                stale_d = {}
+            check("过期响应不污染 DOM（竞态）",
+                  stale_d.get("domHasXLate") is False, True, str(stale_d) or "未拿到结果")
+            check("过期响应仍进各自缓冲",
+                  stale_d.get("xBufHasLate") is True, True, str(stale_d) or "未拿到结果")
+
+            # 15d) 停止语义：当前应用无会话时，不该误停别的应用的会话。
+            win.evaluate_js("""
+              (() => {
+                window.__smokeStop = null;
+                // 同样冻结后台轮询：它会用真实数据覆盖下面伪造的 STATE.sessions
+                window.__smokeReadySave2 = STATE.ready;
+                STATE.ready = false;
+                const realApi = window.pywebview.api;
+                const calls = [];
+                const fake = Object.create(realApi);
+                fake.stop_session = (lid, sid, pid) => {
+                  calls.push(['session', lid, sid, pid]);
+                  return Promise.resolve({ ok: true });
+                };
+                fake.stop_task = () => { calls.push(['task']); return Promise.resolve({ ok: true }); };
+                window.pywebview.api = fake;
+
+                // 场景：左侧选中 A，但只有 B 在跑
+                STATE.current = 'A';
+                STATE.taskRunning = false;
+                STATE.sessions = [{ key: 'sess:B', profile: 'B', running: true, localId: 'b#1' }];
+
+                (async () => {
+                  await stopTask();
+                  window.pywebview.api = realApi;
+                  STATE.ready = window.__smokeReadySave2;
+                  window.__smokeStop = JSON.stringify({
+                    calls,
+                    stoppedB: calls.some((c) => c[1] === 'b#1'),
+                  });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(30):
+                if win.evaluate_js("window.__smokeStop"):
+                    break
+                time.sleep(0.1)
+            raw_stop = win.evaluate_js("window.__smokeStop")
+            try:
+                import json as _json3
+                stop_d = _json3.loads(raw_stop) if raw_stop else {}
+            except Exception:
+                stop_d = {}
+            check("停止不误伤其他应用（语义）",
+                  stop_d.get("stoppedB") is False, True, str(stop_d) or "未拿到结果")
+
+            # 15e) 停止语义：当前应用**有**会话时，应精确停它。
+            win.evaluate_js("""
+              (() => {
+                window.__smokeStop2 = null;
+                window.__smokeReadySave3 = STATE.ready;
+                STATE.ready = false;
+                const realApi = window.pywebview.api;
+                const calls = [];
+                const fake = Object.create(realApi);
+                fake.stop_session = (lid, sid, pid) => {
+                  calls.push([lid, sid, pid]);
+                  return Promise.resolve({ ok: true });
+                };
+                window.pywebview.api = fake;
+
+                STATE.current = 'A';
+                STATE.taskRunning = false;
+                STATE.sessions = [
+                  { key: 'sess:A', profile: 'A', running: true, localId: 'a#1' },
+                  { key: 'sess:B', profile: 'B', running: true, localId: 'b#1' },
+                ];
+
+                (async () => {
+                  await stopTask();
+                  window.pywebview.api = realApi;
+                  STATE.ready = window.__smokeReadySave3;
+                  window.__smokeStop2 = JSON.stringify({
+                    calls,
+                    stoppedA: calls.some((c) => c[0] === 'a#1'),
+                    stoppedB: calls.some((c) => c[0] === 'b#1'),
+                  });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(30):
+                if win.evaluate_js("window.__smokeStop2"):
+                    break
+                time.sleep(0.1)
+            raw_stop2 = win.evaluate_js("window.__smokeStop2")
+            try:
+                import json as _json4
+                stop2_d = _json4.loads(raw_stop2) if raw_stop2 else {}
+            except Exception:
+                stop2_d = {}
+            check("停止精确命中当前应用",
+                  stop2_d.get("stoppedA") is True and stop2_d.get("stoppedB") is False,
+                  True, str(stop2_d) or "未拿到结果")
+
             # 16) 自定义 CSS 编辑器存在且可写
             win.evaluate_js(
                 "document.getElementById('cssEditor').value = '/* smoke */ .x{color:red}'"

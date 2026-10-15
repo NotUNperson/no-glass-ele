@@ -24,10 +24,20 @@ let STATE = {
   taskRunning: false,
   sessions: [],        // 运行中的注入会话
   activeSession: null, // 当前查看日志的会话 key（localId 或 id）
-  sessionCursors: {},  // key -> 游标（每个会话独立）
+  // 每会话一份日志缓冲：key -> { lines, cursor }
+  //
+  // 为什么把内容存在这里而不是只留在 DOM 里：日志区只有一个 DOM 节点，
+  // 切换会话时若直接清空它，另一个会话已渲染的历史就永久丢了 ——
+  // 而游标还停在上次位置，所以切回来只能拿到"游标之后的新行"，
+  // 表现为"历史不见了、只剩新内容"。
+  logBuffers: {},
   cssDirty: false,
   wizard: null,        // 向导状态
 };
+
+// 每个会话在缓冲里保留的最大行数。与后端 LogBuffer 的上限（app.py 的
+// LOG_LIMIT = 4000）对齐 —— 超出后端的部分本来就取不到，前端留更多没意义。
+const LOG_BUFFER_MAX = 4000;
 
 function toast(msg, kind = '', ms = 3600) {
   const el = document.createElement('div');
@@ -423,10 +433,10 @@ async function launchInjector() {
     return;
   }
   toast('已启动注入器（--watch 常驻）', 'ok');
-  // 立刻切到这个会话的日志
-  if (res.localId) STATE.activeSession = res.localId;
+  // 立刻切到这个会话的日志（走唯一入口，保证内容与标题同步）
   await refresh();
   await updateTaskUI();
+  if (res.localId) switchSession(res.localId);
 }
 
 async function stopSession(key) {
@@ -447,13 +457,32 @@ async function stopSession(key) {
   await updateTaskUI();
 }
 
+/**
+ * 「启动注入」卡片里的停止按钮。
+ *
+ * 语义：停**左侧当前选中应用**的注入会话 —— 与这个按钮的禁用条件
+ * （STATE.current 有没有运行中的会话）保持一致。
+ *
+ * 以前这里取的是 STATE.activeSession（右侧日志标签），而禁用条件看的却是
+ * STATE.current（左侧选中应用）—— 两个字段毫无同步，于是出现在左侧切到
+ * 应用 A、点停止却停掉了日志标签 B 的情况。
+ */
 async function stopTask() {
-  // 旧的「停止」按钮：停当前选中的会话，没有就停任意一个
-  const key = STATE.activeSession;
-  if (key) return stopSession(key);
-  const running = STATE.sessions.find((s) => s.running);
-  if (running) return stopSession(running.localId || running.id);
-  toast('没有运行中的注入会话', 'warn');
+  const cur = STATE.current;
+  if (cur) {
+    const mine = STATE.sessions.find((s) => s.key && s.profile === cur && s.running);
+    if (mine) return stopSession(mine.key);
+  }
+  // 当前应用没有注入会话时，才考虑停短任务（probe / build / doctor）
+  if (STATE.taskRunning) {
+    const res = await api().stop_task();
+    if (!res) { toast('界面桥未就绪', 'err'); return; }
+    if (res.ok === false) { toast(res.error || '停止失败', 'err', 5000); return; }
+    toast('已请求停止当前任务。', 'ok', 4000);
+    await updateTaskUI();
+    return;
+  }
+  toast(cur ? `「${cur}」没有运行中的注入。` : '没有运行中的注入会话', 'warn');
 }
 
 async function updateTaskUI() {
@@ -469,6 +498,9 @@ async function updateTaskUI() {
     if (sr && sr.ok) sess = sr.sessions || [];
   } catch (_) { /* 忽略 */ }
   STATE.sessions = sess;
+
+  // 清掉已消失会话的日志缓冲（当前查看的那个会保留，便于回看结束后的输出）
+  pruneLogBuffers(sess.map((s) => s.key).filter(Boolean));
 
   renderSessionTabs();
 
@@ -496,12 +528,16 @@ function renderSessionTabs() {
   // 只显示有 key 的（后端保证非空；这里再兜一层，防御脏数据）
   const live = STATE.sessions.filter((s) => s.key);
 
-  // 若当前查看的会话没了，回退到第一个
+  // 若当前查看的会话没了，回退到第一个。
+  // 注意：这里**不直接改 STATE.activeSession** —— 切换要连带把 DOM 换成
+  // 新会话的缓冲内容，所以统一走 switchSession()，避免出现"标题变了、
+  // 内容还是上一个会话的"这种半切换状态。
   const keys = live.map((s) => s.key);
-  if (STATE.activeSession && !keys.includes(STATE.activeSession)) {
-    STATE.activeSession = keys[0] || null;
+  const wanted = keys.includes(STATE.activeSession) ? STATE.activeSession : (keys[0] || null);
+  if (wanted !== STATE.activeSession) {
+    // 延到本次渲染之后（本函数还会被 switchSession 反过来调用，直接调会递归）
+    setTimeout(() => switchSession(wanted, { silent: true }), 0);
   }
-  if (!STATE.activeSession && keys.length) STATE.activeSession = keys[0];
 
   box.innerHTML = live.map((s) => {
     const key = s.key;
@@ -524,11 +560,7 @@ function renderSessionTabs() {
       const k = el.dataset.key;
       if (!k) return;                      // 没有 key 就不切（不该发生）
       if (STATE.activeSession === k) return;  // 重复点同一个：不重绘，避免闪
-      STATE.activeSession = k;
-      $('log').innerHTML = '';
-      $('logTitle').textContent = '输出 · 加载中…';
-      renderSessionTabs();
-      pollSessionLog();
+      switchSession(k);
     };
   });
   // 停止按钮
@@ -546,8 +578,96 @@ function renderSessionTabs() {
 }
 
 /**
+ * 切换当前查看的会话 —— **唯一入口**。
+ *
+ * 为什么必须收敛成一个函数：日志区只有一个 DOM 节点，而切换涉及三件事
+ * 必须一起发生（换 activeSession、换 DOM 内容、恢复滚动位置）。
+ * 以前分散在标签点击、渲染回退、启动成功三处各写一半，于是出现
+ * "标题是新会话、内容还是旧会话"的半切换状态。
+ *
+ * 内容从 STATE.logBuffers 取 —— 每个会话各自留了一份，所以切回来能
+ * 立刻看到完整历史（包括切走期间攒下的输出，因为轮询一直在充实缓冲）。
+ */
+function switchSession(key, opts = {}) {
+  const prev = STATE.activeSession;
+
+  // 离开旧会话前，把滚动位置记下来，切回来能回到原处
+  if (prev && prev !== key) {
+    const b = STATE.logBuffers[prev];
+    if (b) {
+      const box = $('log');
+      b.scrollTop = box.scrollTop;
+      b.atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    }
+  }
+
+  STATE.activeSession = key || null;
+  renderLogFromBuffer();
+
+  if (!opts.silent) {
+    renderSessionTabs();
+    // 立即拉一次，不用等下一个 300ms 周期
+    pollSessionLog().catch(() => { /* 忽略 */ });
+  }
+}
+
+/** 把当前会话（或短任务）的缓冲内容整体渲染到日志区。 */
+function renderLogFromBuffer() {
+  const box = $('log');
+  const key = STATE.activeSession;
+
+  if (!key) {
+    // 没有会话：短任务日志走 appendLog 那条路，这里不清（避免把正在看的清掉）
+    return;
+  }
+
+  const b = STATE.logBuffers[key];
+  const follow = $('optFollow').checked;
+  const atBottom = b ? b.atBottom : true;
+
+  if (!b || !b.lines.length) {
+    // 缓冲还没建（刚切过来、首轮还没回来）——给提示而不是空白
+    const sess = STATE.sessions.find((x) => x.key === key);
+    box.innerHTML = sess
+      ? '<span class="l-dim">（加载中…）</span>'
+      : '<span class="l-dim">（该会话已结束）</span>';
+    return;
+  }
+
+  box.innerHTML = b.lines
+    .map((l) => `<span class="${classify(l)}">${esc(l)}</span>`).join('\n');
+
+  if (follow && atBottom) box.scrollTop = box.scrollHeight;
+  else if (b.scrollTop != null) box.scrollTop = b.scrollTop;
+}
+
+/** 取（或创建）某会话的日志缓冲。 */
+function bufferFor(key) {
+  if (!STATE.logBuffers[key]) STATE.logBuffers[key] = { lines: [], cursor: 0, scrollTop: null, atBottom: true };
+  return STATE.logBuffers[key];
+}
+
+/**
+ * 丢弃已消失会话的缓冲，但**保留当前查看的那个**。
+ *
+ * 为什么要留当前这个：会话结束后你往往还想回头看一眼它的输出
+ * （比如注入为什么失败）。一结束就清掉，标签虽然还在（dead 态）却空了。
+ */
+function pruneLogBuffers(liveKeys) {
+  const keep = new Set(liveKeys);
+  if (STATE.activeSession) keep.add(STATE.activeSession);
+  for (const k of Object.keys(STATE.logBuffers)) {
+    if (!keep.has(k)) delete STATE.logBuffers[k];
+  }
+}
+
+/**
  * 轮询当前选中会话的日志。
- * 每个会话有独立游标，所以切标签不会互相污染。
+ *
+ * 关键约定（修"日志混在一起"）：请求发出前把 key 快照下来，
+ * 回来时若 activeSession 已经变了，就**只充实那个会话的缓冲、不碰 DOM**。
+ * 之前没有这个检查，两个会话的响应会先后落进同一个 DOM 节点，
+ * 日志就混在一起了。
  */
 async function pollSessionLog() {
   const key = STATE.activeSession;
@@ -557,44 +677,63 @@ async function pollSessionLog() {
   }
   const s = STATE.sessions.find((x) => x.key === key);
   if (!s) {
-    // 会话可能刚好消失了 —— 不要静默留空白，给一句提示
-    const box = $('log');
-    if (!box.textContent.trim()) {
-      box.innerHTML = '<span class="l-dim">（该会话已结束）</span>';
+    const b = STATE.logBuffers[key];
+    if (!b || !b.lines.length) {
+      const box = $('log');
+      if (!box.textContent.trim()) box.innerHTML = '<span class="l-dim">（该会话已结束）</span>';
     }
     return;
   }
 
-  const cursor = STATE.sessionCursors[key] || 0;
+  const buf = bufferFor(key);
   const res = await api().get_session_log(
-    s.localId || null, s.id || null, cursor, s.pid || null
+    s.localId || null, s.id || null, buf.cursor, s.pid || null
   );
   if (!res || res.ok === false) {
     // 后端明确报错时也要让用户看见，而不是留一片空白
-    const box = $('log');
-    if (!box.textContent.trim()) {
-      box.innerHTML = `<span class="l-err">（读日志失败：${esc((res && res.error) || '未知错误')}）</span>`;
+    if (key === STATE.activeSession) {
+      const box = $('log');
+      if (!box.textContent.trim()) {
+        box.innerHTML = `<span class="l-err">（读日志失败：${esc((res && res.error) || '未知错误')}）</span>`;
+      }
     }
     return;
   }
 
+  // 先把结果写进**它自己的**缓冲（无论现在看的是不是它）
   if (res.live) {
-    STATE.sessionCursors[key] = res.cursor;
-    appendLog(res.lines || []);
-    if (!res.lines.length && !$('log').textContent.trim()) {
-      $('log').innerHTML = '<span class="l-dim">（该会话暂无输出）</span>';
+    buf.cursor = res.cursor;
+    if (res.lines && res.lines.length) {
+      buf.lines.push(...res.lines);
+      if (buf.lines.length > LOG_BUFFER_MAX) {
+        buf.lines.splice(0, buf.lines.length - LOG_BUFFER_MAX);
+      }
     }
   } else {
-    // 外部会话：整段返回，直接替换显示（避免重复追加）
-    const box = $('log');
+    // 外部会话：后端每次整段返回（游标恒为 0），所以整体替换而不是追加
     if (res.lines && res.lines.length) {
-      const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-      box.innerHTML = res.lines
-        .map((l) => `<span class="${classify(l)}">${esc(l)}</span>`).join('\n');
-      if ($('optFollow').checked && atBottom) box.scrollTop = box.scrollHeight;
-    } else if (!box.textContent.trim()) {
-      box.innerHTML = `<span class="l-dim">（${esc(res.note || '该会话没有日志')}）</span>`;
+      buf.lines = res.lines.slice(-LOG_BUFFER_MAX);
+    } else if (res.note && !buf.lines.length) {
+      buf.lines = [res.note];
     }
+    buf.cursor = res.cursor || 0;
+  }
+
+  // 只有"回来时看的还是它"才动 DOM —— 过期响应只充实缓冲
+  if (key !== STATE.activeSession) return;
+
+  const box = $('log');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+
+  if (res.live) {
+    // 增量追加（比整体重渲染便宜，长日志时不卡）
+    if (res.lines && res.lines.length) {
+      appendLog(res.lines, atBottom);
+    } else if (!buf.lines.length && !box.textContent.trim()) {
+      box.innerHTML = '<span class="l-dim">（该会话暂无输出）</span>';
+    }
+  } else {
+    renderLogFromBuffer();
   }
 }
 
@@ -619,18 +758,31 @@ function classify(line) {
   return '';
 }
 
-function appendLog(lines) {
-  if (!lines.length) return;
+/**
+ * 把新行追加到日志区，并维护滚动。
+ *
+ * 注意：这里**不写缓冲** —— 缓冲由 pollSessionLog 负责（它得先判定
+ * "这条响应属于哪个会话"，再决定是否动 DOM）。本函数只管显示。
+ *
+ * @param lines    要追加的行
+ * @param atBottom 追加前是否已经在底部（不在底部时不要抢用户的滚动位置）
+ */
+function appendLog(lines, atBottom) {
+  if (!lines || !lines.length) return;
   const box = $('log');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const wasAtBottom = atBottom !== undefined
+    ? atBottom
+    : (box.scrollHeight - box.scrollTop - box.clientHeight < 40);
   const html = lines.map((l) => `<span class="${classify(l)}">${esc(l)}</span>`).join('\n');
   box.insertAdjacentHTML('beforeend', (box.textContent ? '\n' : '') + html);
 
-  // 限制 DOM 节点数，避免长时间运行后卡顿
-  if (box.childNodes.length > 6000) {
+  // 限制 DOM 节点数，避免长时间运行后卡顿。
+  // 缓冲里另有一份同样的上限（LOG_BUFFER_MAX），切换会话时会整体重建 DOM，
+  // 所以这里多删一点不会丢内容。
+  if (box.childNodes.length > LOG_BUFFER_MAX + 2000) {
     for (let i = 0; i < 1500; i++) box.removeChild(box.firstChild);
   }
-  if ($('optFollow').checked && atBottom) box.scrollTop = box.scrollHeight;
+  if ($('optFollow').checked && wasAtBottom) box.scrollTop = box.scrollHeight;
 }
 
 async function pollLogs() {
@@ -990,8 +1142,11 @@ function bindUI() {
   $('btnClearLog').onclick = async () => {
     const key = STATE.activeSession;
     if (key) {
-      STATE.sessionCursors[key] = 0;
-      $('log').innerHTML = '';
+      // 只清当前会话的缓冲（其他会话的历史不该被连带清掉）
+      STATE.logBuffers[key] = { lines: [], cursor: 0, scrollTop: null, atBottom: true };
+      $('log').innerHTML = '<span class="l-dim">（已清空显示；新输出会继续出现）</span>';
+      // 注意：不清后端缓冲 —— 它通过 get_session_log 的游标取增量，
+      // 把前端游标归零反而会把旧内容重新拉回来（后端 _seq 只增不减）。
       await pollSessionLog();
     } else {
       const res = await api().clear_logs();
