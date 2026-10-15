@@ -3,12 +3,18 @@
  * 深色主题质量审计：找出所有仍然偏亮的元素（不限大小）+ 文字对比度不足的地方。
  * 只读。
  *
- * 用法：node tools/audit-dark.js <port> [最小面积，默认 0]
+ * 用法：
+ *   node tools/audit-dark.js <端口> [最小面积] [url关键词]
+ *
+ * url 关键词用于指定要审的窗口 —— 应用有多个独立窗口
+ * （悬浮番茄钟 /floating/tomato、编辑窗口 /todo-edit-window、小组件 widget.html），
+ * 默认只审第一个。加关键词可以指定。
  */
 const http = require('http');
 
 const PORT = Number(process.argv[2] || 9343);
 const MIN_AREA = Number(process.argv[3] || 0);
+const URL_KW = process.argv[4] || null;
 
 function get(url) {
   return new Promise((resolve, reject) => {
@@ -41,7 +47,18 @@ class CDP {
 
 (async () => {
   const list = JSON.parse(await get(`http://127.0.0.1:${PORT}/json/list`));
-  const page = list.find((t) => t.type === 'page');
+  const pages = list.filter((t) => t.type === 'page');
+  let page;
+  if (URL_KW) {
+    page = pages.find((t) => String(t.url).includes(URL_KW));
+    if (!page) {
+      console.log(`没有匹配 "${URL_KW}" 的页面。现有页面：`);
+      for (const t of pages) console.log('  -', t.url);
+      process.exit(1);
+    }
+  } else {
+    page = pages[0];
+  }
   if (!page) { console.log('没有页面'); process.exit(1); }
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);

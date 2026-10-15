@@ -123,6 +123,28 @@ for (const f of files) {
 }
 fs.closeSync(fd);
 
+// ── 追加：运行时采集到的类名 ──
+//
+// 为什么需要这一步（重要）：
+//   只从 CSS 文件提取有一个盲区 —— **Vue 运行时注入的 scoped 样式**。
+//   实测：悬浮番茄钟的 `.tomato[data-v-45545968] { background:#fff }`
+//   不在任何 .css 文件里，是组件挂载时动态插 <style> 的。
+//   只扫文件必然漏掉它（实测漏了一个 4750px² 的白块）。
+//
+// 采集方式：tools/harvest-selectors.js 在运行中的应用上读计算样式，
+// 输出类名清单，存到 tools/harvested-selectors.json。
+const HARVEST = path.join(__dirname, 'harvested-selectors.json');
+let harvested = { lightBg: [], darkText: [] };
+if (fs.existsSync(HARVEST)) {
+  try {
+    harvested = JSON.parse(fs.readFileSync(HARVEST, 'utf8'));
+  } catch (e) {
+    console.error(`警告：${HARVEST} 解析失败 — ${e.message}`);
+  }
+}
+const extraBg = new Set(harvested.lightBg || []);
+const extraFg = new Set(harvested.darkText || []);
+
 // ── 把选择器归组：去掉 [data-v-xxx] 与 :hover 等伪类，取"基名" ──
 function baseName(sel) {
   return sel
@@ -185,11 +207,13 @@ function prefixOf(sel) {
   // 按 BEM 分隔切：todo-list-item__min -> [todo, list, item]
   const segs = cls.split(/__|--|-/).filter(Boolean);
   if (!segs.length) return null;
-  // 单段前缀太泛（如 .tag / .card），要求至少两段
-  if (segs.length === 1) return null;
   // 注意：返回**不带点**的类名前缀 —— [class*="..."] 匹配的是 class 属性
   // 的字面内容，属性里没有点号。带点会永远匹配不到（早期版本的 bug）。
-  return segs.slice(0, 2).join('-');
+  //
+  // 单段类名（如 .tomato / .tag / .card）也要收 ——
+  // 早期版本跳过它们，结果漏掉了悬浮番茄钟的 .tomato（实测是个 4750px² 白块）。
+  // 单段虽然泛，但配合"还原段"可以接受；漏掉则是硬伤。
+  return segs.join('-');
 }
 
 const bgPrefixes = new Map();   // prefix -> count
@@ -208,6 +232,14 @@ const bgList = [...bgPrefixes.entries()].filter(([, n]) => n >= 2)
   .sort((a, b) => b[1] - a[1]).map(([p]) => p);
 const fgList = [...fgPrefixes.entries()].filter(([, n]) => n >= 2)
   .sort((a, b) => b[1] - a[1]).map(([p]) => p);
+
+// 运行时采集的类名直接并入。
+//
+// 注意：这里用**精确类选择器**（.tomato），不是前缀通配（[class*="tomato"]）。
+// 因为采集到的就是确切的类名，用通配会过度命中 ——
+// 例如采集到 "tip" 时，[class*="tip"] 会连 tooltip / multiselect__tip 一起压掉。
+const bgExact = [...extraBg].sort();
+const fgExact = [...extraFg].sort();
 
 const chunk = (arr, n) => {
   const out = [];
@@ -243,6 +275,27 @@ for (const c of chunk(fgList, 6)) {
   L.push('  color: var(--t-text) !important;');
   L.push('}');
   L.push('');
+}
+
+// ── 运行时采集到的（精确选择器）──
+if (bgExact.length || fgExact.length) {
+  L.push('/* ── 运行时采集到的类名（精确匹配）──────────────────────────────');
+  L.push('   来源：tools/harvest-selectors.js 在运行中的应用上读计算样式。');
+  L.push('   必要性：Vue 运行时注入的 scoped 样式不在任何 .css 文件里，');
+  L.push('   只扫文件会漏（实测漏过悬浮番茄钟的 .tomato 白块）。');
+  L.push('   ────────────────────────────────────────────────────────────── */');
+  if (bgExact.length) {
+    L.push(bgExact.map((c) => `.${c}`).join(',\n') + ' {');
+    L.push('  background-color: var(--t-bg-soft) !important;');
+    L.push('}');
+    L.push('');
+  }
+  if (fgExact.length) {
+    L.push(fgExact.map((c) => `.${c}`).join(',\n') + ' {');
+    L.push('  color: var(--t-text) !important;');
+    L.push('}');
+    L.push('');
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════
