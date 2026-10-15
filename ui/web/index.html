@@ -19,6 +19,7 @@
     <span class="sub" id="rootPath">…</span>
   </div>
   <div class="topbar-actions">
+    <button class="theme-btn" id="btnTheme" title="切换界面主题（跟随系统 / 深色 / 浅色）">主题：跟随系统</button>
     <span class="badge" id="nodeBadge" title="Node 是否可用">node ?</span>
     <span class="badge" id="taskBadge" title="当前任务状态">空闲</span>
     <button class="btn ghost" id="btnRefresh" title="重新读取 profiles">刷新</button>
@@ -75,7 +76,20 @@
           <label class="check"><input type="checkbox" id="optIsolate"> 隔离实例（不影响正在运行的）</label>
         </div>
         <div class="row">
-          <input class="input" id="optExtra" placeholder="额外参数（可选），如 --port 9500">
+          <label class="check">
+            <select id="optEmulate" class="select-inline">
+              <option value="">配色：不模拟</option>
+              <option value="dark">模拟深色</option>
+              <option value="light">模拟浅色</option>
+            </select>
+          </label>
+          <span class="dim tiny">只对已写 prefers-color-scheme 的应用有效</span>
+        </div>
+        <div class="row">
+          <input class="input" id="optAppArgs" placeholder="传给应用的参数（可选），如 --disable-lcd-text">
+        </div>
+        <div class="row">
+          <input class="input" id="optExtra" placeholder="传给注入器的额外参数（可选），如 --port 9500">
         </div>
         <div class="row">
           <button class="btn primary" id="btnLaunch">启动（--launch --watch）</button>
@@ -86,6 +100,24 @@
           <strong>不会被关掉</strong>。
         </p>
         <div class="presets" id="dPresets"></div>
+      </div>
+
+      <!-- 自定义 CSS -->
+      <div class="card">
+        <h3>自定义样式片段
+          <span class="dim tiny" id="cssPathHint"></span>
+        </h3>
+        <p class="hint" style="margin-top:0">
+          追加在内置样式表之后，用于给应用补它没有的样式（如深色模式）。
+          保存后<strong>注入器会自动重新注入</strong>，不用重启应用。
+        </p>
+        <textarea class="css-editor" id="cssEditor"
+                  placeholder="/* 例：&#10;body, .app { background: #1e1e1e !important; color: #ddd !important; }&#10;*/"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary" id="btnSaveCss">保存并重新注入</button>
+          <button class="btn ghost" id="btnReloadCss">重新读取</button>
+          <span class="dim tiny" id="cssStatus"></span>
+        </div>
       </div>
 
       <!-- 编辑 -->
@@ -103,10 +135,17 @@
     </div>
   </section>
 
-  <!-- 右：日志 -->
+  <!-- 右：会话 + 日志 -->
   <aside class="pane pane-log">
     <div class="pane-head">
-      <h2>输出</h2>
+      <h2>会话</h2>
+      <div class="pane-head-actions">
+        <button class="btn ghost small" id="btnPrune" title="清理已退出会话的残留">清理</button>
+      </div>
+    </div>
+    <div class="session-tabs" id="sessionTabs"></div>
+    <div class="pane-head log-head">
+      <h2 id="logTitle">输出</h2>
       <div class="pane-head-actions">
         <label class="check tiny"><input type="checkbox" id="optFollow" checked> 跟随</label>
         <button class="btn ghost small" id="btnClearLog">清空</button>

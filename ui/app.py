@@ -41,6 +41,9 @@ except ImportError:
     print("需要 pywebview。请先安装：pip install pywebview", file=sys.stderr)
     sys.exit(1)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sessions  # noqa: E402  （与 lib/sessions.js 同一套磁盘契约）
+
 
 # ─────────────────────────── 路径与常量 ───────────────────────────
 
@@ -50,6 +53,32 @@ WEB_DIR = UI_DIR / "web"
 GEN_JS = ROOT / "gen.js"
 INJECTOR = ROOT / "injector" / "noglass.js"
 PROFILES_DIR = ROOT / "profiles"
+CSS_DIR = ROOT / "css"
+
+# 隐藏子进程的控制台窗口。
+#
+# 为什么需要：UI 由 pythonw.exe 启动（GUI 子系统，没有控制台），
+# 而 node.exe 是控制台子系统程序。不加这个标志，Windows 会为它
+# **新分配一个控制台窗口** —— 用户会看到一个空终端（输出其实被我们的
+# 管道接走了，所以窗口里什么都没有）。
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# ── overview 缓存 ──
+#
+# get_overview 要跑两次 gen.js（各起一个 node 进程，实测合计约 1.7 秒）。
+# 前端若每次轮询都调，就会持续派生进程。所以加 TTL 缓存：
+# 过期才真跑，其余时候读缓存（会话列表仍实时刷新，因为它读磁盘、很廉价）。
+OVERVIEW_TTL_SEC = 5.0
+_overview_lock = threading.Lock()
+_overview_cache = {"at": 0.0, "data": None}
+
+# ── 进程列表缓存（新建向导用）──
+#
+# list_running_processes 要起一个 PowerShell（约 1-2 秒）。
+# 向导打开时才需要，所以缓存久一点。
+PROCESS_LIST_TTL_SEC = 20.0
+_proc_lock = threading.Lock()
+_proc_cache = {"at": 0.0, "data": []}
 
 # 绝不接触的应用。用户明确要求（账号封禁风险）。
 #
@@ -132,21 +161,41 @@ class LogBuffer:
 
 
 class TaskRunner:
-    """跑一个子进程，把输出逐行喂进 LogBuffer。同一时刻只允许一个任务。"""
+    """
+    跑子进程并收集输出。
+
+    两类任务，语义不同：
+
+      · **短任务**（probe / build / doctor / list）—— 一次性、会写文件，
+        所以串行执行，共用一块日志缓冲 `_task_log`。
+
+      · **注入会话**（--launch --watch）—— 常驻、每个应用一个。
+        各自独立的 LogBuffer 与进程句柄，**不限数量**，
+        这样多个应用的注入能同时被监控。
+    """
 
     def __init__(self):
-        self.log = LogBuffer()
-        self._proc = None
         self._lock = threading.Lock()
+        # 短任务：单槽 + 单一日志
+        self._task_proc = None
+        self._task_log = LogBuffer()
         self._thread = None
-        self._kind = None       # 'task' | 'injector'
-        self._exit_code = None
+        # 注入会话：localId -> {profile, proc, log, startedAt, exitCode, endedAt}
+        self._sessions = {}
+        # 兼容旧字段（外部仍读 .log）
+        self.log = self._task_log
 
     # ── 通用启动 ──
     def _spawn(self, argv, cwd, kind, env_extra=None):
         with self._lock:
-            if self._proc and self._proc.poll() is None:
-                return False, "已有任务在运行，请先停止。"
+            # 短任务（probe/build/doctor）串行 —— 它们会写文件，并发没有意义。
+            # 注入会话不限数量：每个应用一个，各自独立。
+            if kind == "task" and self._task_proc and self._task_proc.poll() is None:
+                return False, "已有短任务在运行，请先等待它结束。"
+            if kind == "task":
+                log = self._task_log
+            else:
+                return False, "内部错误：注入会话请用 launch_injector。"
 
             env = dict(os.environ)
             env["PYTHONIOENCODING"] = "utf-8"
@@ -155,9 +204,9 @@ class TaskRunner:
             if env_extra:
                 env.update(env_extra)
 
-            self.log.add(f"$ {' '.join(argv)}")
+            log.add(f"$ {' '.join(argv)}")
             try:
-                self._proc = subprocess.Popen(
+                self._task_proc = subprocess.Popen(
                     argv,
                     cwd=str(cwd),
                     stdout=subprocess.PIPE,
@@ -168,37 +217,41 @@ class TaskRunner:
                     bufsize=1,
                     shell=False,
                     env=env,
+                    creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
             except FileNotFoundError as e:
-                self._proc = None
+                self._task_proc = None
                 return False, f"找不到可执行文件：{e}"
             except Exception as e:                       # noqa: BLE001
-                self._proc = None
+                self._task_proc = None
                 return False, f"启动失败：{e}"
 
-            self._kind = kind
-            self._exit_code = None
-            self._thread = threading.Thread(target=self._pump, daemon=True)
+            self._thread = threading.Thread(
+                target=self._pump, args=(self._task_proc, log, "task"), daemon=True)
             self._thread.start()
             return True, ""
 
-    def _pump(self):
-        proc = self._proc
+    def _pump(self, proc, log, kind, session_id=None):
+        """读子进程输出直到结束。"""
         try:
             for line in proc.stdout:
-                self.log.add(line)
+                log.add(line)
         except Exception as e:                           # noqa: BLE001
-            self.log.add(f"[ui] 读取输出失败：{e}")
+            log.add(f"[ui] 读取输出失败：{e}")
         finally:
             try:
                 proc.stdout.close()
             except Exception:                            # noqa: BLE001
                 pass
             code = proc.wait()
-            self._exit_code = code
-            self.log.add(f"—— 结束（退出码 {code}）——")
+            log.add(f"—— 结束（退出码 {code}）——")
             with self._lock:
-                self._proc = None
+                if kind == "task":
+                    self._task_proc = None
+                elif session_id and session_id in self._sessions:
+                    self._sessions[session_id]["proc"] = None
+                    self._sessions[session_id]["exitCode"] = code
+                    self._sessions[session_id]["endedAt"] = time.time()
 
     # ── 具体入口 ──
     def run_node(self, args, deep_ok=True):
@@ -206,15 +259,23 @@ class TaskRunner:
         argv = ["node", str(GEN_JS)] + [str(a) for a in args]
         return self._spawn(argv, ROOT, "task")
 
-    def launch_injector(self, profile_name, extra_args=None, isolate=False):
+    def launch_injector(self, profile_name, extra_args=None, isolate=False,
+                        emulate=None, app_args=None, detached=False):
         """
-        启动注入器（常驻）。
-        注意：注入器会用 detached + unref 启动目标应用 —— 所以停掉注入器
-        **不会**关掉用户正在用的应用窗口。这个语义要告诉用户。
+        启动一个注入会话（常驻）。**可以同时跑多个** —— 每个应用一个。
+
+        detached=False（UI 用）：stdout 接管道，输出实时喂给 UI 的日志面板。
+        detached=True（自启动/无窗口用）：stdout 接 DEVNULL 并真正脱离父进程。
+            为什么不接管道：父进程（pythonw）拉起注入器后就退出了，
+            管道读端关闭；注入器下次往 stdout 写就会 EPIPE 崩溃。
+            脱离后它靠自己的 run/logs/<id>.log 留痕。
+
+        注意语义：注入器用 detached + unref 启动目标应用，所以停掉注入器
+        **不会**关掉用户正在用的应用窗口。这个语义要在 UI 上说明。
         """
         prof_path = PROFILES_DIR / f"{profile_name}.json"
         if not prof_path.exists():
-            return False, f"profile 不存在：{prof_path}"
+            return {"ok": False, "error": f"profile 不存在：{prof_path}"}
 
         # 护栏：读 profile 里的目标应用，确认不在禁止名单
         try:
@@ -222,56 +283,201 @@ class TaskRunner:
             check_forbidden(data.get("name"), data.get("displayName"),
                             data.get("processName"), data.get("exe"))
         except ForbiddenApp as e:
-            return False, str(e)
+            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
-            return False, f"读取 profile 失败：{e}"
+            return {"ok": False, "error": f"读取 profile 失败：{e}"}
 
-        args = ["--profile", str(prof_path), "--launch", "--watch"]
+        # 同一个 profile 已经在跑就不重复启动（否则会争同一个调试端口）
+        if not detached:
+            with self._lock:
+                for sid, s in self._sessions.items():
+                    if s.get("profile") == profile_name and s.get("proc") and s["proc"].poll() is None:
+                        return {"ok": False,
+                                "error": f"{profile_name} 已经在运行中（会话 {sid}）。"}
+        else:
+            # 无窗口模式也要防重复：查注册表 + 进程表
+            try:
+                for r in sessions.list_all():
+                    if r.get("profile") == profile_name and r.get("alive"):
+                        return {"ok": False,
+                                "error": f"{profile_name} 已经在运行中（pid {r.get('pid')}）。"}
+            except Exception:                            # noqa: BLE001
+                pass
+
+        args = ["--profile", str(prof_path), "--launch", "--watch",
+                "--source", "autostart" if detached else "ui"]
         if isolate:
             args.append("--isolate")
+        if emulate:
+            args.extend(["--emulate-color-scheme", str(emulate)])
+        for a in (app_args or []):
+            args.extend(["--app-arg", str(a)])
         if extra_args:
             args.extend(extra_args)
         argv = ["node", str(INJECTOR)] + args
-        return self._spawn(argv, ROOT, "injector")
+
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["NODE_DISABLE_COLORS"] = "1"
+
+        if detached:
+            # 完全脱离：不接管道，独立进程组，无控制台窗口。
+            # DETACHED_PROCESS 让子进程没有控制台；CREATE_NO_WINDOW 保证不新建。
+            flags = 0
+            if os.name == "nt":
+                DETACHED_PROCESS = 0x00000008
+                flags = DETACHED_PROCESS | CREATE_NO_WINDOW
+            try:
+                proc = subprocess.Popen(
+                    argv, cwd=str(ROOT),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False, env=env, creationflags=flags,
+                    close_fds=True,
+                )
+            except FileNotFoundError as e:
+                return {"ok": False, "error": f"找不到可执行文件：{e}"}
+            except Exception as e:                       # noqa: BLE001
+                return {"ok": False, "error": f"启动失败：{e}"}
+            # 注入器会自己写 run/logs/<profile>-<pid>.log，不依赖我们的管道
+            return {"ok": True, "localId": None, "pid": proc.pid, "detached": True}
+
+        log = LogBuffer()
+        log.add(f"$ {' '.join(argv)}")
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                shell=False,
+                env=env,
+                # 关键：UI 是 pythonw（无控制台）启动的，而 node.exe 是控制台
+                # 子系统程序。不加这个标志，Windows 会给它分配一个新控制台窗口
+                # —— 用户会看到一个空终端（输出其实被我们管道接走了）。
+                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except FileNotFoundError as e:
+            return {"ok": False, "error": f"找不到可执行文件：{e}"}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": f"启动失败：{e}"}
+
+        # 会话 id 由注入器自己生成并登记；这里先用 pid 做本地键，
+        # 稍后从注册表把真正的 id 关联上（见 reconcile()）。
+        local_id = f"{profile_name}#{proc.pid}"
+        with self._lock:
+            self._sessions[local_id] = {
+                "localId": local_id,
+                "profile": profile_name,
+                "proc": proc,
+                "log": log,
+                "startedAt": time.time(),
+                "exitCode": None,
+                "endedAt": None,
+            }
+        threading.Thread(target=self._pump,
+                         args=(proc, log, "injector", local_id),
+                         daemon=True).start()
+        return {"ok": True, "localId": local_id, "pid": proc.pid}
+
+    def stop_session(self, local_id):
+        """
+        停止一个注入会话。
+
+        **绝不 taskkill /T**：注入器启动的目标应用虽然 detached，但父子关系
+        仍在进程表里，/T 会顺树把应用一起杀掉，关掉用户正在用的窗口。
+
+        优先走协作式停止：从注册表找到该会话的 id，放一个停止文件。
+        兜底才按 PID 单杀（不带 /T）。
+        """
+        with self._lock:
+            s = self._sessions.get(local_id)
+        if not s:
+            return {"ok": False, "error": f"没有这个会话：{local_id}"}
+
+        proc = s.get("proc")
+        if not proc or proc.poll() is not None:
+            return {"ok": False, "error": "该会话已结束。"}
+
+        # 找到它在注册表里的 id（注入器启动后自己登记的）
+        reg_id = None
+        try:
+            for r in sessions.list_registered(force=True):
+                if r.get("pid") == proc.pid:
+                    reg_id = r.get("id")
+                    break
+        except Exception:                                # noqa: BLE001
+            pass
+
+        if reg_id:
+            okr, err = sessions.request_stop(reg_id)
+            if not okr:
+                return {"ok": False, "error": f"停止请求失败：{err}"}
+            s["log"].add("[ui] 已发送停止请求（协作式）。目标应用不会被关闭。")
+            # 给它一点时间优雅退出
+            for _ in range(30):
+                if proc.poll() is not None:
+                    return {"ok": True, "graceful": True}
+                time.sleep(0.2)
+            s["log"].add("[ui] 优雅停止超时，改为按 PID 结束注入器（不带 /T，应用不受影响）。")
+
+        # 兜底：只杀注入器自己的 PID。**不加 /T。**
+        okk, err = sessions.force_kill(proc.pid)
+        if not okk:
+            return {"ok": False, "error": f"结束失败：{err}"}
+        s["log"].add("[ui] 注入器已结束。目标应用不受影响。")
+        return {"ok": True, "graceful": False}
 
     def stop(self):
-        """
-        停止当前任务。
-        只结束注入器/任务本身 —— 目标应用是 detached 启动的，不受影响。
-        """
+        """兼容旧调用：停止「任意一个」运行中的注入会话。"""
         with self._lock:
-            proc = self._proc
-        if not proc or proc.poll() is not None:
-            return False, "当前没有在运行的任务。"
-
-        kind = self._kind
-        try:
-            if os.name == "nt":
-                # 用 taskkill /T 连子进程一起收，但注入器 spawn 的应用是
-                # detached（DETACHED_PROCESS），不在同一进程树里，所以安全。
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True, timeout=10,
-                )
-            else:
-                proc.terminate()
-        except Exception as e:                           # noqa: BLE001
-            return False, f"停止失败：{e}"
-
-        self.log.add(f"[ui] 已停止（{kind}）。目标应用不受影响。")
+            for lid, s in self._sessions.items():
+                if s.get("proc") and s["proc"].poll() is None:
+                    return self.stop_session(lid)
+        # 没有注入会话时，若有短任务在跑就结束它
         with self._lock:
-            self._proc = None
-        return True, ""
+            p = self._task_proc
+        if p and p.poll() is None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True, timeout=10)
+                else:
+                    p.terminate()
+            except Exception as e:                       # noqa: BLE001
+                return False, f"停止失败：{e}"
+            return True, ""
+        return False, "当前没有在运行的任务。"
 
     def status(self):
+        """短任务状态 + 所有注入会话的概要。"""
         with self._lock:
-            proc = self._proc
-            kind = self._kind
-        running = bool(proc and proc.poll() is None)
+            tp = self._task_proc
+            sessions_snapshot = {
+                lid: {
+                    "profile": s["profile"],
+                    "pid": s["proc"].pid if s.get("proc") else None,
+                    "running": bool(s.get("proc") and s["proc"].poll() is None),
+                    "startedAt": s.get("startedAt"),
+                    "exitCode": s.get("exitCode"),
+                }
+                for lid, s in self._sessions.items()
+            }
+        task_running = bool(tp and tp.poll() is None)
+        any_session = any(v["running"] for v in sessions_snapshot.values())
         return {
-            "running": running,
-            "kind": kind if running else None,
-            "pid": proc.pid if running else None,
+            # 兼容旧前端字段
+            "running": task_running or any_session,
+            "kind": "task" if task_running else ("injector" if any_session else None),
+            "pid": tp.pid if task_running else None,
+            # 新增
+            "taskRunning": task_running,
+            "sessions": sessions_snapshot,
         }
 
 
@@ -287,6 +493,7 @@ def run_node_json(args, timeout=180):
         p = subprocess.run(
             argv, cwd=str(ROOT), capture_output=True,
             encoding="utf-8", errors="replace", timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
         )
     except FileNotFoundError:
         raise RuntimeError("找不到 node。请确认 Node 18+ 已安装并在 PATH 中。")
@@ -367,6 +574,7 @@ def list_running_processes():
         p = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, encoding="utf-8", errors="replace", timeout=25,
+            creationflags=CREATE_NO_WINDOW,
         )
         raw = (p.stdout or "").strip()
         if not raw:
@@ -453,8 +661,36 @@ class Api:
             "task": RUNNER.status(),
         }
 
-    def get_overview(self):
-        """profile 列表 + 校验结果。两者都来自 gen.js --json。"""
+    def get_overview(self, force=False):
+        """
+        profile 列表 + 校验结果 + 会话列表。
+
+        profile/doctor 数据来自 `gen.js --json`，每次调用要起两个 node 进程
+        （实测合计约 1.7 秒）。所以结果带 TTL 缓存 —— 前端高频刷新时读缓存，
+        只有缓存过期才真的跑 node。会话列表另走 sessions 模块（它自带缓存）。
+
+        force=True 用于「用户点了刷新」这类明确要求最新数据的场景。
+        """
+        global _overview_cache
+        now = time.time()
+
+        with _overview_lock:
+            fresh = (now - _overview_cache["at"]) < OVERVIEW_TTL_SEC
+            if fresh and not force:
+                cached = _overview_cache["data"]
+                if cached:
+                    # 会话列表是实时的（读磁盘注册表，廉价），单独刷新
+                    out = dict(cached)
+                    try:
+                        out["sessions"] = self.list_sessions().get("sessions", [])
+                    except Exception:                    # noqa: BLE001
+                        out["sessions"] = []
+                    try:
+                        out["task"] = RUNNER.status()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                    return out
+
         try:
             listing = run_node_json(["list", "--json"])
         except Exception as e:                           # noqa: BLE001
@@ -467,13 +703,24 @@ class Api:
         issues = {p["name"]: p.get("issues", []) for p in doctor.get("profiles", [])}
         for prof in listing.get("profiles", []):
             prof["issues"] = issues.get(prof["name"], [])
-        return {
+
+        try:
+            sess = self.list_sessions().get("sessions", [])
+        except Exception:                                # noqa: BLE001
+            sess = []
+
+        out = {
             "ok": True,
             "profiles": listing.get("profiles", []),
             "doctorOk": doctor.get("ok", False),
             "problemCount": doctor.get("problemCount", 0),
             "task": RUNNER.status(),
+            "sessions": sess,
         }
+        with _overview_lock:
+            _overview_cache["at"] = time.time()
+            _overview_cache["data"] = dict(out)
+        return out
 
     # ── profile 读写 ──
     def get_profile(self, name):
@@ -541,7 +788,7 @@ class Api:
             return ["list"] + (["--json"] if as_json else [])
         return None
 
-    def launch(self, name, isolate=False, extra=None):
+    def launch(self, name, isolate=False, extra=None, emulate=None, appArgs=None):
         try:
             check_forbidden(name)
             extra_args = None
@@ -551,10 +798,133 @@ class Api:
                     extra_args = [a for a in extra.split() if a]
                 elif isinstance(extra, list):
                     extra_args = [str(a) for a in extra]
-            ok, err = RUNNER.launch_injector(name, extra_args=extra_args, isolate=bool(isolate))
-            return {"ok": ok, "error": err} if not ok else {"ok": True}
+            if emulate not in (None, "", "none", "auto"):
+                if emulate not in ("dark", "light"):
+                    return {"ok": False, "error": f"配色模拟只能是 dark 或 light，收到 {emulate!r}"}
+            else:
+                emulate = None
+            aa = [str(a) for a in (appArgs or []) if str(a).strip()] or None
+            return RUNNER.launch_injector(
+                name, extra_args=extra_args, isolate=bool(isolate),
+                emulate=emulate, app_args=aa,
+            )
         except ForbiddenApp as e:
             return {"ok": False, "error": str(e), "forbidden": True}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    # ── 会话（多进程监控）──
+    def list_sessions(self):
+        """
+        列出所有注入会话：本地启动的 + 从注册表读到的 + 进程表发现的。
+        合并成一个列表给前端，每项带 localId（本地句柄）或 id（注册表 id）。
+        """
+        try:
+            status = RUNNER.status()
+            local = status.get("sessions", {})
+        except Exception:                                # noqa: BLE001
+            local = {}
+
+        # 注册表（含外部发现）
+        try:
+            reg = sessions.list_all()
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": f"读取会话注册表失败：{e}", "sessions": []}
+
+        out = []
+        seen_pids = set()
+
+        # 先放本地启动的（有实时日志缓冲）
+        for lid, s in local.items():
+            pid = s.get("pid")
+            # 从注册表补齐元数据
+            meta = next((r for r in reg if r.get("pid") == pid), None)
+            out.append({
+                "localId": lid,
+                "id": meta.get("id") if meta else None,
+                "profile": s.get("profile"),
+                "displayName": (meta or {}).get("displayName") or s.get("profile"),
+                "pid": pid,
+                "port": (meta or {}).get("port"),
+                "running": s.get("running"),
+                "startedAt": (meta or {}).get("startedAt"),
+                "source": (meta or {}).get("source") or "ui",
+                "external": False,
+                "hasLiveLog": True,
+                "pages": (meta or {}).get("pages"),
+                "cssExtra": (meta or {}).get("cssExtra"),
+                "emulateColorScheme": (meta or {}).get("emulateColorScheme"),
+            })
+            if pid:
+                seen_pids.add(pid)
+
+        # 再放注册表里其余（外部启动的、或本地已结束但仍登记的）
+        for r in reg:
+            if r.get("pid") in seen_pids:
+                continue
+            out.append({
+                "localId": None,
+                "id": r.get("id"),
+                "profile": r.get("profile"),
+                "displayName": r.get("displayName") or r.get("appName") or r.get("profile"),
+                "pid": r.get("pid"),
+                "port": r.get("port"),
+                "running": bool(r.get("alive")),
+                "startedAt": r.get("startedAt"),
+                "source": r.get("source") or ("external" if r.get("external") else "cli"),
+                "external": bool(r.get("external")),
+                "hasLiveLog": False,
+                "pages": r.get("pages"),
+                "cssExtra": r.get("cssExtra"),
+                "emulateColorScheme": r.get("emulateColorScheme"),
+            })
+
+        out.sort(key=lambda x: (not x.get("running"), str(x.get("startedAt") or "")))
+        return {"ok": True, "sessions": out}
+
+    def stop_session(self, local_id=None, session_id=None):
+        """停止一个会话。优先本地句柄（有实时日志），否则走注册表 id。"""
+        try:
+            if local_id:
+                return RUNNER.stop_session(local_id)
+            if session_id:
+                okr, err = sessions.request_stop(session_id)
+                if not okr:
+                    return {"ok": False, "error": err}
+                return {"ok": True, "graceful": True}
+            return {"ok": False, "error": "需要 localId 或 sessionId"}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def get_session_log(self, local_id=None, session_id=None, cursor=0):
+        """
+        取某会话的日志。
+        本地会话走内存缓冲（增量、游标）；外部会话直接读磁盘日志文件。
+        """
+        try:
+            if local_id:
+                with RUNNER._lock:                       # noqa: SLF001
+                    s = RUNNER._sessions.get(local_id)   # noqa: SLF001
+                if not s:
+                    return {"ok": False, "error": "会话不存在", "lines": [], "cursor": cursor}
+                lines, new_cursor = s["log"].since(int(cursor or 0))
+                return {"ok": True, "lines": lines, "cursor": new_cursor, "live": True}
+
+            if session_id:
+                text, _ = sessions.read_log(session_id)
+                lines = text.splitlines()
+                # 文件日志没有游标语义，按行数返回尾部
+                return {"ok": True, "lines": lines[-400:], "cursor": 0,
+                        "live": False, "path": sessions.log_path(session_id)}
+
+            return {"ok": False, "error": "需要 localId 或 sessionId", "lines": [], "cursor": cursor}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e), "lines": [], "cursor": cursor}
+
+    def prune_sessions(self):
+        try:
+            n = sessions.prune()
+            return {"ok": True, "removed": n}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -565,21 +935,82 @@ class Api:
     def get_task_status(self):
         return {"ok": True, "task": RUNNER.status()}
 
-    # ── 日志 ──
+    # ── 日志（短任务）──
     def get_logs(self, cursor=0):
         try:
-            lines, new_cursor = RUNNER.log.since(int(cursor or 0))
+            lines, new_cursor = RUNNER._task_log.since(int(cursor or 0))  # noqa: SLF001
             return {"ok": True, "lines": lines, "cursor": new_cursor}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e), "lines": [], "cursor": cursor}
 
     def clear_logs(self):
-        cur = RUNNER.log.clear()
+        cur = RUNNER._task_log.clear()                   # noqa: SLF001
         return {"ok": True, "cursor": cur}
+
+    # ── 自定义 CSS ──
+    def get_custom_css(self, name):
+        """
+        读该 profile 的自定义 CSS 片段。
+        约定路径：css/<name>.custom.css（profile 的 cssExtra 可覆盖）。
+        """
+        try:
+            path = self._custom_css_path(name)
+            if not path.exists():
+                return {"ok": True, "exists": False, "path": str(path), "css": ""}
+            return {"ok": True, "exists": True, "path": str(path),
+                    "css": path.read_text(encoding="utf-8")}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    def save_custom_css(self, name, css):
+        """
+        写自定义 CSS 片段。写入后注入器会通过热重载自动重新注入，
+        不需要重启应用（前提是注入器在运行且监听该文件）。
+        """
+        try:
+            check_forbidden(name)
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)):
+                return {"ok": False, "error": "profile 名不合法"}
+            path = self._custom_css_path(name)
+            CSS_DIR.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(css if css is not None else "")
+            return {"ok": True, "path": str(path)}
+        except ForbiddenApp as e:
+            return {"ok": False, "error": str(e), "forbidden": True}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _custom_css_path(name):
+        """解析该 profile 的自定义 CSS 路径（尊重 profile 里的 cssExtra）。"""
+        try:
+            prof = read_profile(name)
+        except Exception:                                # noqa: BLE001
+            prof = {}
+        extra = prof.get("cssExtra")
+        if extra:
+            p = Path(extra)
+            return p if p.is_absolute() else (PROFILES_DIR / p)
+        return CSS_DIR / f"{name}.custom.css"
 
     # ── 新建向导辅助 ──
     def list_running(self):
-        return {"ok": True, "processes": list_running_processes()}
+        """
+        列出可选的运行中进程（新建向导用）。
+
+        带 TTL 缓存：这个查询要起一个 PowerShell（约 1-2 秒），
+        而向导可能被反复打开。缓存 20 秒足够，用户不会察觉。
+        """
+        now = time.time()
+        with _proc_lock:
+            if (now - _proc_cache["at"]) < PROCESS_LIST_TTL_SEC and _proc_cache["data"]:
+                return {"ok": True, "processes": list(_proc_cache["data"]), "cached": True}
+        data = list_running_processes()
+        with _proc_lock:
+            _proc_cache["at"] = time.time()
+            _proc_cache["data"] = data
+        return {"ok": True, "processes": data}
 
     def pick_exe(self):
         """原生文件选择框。不扫盘，只让用户点。"""
@@ -606,10 +1037,100 @@ class Api:
 
 # ─────────────────────────── 入口 ───────────────────────────
 
+def run_headless(profiles, isolate=False):
+    """
+    无窗口模式：拉起指定 profile 的注入器，然后立刻退出。
+
+    这是**自启动**的实现方式。为什么绕一层 Python 而不让 .lnk 直接指向 node.exe：
+
+      · pythonw.exe 是 GUI 子系统程序，没有控制台。它用 CREATE_NO_WINDOW
+        启动 node.exe，就不会闪出一个终端窗口。
+      · 直接让 .lnk 指向 node.exe 的话，node 是控制台程序，会留下一个
+        常驻的黑色终端窗口。
+
+    注入器是 detached 启动的，所以本进程退出后它继续运行，
+    并且会把自己登记到 run/sessions/，之后打开 UI 就能看到并管理它。
+    """
+    ok_all = True
+    for name in profiles:
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            # detached=True 是关键：本进程马上就要退出，若把子进程的 stdout
+            # 接到管道上，读端一关，注入器下次写日志就会 EPIPE 崩溃。
+            res = RUNNER.launch_injector(name, isolate=isolate, detached=True)
+        except Exception as e:                           # noqa: BLE001
+            print(f"[ui] 启动 {name} 失败：{e}", file=sys.stderr)
+            ok_all = False
+            continue
+        if res.get("ok"):
+            print(f"[ui] 已启动 {name} 的注入（pid {res.get('pid')}，后台运行）。")
+        else:
+            print(f"[ui] 启动 {name} 失败：{res.get('error')}", file=sys.stderr)
+            ok_all = False
+
+    # 给注入器一点时间完成登记，这样紧接着打开 UI 就能看到它
+    time.sleep(1.5)
+    return 0 if ok_all else 1
+
+
+def parse_ui_args(argv):
+    """极简参数解析。UI 只有几个开关，不需要 argparse。"""
+    o = {"headless": False, "start": [], "isolate": False, "help": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            o["help"] = True
+        elif a == "--headless":
+            o["headless"] = True
+        elif a == "--isolate":
+            o["isolate"] = True
+        elif a == "--start":
+            i += 1
+            if i < len(argv):
+                o["start"].extend(x for x in argv[i].split(",") if x.strip())
+        elif a.startswith("--start="):
+            o["start"].extend(x for x in a.split("=", 1)[1].split(",") if x.strip())
+        i += 1
+    return o
+
+
+def ui_usage():
+    print(
+        "no-glass-ele 管理界面\n"
+        "\n"
+        "  python app.py                          打开图形界面\n"
+        "  python app.py --headless --start <name>[,<name>...]\n"
+        "                                         无窗口拉起注入器后退出（自启动用）\n"
+        "  python app.py --headless --start <name> --isolate\n"
+        "                                         隔离实例启动\n"
+        "\n"
+        "配合 pythonw.exe 使用可完全无窗口：\n"
+        "  pythonw app.py --headless --start todo-list\n"
+        "\n"
+        "自启动项由 `node gen.js autostart on <name>` 创建，不需要手写这一串。\n"
+    )
+
+
 def main():
+    opts = parse_ui_args(sys.argv[1:])
+    if opts["help"]:
+        ui_usage()
+        return 0
+
     if not GEN_JS.exists():
         print(f"找不到 gen.js：{GEN_JS}", file=sys.stderr)
         return 1
+
+    # 无窗口模式：拉起注入器就走
+    if opts["headless"]:
+        if not opts["start"]:
+            print("[ui] --headless 需要配合 --start <name>", file=sys.stderr)
+            return 2
+        return run_headless(opts["start"], isolate=opts["isolate"])
+
     if not WEB_DIR.exists():
         print(f"找不到前端目录：{WEB_DIR}", file=sys.stderr)
         return 1
@@ -619,8 +1140,15 @@ def main():
     print(f"[ui] no-glass-ele 管理界面：{url}")
     print(f"[ui] 项目根目录：{ROOT}")
 
+    # 预热外部注入器发现：让后台线程先跑一次，
+    # 这样用户第一次打开会话列表时缓存已有数据，不必等进程表查询。
+    try:
+        sessions.warm_up()
+    except Exception:                                    # noqa: BLE001
+        pass
+
     api = Api()
-    window = webview.create_window(
+    webview.create_window(
         "no-glass-ele · Electron 去毛玻璃管理",
         url,
         js_api=api,

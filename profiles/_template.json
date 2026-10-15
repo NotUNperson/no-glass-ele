@@ -45,7 +45,16 @@
   "_urlFilter_comment": "人工：只注入匹配此正则的页面。用于放过内置浏览器里的第三方网页，避免误伤。例如 \"^file:///.*app\\\\.asar\"。",
 
   "css": null,
-  "_css_comment": "人工：自定义样式表路径（相对本文件）。为空则用 css/no-glass.css。",
+  "_css_comment": "人工：替换内置样式表路径（相对本文件）。一般留空。",
+
+  "cssExtra": null,
+  "_cssExtra_comment": "人工：追加的自定义 CSS 片段。留空则自动找 css/<name>.custom.css（存在即生效，无需配置）。用途：给「电脑端没有深色模式」的应用补样式。注入器会监听该文件，改完保存即自动重新注入，不用重启应用。",
+
+  "emulateColorScheme": null,
+  "_emulateColorScheme_comment": "人工：dark 或 light。让页面认为系统处于该配色模式，经 CDP Emulation.setEmulatedMedia 实现。**只对已经写了 @media (prefers-color-scheme: ...) 的应用有效** —— 如果应用桌面版 CSS 里根本没有这段媒体查询，模拟不会产生任何变化，那种情况只能靠 cssExtra 手写样式。",
+
+  "appArgs": [],
+  "_appArgs_comment": "人工：传给**目标应用**的额外启动参数（不是给注入器的）。用途：Chromium 渲染开关，如 \"--disable-lcd-text\"（强制灰度抗锯齿，配合 MacType 用）、\"--font-render-hinting=none\"。命令行也可临时试：--app-arg=--disable-lcd-text",
 
   "native": {
     "enabled": false,

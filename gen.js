@@ -20,6 +20,17 @@ const fs = require('fs');
 const path = require('path');
 const probe = require('./lib/probe');
 const render = require('./lib/render');
+const sessions = require('./lib/sessions');
+const autostart = require('./lib/autostart');
+
+/**
+ * 同步睡眠。gen.js 是纯同步 CLI，没有事件循环可等，
+ * 所以用 Atomics.wait 而不是 Promise —— 后者在这个上下文里根本不会被调度。
+ */
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
 
 const ROOT = __dirname;
 const PROFILES_DIR = path.join(ROOT, 'profiles');
@@ -308,6 +319,7 @@ function buildOne(name, opts = {}) {
       const cmd = render.renderCmd({
         title: p.title,
         appName: prof.displayName || name,
+        asciiFallback: name,
         invocation: 'node "%~dp0noglass.js"',
         defaultArgs: p.args,
         notes: [...p.notes, 'Bundled build: profile and stylesheet are inlined in noglass.js.'],
@@ -326,6 +338,7 @@ function buildOne(name, opts = {}) {
       const cmd = render.renderCmd({
         title: p.title,
         appName: prof.displayName || name,
+        asciiFallback: name,
         invocation: `node "${relInjector}" --profile "${relProfile}"`,
         defaultArgs: p.args,
         notes: p.notes,
@@ -498,6 +511,273 @@ function cmdList(args) {
   say();
 }
 
+// ─────────────────────────── ps / stop / logs ───────────────────────────
+
+/** 采集会话列表（文本与 --json 共用）。 */
+function collectSessionData() {
+  const all = sessions.listAll();
+  const dead = all.filter((s) => s.alive === false);
+  return {
+    sessions: all.map((s) => ({
+      id: s.id || null,
+      pid: s.pid,
+      parentPid: s.parentPid || null,
+      profile: s.profile || null,
+      displayName: s.displayName || null,
+      appName: s.appName || null,
+      processName: s.processName || null,
+      port: s.port,
+      watch: s.watch === undefined ? null : s.watch,
+      isolate: s.isolate === undefined ? null : s.isolate,
+      native: s.native === undefined ? null : s.native,
+      source: s.source || null,
+      startedAt: s.startedAt || null,
+      pages: s.pages === undefined ? null : s.pages,
+      lastTick: s.lastTick || null,
+      cssExtra: s.cssExtra || null,
+      emulateColorScheme: s.emulateColorScheme || null,
+      alive: s.alive !== false,
+      external: !!s.external,
+      logFile: s.__logFile || null,
+      commandLine: s.commandLine || null,
+    })),
+    dead,
+    registered: all.filter((s) => !s.external).length,
+    external: all.filter((s) => s.external).length,
+  };
+}
+
+function cmdPs(args) {
+  const data = collectSessionData();
+  if (args.flags.json === true) { say(JSON.stringify(data, null, 2)); return; }
+
+  const live = data.sessions.filter((s) => s.alive);
+  if (!live.length) {
+    say('当前没有运行中的注入会话。');
+    say(dim('  启动一个：node injector/noglass.js --profile profiles/<name>.json --launch --watch'));
+    return;
+  }
+
+  say(`${C.b}注入会话${C.x} ${dim(`(${live.length} 个运行中 · ${data.registered} 已登记 · ${data.external} 外部发现)`)}`);
+  say();
+  for (const s of live) {
+    const name = s.displayName || s.appName || s.profile || '(未知)';
+    const tags = [];
+    if (s.external) tags.push(`${C.y}外部${C.x}`);
+    else tags.push(`${C.g}已登记${C.x}`);
+    if (s.watch) tags.push('watch');
+    if (s.isolate) tags.push('isolate');
+    if (s.native) tags.push('native');
+
+    say(`  ${C.b}${name}${C.x}  ${dim(tags.join(' '))}`);
+    say(`    pid ${s.pid}  端口 ${s.port == null ? '?' : s.port}  ${s.source ? `来源 ${s.source}` : ''}`);
+    if (s.startedAt) say(dim(`    启动于 ${s.startedAt}`));
+    if (s.pages != null) say(dim(`    页面 ${s.pages}`));
+    if (s.cssExtra) say(dim(`    自定义 CSS ${s.cssExtra}`));
+    if (s.emulateColorScheme) say(dim(`    配色模拟 ${s.emulateColorScheme}`));
+    if (s.id) say(dim(`    id ${s.id}`));
+    else say(dim(`    无 id —— 这是旧版本启动的注入器，无法用 stop 优雅停止`));
+    say();
+  }
+
+  if (data.dead.length) {
+    say(`${C.y}${data.dead.length} 个注册项对应的进程已不存在${C.x}（运行 ${C.c}node gen.js ps --prune${C.x} 清理）`);
+    say();
+  }
+}
+
+function cmdStop(args) {
+  const target = args._[0];
+  if (!target) {
+    bad('用法: node gen.js stop <id|profile|pid>');
+    say(dim('  用 `node gen.js ps` 查看可停止的会话。'));
+    process.exit(2);
+  }
+
+  const all = sessions.listAll();
+  // 三种定位方式：完整 id、profile 名、pid
+  const hit = all.find((s) => s.id === target)
+    || all.find((s) => s.profile === target)
+    || all.find((s) => String(s.pid) === String(target));
+
+  if (!hit) {
+    bad(`没找到会话：${target}`);
+    say(dim('  用 `node gen.js ps` 查看。'));
+    process.exit(1);
+  }
+
+  if (hit.external || !hit.id) {
+    // 旧版本注入器没有登记，也就没有停止文件通道
+    wrn('这是一个「外部发现」的注入器（旧版本启动，未登记）。');
+    wrn('它不支持协作式停止。若强行结束它，目标应用**不会被关闭**（我们不用 /T），');
+    wrn(`但注入也会随之失效（刷新页面即恢复原样）。`);
+    if (args.flags.force !== true) {
+      say();
+      say(`要强行结束，请加 ${C.c}--force${C.x}：`);
+      say(`  node gen.js stop ${hit.pid} --force`);
+      process.exit(1);
+    }
+    const r = sessions.forceKill(hit.pid);
+    if (r.ok) ok(`已结束外部注入器 pid ${hit.pid}（目标应用未受影响）。`);
+    else bad(`结束失败：${r.error}`);
+    return;
+  }
+
+  const r = sessions.requestStop(hit.id);
+  if (!r.ok) { bad(`停止请求失败：${r.error}`); process.exit(1); }
+
+  const name = hit.displayName || hit.appName || hit.profile;
+  say(`已发送停止请求给 ${C.b}${name}${C.x}（${hit.id}）。`);
+  say(dim('  注入器会在 1 秒内优雅退出。'));
+  say(`${C.g}目标应用不会被关闭。${C.x}`);
+
+  // 等一会儿确认真的退了
+  const deadline = Date.now() + 6000;
+  let gone = false;
+  while (Date.now() < deadline) {
+    const still = sessions.listRegistered().find((s) => s.id === hit.id);
+    if (!still || !sessions.isAlive(still.pid)) { gone = true; break; }
+    sleepSync(300);
+  }
+  if (gone) ok('注入器已退出，注册项已清理。');
+  else wrn('注入器尚未退出。可稍后用 `node gen.js ps` 复查。');
+}
+
+function cmdLogs(args) {
+  const target = args._[0];
+  if (!target) {
+    bad('用法: node gen.js logs <id|profile|pid> [-n 行数]');
+    process.exit(2);
+  }
+  const all = sessions.listAll();
+  const hit = all.find((s) => s.id === target)
+    || all.find((s) => s.profile === target)
+    || all.find((s) => String(s.pid) === String(target));
+
+  if (!hit) { bad(`没找到会话：${target}`); process.exit(1); }
+  if (!hit.id) {
+    bad('这是外部发现的注入器，没有日志文件（旧版本不写 run/logs/）。');
+    process.exit(1);
+  }
+
+  const n = args.flags.n ? Number(args.flags.n) : 200;
+  const r = sessions.readLog(hit.id, n);
+  if (!r.ok) { bad(`读日志失败：${r.error}`); process.exit(1); }
+
+  const name = hit.displayName || hit.appName || hit.profile;
+  say(`${C.b}${name}${C.x} 的日志 ${dim(`(${r.path})`)}`);
+  say();
+  for (const line of r.lines) {
+    if (!line) continue;
+    const cls = /已注入 ✓|就绪|已退出|已重新注入/.test(line) ? C.g
+      : /失败|出错|错误|超时/.test(line) ? C.r
+      : /警告|⚠|跳过/.test(line) ? C.y : '';
+    say(cls ? `${cls}${line}${C.x}` : line);
+  }
+}
+
+function cmdPrune(args) {
+  const n = sessions.prune();
+  if (args.flags.json === true) { say(JSON.stringify({ ok: true, removed: n })); return; }
+  if (n) ok(`已清理 ${n} 个孤儿注册项。`);
+  else say('没有需要清理的注册项。');
+}
+
+// ─────────────────────────── autostart ───────────────────────────
+
+function cmdAutostart(args) {
+  const action = args._[0];
+  const name = args._[1];
+
+  // ── list ──
+  if (action === 'list' || action === undefined) {
+    const items = autostart.listManaged();
+    if (args.flags.json === true) { say(JSON.stringify({ ok: true, items }, null, 2)); return; }
+    if (!items.length) {
+      say('没有由本工具创建的自启动项。');
+      say(dim('  创建一个：node gen.js autostart on <profile>'));
+      return;
+    }
+    say(`${C.b}本工具创建的自启动项${C.x} ${dim(`(${items.length})`)}`);
+    say();
+    for (const it of items) {
+      say(`  ${C.b}${it.profile}${C.x}`);
+      say(dim(`    ${it.lnk}`));
+    }
+    say();
+    say(dim('  删除：node gen.js autostart off <profile>'));
+    return;
+  }
+
+  if (!name) {
+    bad(`用法: node gen.js autostart ${action} <profile>`);
+    process.exit(2);
+  }
+
+  // profile 必须存在
+  const profPath = path.join(PROFILES_DIR, `${name}.json`);
+  if (!fs.existsSync(profPath)) {
+    bad(`profile 不存在：${profPath}`);
+    say(dim(`  可用：${listProfiles().join(', ') || '(无)'}`));
+    process.exit(1);
+  }
+  const prof = loadProfile(name);
+
+  // ── on ──
+  if (action === 'on') {
+    const r = autostart.enable(name, {
+      exe: prof.exe,
+      processName: prof.processName,
+      isolate: args.flags.isolate === true,
+      ignoreConflicts: args.flags.force === true,
+    });
+
+    if (!r.ok && r.conflict) {
+      wrn(`检测到该应用**已经**有自启动项：`);
+      say();
+      for (const c of r.conflicts) {
+        say(`    ${C.y}${c.where}${C.x}  ${c.name}  ${dim(`(${c.how})`)}`);
+      }
+      say();
+      say('这意味着开机后应用会自己启动一次，而我们的注入器也会再启动一次。');
+      say('两者会撞单实例锁：第二次启动会直接退出，调试端口也就开不起来。');
+      say();
+      say(`建议二选一：`);
+      say(`  ${C.c}1)${C.x} 保留应用自己的自启动，改用「手动注入」——`);
+      say(`     开机后应用已在运行，此时用 ${C.c}node gen.js ps${C.x} 看不到它（没有调试端口），`);
+      say(`     需要先退出应用再用本工具启动。`);
+      say(`  ${C.c}2)${C.x} 关掉应用自己的自启动项，改用本工具代理（推荐）：`);
+      say(`     删除上面列出的那个启动项，然后：`);
+      say(`     ${C.c}node gen.js autostart on ${name} --force${C.x}`);
+      say();
+      say(dim('  --force 会跳过这个检查，两个自启动项并存。'));
+      process.exitCode = 1;
+      return;
+    }
+    if (!r.ok) { bad(r.error); process.exit(1); }
+
+    ok(`已创建自启动项：${r.lnk}`);
+    say();
+    say(`  指向      ${r.pythonw}`);
+    say(`  参数      ${r.args}`);
+    say();
+    say(dim('  下次登录时自动拉起注入（无窗口，后台运行）。'));
+    say(dim('  之后打开 UI 就能在会话列表里看到并管理它。'));
+    return;
+  }
+
+  // ── off ──
+  if (action === 'off') {
+    const r = autostart.disable(name);
+    if (!r.ok) { bad(r.error); process.exit(1); }
+    ok(`已删除自启动项：${r.lnk}`);
+    return;
+  }
+
+  bad(`未知动作：${action}（可用：on / off / list）`);
+  process.exit(2);
+}
+
 // ─────────────────────────── doctor ───────────────────────────
 
 /**
@@ -625,16 +905,25 @@ ${C.b}命令${C.x}
   ${C.c}list${C.x}                          列出 profiles 与探测状态
   ${C.c}doctor${C.x}                        校验 exe 存在性、端口冲突、fuse 与预设矛盾
 
+${C.b}后台会话${C.x}
+  ${C.c}ps${C.x}                            列出运行中的注入会话（含外部启动的）
+  ${C.c}stop${C.x} <id|profile|pid>         请求停止（优雅退出，**不关目标应用**）
+                             加 --force 可强停「外部发现」的旧版注入器
+  ${C.c}logs${C.x} <id|profile|pid> [-n N]  查看某会话的日志
+  ${C.c}prune${C.x}                         清理已退出会话残留的注册项
+
 ${C.b}选项${C.x}
   --deep      深层探测：额外扫描 resources/*.asar 找行为标记
   --bundle    生成自包含版本（配置与样式内联，目录可单独拷走）
   --port <n>  new 时指定默认端口
-  --json      probe / list / doctor 输出 JSON（供 UI 调用，人类可读输出不变）
+  --json      probe / list / doctor / ps 输出 JSON（供 UI 调用，人类可读输出不变）
 
 ${C.b}说明${C.x}
-  · 全程**不启动**目标应用，只读 exe / asar 的字节。
+  · 全程**不启动**目标应用做探测，只读 exe / asar 的字节。
   · **不遍历文件系统**：只读被点名的文件，目录读取仅限单个父目录。
   · 零依赖，Node 18+。
+  · 停止是协作式的：注入器在 run/sessions/<id>.json 登记自己，
+    stop 只放一个停止文件让它自己退出 —— 目标应用不受影响。
 `);
 }
 
@@ -651,6 +940,11 @@ function main() {
     case 'build': return cmdBuild(args);
     case 'list': case 'ls': return cmdList(args);
     case 'doctor': case 'check': return cmdDoctor(args);
+    case 'ps': case 'sessions': return cmdPs(args);
+    case 'stop': return cmdStop(args);
+    case 'logs': case 'log': return cmdLogs(args);
+    case 'prune': return cmdPrune(args);
+    case 'autostart': return cmdAutostart(args);
     case undefined: case '-h': case '--help': case 'help': return usage();
     default:
       bad(`未知命令: ${cmd}`);

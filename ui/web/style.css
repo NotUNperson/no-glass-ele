@@ -5,13 +5,17 @@
    这个工具存在的意义就是干掉毛玻璃，界面自己却用毛玻璃会很可笑。
    所以：扁平、实色、清晰边框。
 
-   配色对齐 Electron 深色应用的习惯（#0f1216 底 / #161b22 面板）。
+   主题：深色为默认，另有一套浅色覆盖。切换方式由 app.js 写在
+   <html data-theme="dark|light"> 上；不写时跟随系统 prefers-color-scheme。
    ========================================================================== */
 
 :root {
+  /* ── 深色（默认）── */
   --bg:        #0f1216;
   --panel:     #161b22;
   --panel-2:   #1c2230;
+  --inset:     #0c1015;   /* 输入框、标签等"凹陷"面 */
+  --inset-2:   #0a0d11;   /* 日志区、只读框 */
   --line:      #2a3341;
   --line-soft: #212936;
   --text:      #e6edf3;
@@ -20,9 +24,112 @@
   --accent:    #4a9eff;
   --accent-2:  #2d7ad4;
   --ok:        #3fb950;
+  --ok-bg:     #10241a;
+  --ok-bd:     #23492c;
   --warn:      #d29922;
+  --warn-bg:   #241d0d;
+  --warn-bd:   #4a3a12;
   --err:       #f85149;
+  --err-bg:    #2a1412;
+  --err-bd:    #4d1f1c;
+  --danger-bg: #3a1b19;
+  --danger-bd: #5c2a26;
+  --danger-fg: #ff9d95;
+  --danger-hv: #4a221f;
+  --btn-hover: #232b3a;
+  --btn-hv-bd: #37445a;
+  --scroll:    #2b3543;
+  --scroll-hv: #3a4757;
+  --overlay:   rgba(4, 6, 9, .72);
+  --on-accent: #ffffff;
+  /* 日志着色 */
+  --log-text:  #c9d4de;
+  --log-ok:    #7ee787;
+  --log-warn:  #e3b341;
+  --log-err:   #ff9d95;
+  --log-cmd:   #79c0ff;
   --mono: ui-monospace, "Cascadia Mono", "Consolas", "Courier New", monospace;
+}
+
+/* ── 浅色 ── */
+:root[data-theme="light"] {
+  --bg:        #f6f8fa;
+  --panel:     #ffffff;
+  --panel-2:   #eef2f6;
+  --inset:     #ffffff;
+  --inset-2:   #f8fafc;
+  --line:      #d6dee6;
+  --line-soft: #e6ecf2;
+  --text:      #1c2430;
+  --text-2:    #55636f;
+  --text-3:    #8592a0;
+  --accent:    #1f6feb;
+  --accent-2:  #1a5fd0;
+  --ok:        #1a7f37;
+  --ok-bg:     #e8f5ec;
+  --ok-bd:     #b3ddc0;
+  --warn:      #9a6700;
+  --warn-bg:   #fff5d6;
+  --warn-bd:   #e6cf8a;
+  --err:       #cf222e;
+  --err-bg:    #ffeef0;
+  --err-bd:    #f0b6bb;
+  --danger-bg: #ffeef0;
+  --danger-bd: #f0b6bb;
+  --danger-fg: #b62324;
+  --danger-hv: #ffdce0;
+  --btn-hover: #e7edf3;
+  --btn-hv-bd: #c2ceda;
+  --scroll:    #c9d3dd;
+  --scroll-hv: #b0bcc9;
+  --overlay:   rgba(28, 36, 48, .45);
+  --on-accent: #ffffff;
+  --log-text:  #24303c;
+  --log-ok:    #1a7f37;
+  --log-warn:  #9a6700;
+  --log-err:   #cf222e;
+  --log-cmd:   #1f6feb;
+}
+
+/* 未显式设置 data-theme 时跟随系统 */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg:        #f6f8fa;
+    --panel:     #ffffff;
+    --panel-2:   #eef2f6;
+    --inset:     #ffffff;
+    --inset-2:   #f8fafc;
+    --line:      #d6dee6;
+    --line-soft: #e6ecf2;
+    --text:      #1c2430;
+    --text-2:    #55636f;
+    --text-3:    #8592a0;
+    --accent:    #1f6feb;
+    --accent-2:  #1a5fd0;
+    --ok:        #1a7f37;
+    --ok-bg:     #e8f5ec;
+    --ok-bd:     #b3ddc0;
+    --warn:      #9a6700;
+    --warn-bg:   #fff5d6;
+    --warn-bd:   #e6cf8a;
+    --err:       #cf222e;
+    --err-bg:    #ffeef0;
+    --err-bd:    #f0b6bb;
+    --danger-bg: #ffeef0;
+    --danger-bd: #f0b6bb;
+    --danger-fg: #b62324;
+    --danger-hv: #ffdce0;
+    --btn-hover: #e7edf3;
+    --btn-hv-bd: #c2ceda;
+    --scroll:    #c9d3dd;
+    --scroll-hv: #b0bcc9;
+    --overlay:   rgba(28, 36, 48, .45);
+    --log-text:  #24303c;
+    --log-ok:    #1a7f37;
+    --log-warn:  #9a6700;
+    --log-err:   #cf222e;
+    --log-cmd:   #1f6feb;
+  }
 }
 
 * { box-sizing: border-box; }
@@ -54,7 +161,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .brand strong { font-size: 14px; }
 .brand .sub {
   color: var(--text-3); font-family: var(--mono); font-size: 11px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46vw;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw;
 }
 .topbar-actions { display: flex; align-items: center; gap: 8px; }
 
@@ -63,9 +170,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--panel-2); border: 1px solid var(--line); color: var(--text-2);
   white-space: nowrap;
 }
-.badge.ok   { color: var(--ok);   border-color: #23492c; background: #10241a; }
-.badge.warn { color: var(--warn); border-color: #4a3a12; background: #241d0d; }
-.badge.err  { color: var(--err);  border-color: #4d1f1c; background: #2a1412; }
+.badge.ok   { color: var(--ok);   border-color: var(--ok-bd);   background: var(--ok-bg); }
+.badge.warn { color: var(--warn); border-color: var(--warn-bd); background: var(--warn-bg); }
+.badge.err  { color: var(--err);  border-color: var(--err-bd);  background: var(--err-bg); }
+
+/* 主题切换按钮：三态循环 跟随系统 → 深色 → 浅色 */
+.theme-btn {
+  padding: 3px 8px; border-radius: 5px; cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text-2);
+  font-size: 11px; white-space: nowrap;
+}
+.theme-btn:hover { background: var(--btn-hover); color: var(--text); }
 
 /* ── 布局 ── */
 .layout {
@@ -91,19 +206,19 @@ button, input, select, textarea { font: inherit; color: inherit; }
   transition: background .12s, border-color .12s;
   white-space: nowrap;
 }
-.btn:hover:not(:disabled) { background: #232b3a; border-color: #37445a; }
+.btn:hover:not(:disabled) { background: var(--btn-hover); border-color: var(--btn-hv-bd); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
-.btn.primary { background: var(--accent-2); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent-2); border-color: var(--accent); color: var(--on-accent); }
 .btn.primary:hover:not(:disabled) { background: var(--accent); }
-.btn.danger  { background: #3a1b19; border-color: #5c2a26; color: #ff9d95; }
-.btn.danger:hover:not(:disabled) { background: #4a221f; }
+.btn.danger  { background: var(--danger-bg); border-color: var(--danger-bd); color: var(--danger-fg); }
+.btn.danger:hover:not(:disabled) { background: var(--danger-hv); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
 .btn.ghost:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
 .btn.small { padding: 3px 8px; font-size: 12px; }
 
 .input {
   width: 100%; padding: 5px 9px; border-radius: 5px;
-  background: #0c1015; border: 1px solid var(--line); color: var(--text);
+  background: var(--inset); border: 1px solid var(--line); color: var(--text);
   font-family: var(--mono); font-size: 12px;
 }
 .input:focus { outline: none; border-color: var(--accent); }
@@ -151,7 +266,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 7px; }
 .fact {
-  background: #0c1015; border: 1px solid var(--line-soft);
+  background: var(--inset); border: 1px solid var(--line-soft);
   border-radius: 5px; padding: 6px 8px;
 }
 .fact .k { color: var(--text-3); font-size: 10.5px; }
@@ -174,9 +289,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .presets { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
 .preset {
   padding: 4px 9px; border-radius: 5px; font-family: var(--mono); font-size: 11.5px;
-  background: #0c1015; border: 1px solid var(--line); color: var(--text-2);
+  background: var(--inset); border: 1px solid var(--line); color: var(--text-2);
 }
-.preset.available { color: var(--ok); border-color: #23492c; }
+.preset.available { color: var(--ok); border-color: var(--ok-bd); }
 .preset.missing { color: var(--text-3); text-decoration: line-through; }
 
 /* ── 表单 ── */
@@ -187,28 +302,80 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .field .note { color: var(--text-3); font-size: 10.5px; }
 .field input, .field textarea, .field select {
   width: 100%; padding: 5px 8px; border-radius: 5px;
-  background: #0c1015; border: 1px solid var(--line); color: var(--text);
+  background: var(--inset); border: 1px solid var(--line); color: var(--text);
   font-family: var(--mono); font-size: 12px;
 }
 .field textarea { min-height: 58px; resize: vertical; line-height: 1.5; }
 .field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
-.field input[readonly] { color: var(--text-3); background: #0a0d11; }
+.field input[readonly] { color: var(--text-3); background: var(--inset-2); }
 
 /* ── 日志 ── */
 .log {
   flex: 1; margin: 0; padding: 9px 11px; overflow-y: auto;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-  color: #c9d4de; background: #0a0d11; white-space: pre-wrap; word-break: break-word;
+  color: var(--log-text); background: var(--inset-2); white-space: pre-wrap; word-break: break-word;
 }
-.log .l-err  { color: #ff9d95; }
-.log .l-ok   { color: #7ee787; }
-.log .l-warn { color: #e3b341; }
-.log .l-cmd  { color: #79c0ff; }
+.log .l-err  { color: var(--log-err); }
+.log .l-ok   { color: var(--log-ok); }
+.log .l-warn { color: var(--log-warn); }
+.log .l-cmd  { color: var(--log-cmd); }
 .log .l-dim  { color: var(--text-3); }
+
+/* ── 会话标签 ── */
+.session-tabs {
+  flex: none; display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 6px 8px; border-bottom: 1px solid var(--line-soft);
+  max-height: 92px; overflow-y: auto;
+}
+.session-tabs:empty::after {
+  content: '暂无运行中的注入会话';
+  color: var(--text-3); font-size: 11px; padding: 2px 4px;
+}
+.stab {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 7px; border-radius: 5px; cursor: pointer;
+  background: var(--inset); border: 1px solid var(--line);
+  font-size: 11.5px; color: var(--text-2); white-space: nowrap;
+}
+.stab:hover { background: var(--panel-2); }
+.stab.active { border-color: var(--accent); color: var(--text); background: var(--panel-2); }
+.stab .dot {
+  width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: var(--text-3);
+}
+.stab.run .dot { background: var(--ok); }
+.stab.dead .dot { background: var(--text-3); }
+.stab .nm { max-width: 110px; overflow: hidden; text-overflow: ellipsis; }
+.stab .pt { color: var(--text-3); font-family: var(--mono); font-size: 10.5px; }
+.stab .x {
+  color: var(--text-3); padding: 0 2px; border-radius: 3px; font-size: 12px; line-height: 1;
+}
+.stab .x:hover { color: var(--err); background: var(--err-bg); }
+.stab .ext { color: var(--warn); font-size: 10px; }
+
+.log-head { border-top: 1px solid var(--line-soft); }
+
+/* ── 自定义 CSS 编辑器 ── */
+.css-editor {
+  width: 100%; min-height: 160px; resize: vertical;
+  padding: 8px 10px; border-radius: 5px;
+  background: var(--inset-2); border: 1px solid var(--line); color: var(--text);
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  tab-size: 2;
+}
+.css-editor:focus { outline: none; border-color: var(--accent); }
+.css-editor::placeholder { color: var(--text-3); }
+
+.select-inline {
+  padding: 4px 7px; border-radius: 5px;
+  background: var(--inset); border: 1px solid var(--line); color: var(--text);
+  font-size: 12px; cursor: pointer;
+}
+.select-inline:focus { outline: none; border-color: var(--accent); }
 
 /* ── 模态 ── */
 .modal {
-  position: fixed; inset: 0; background: rgba(4, 6, 9, .72);
+  position: fixed; inset: 0; background: var(--overlay);
   display: flex; align-items: center; justify-content: center; z-index: 50;
 }
 .modal-box {
@@ -257,5 +424,5 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* 滚动条 */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2b3543; border-radius: 5px; border: 2px solid var(--bg); }
-::-webkit-scrollbar-thumb:hover { background: #3a4757; }
+::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-hv); }

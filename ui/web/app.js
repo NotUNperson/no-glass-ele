@@ -20,8 +20,12 @@ let STATE = {
   current: null,       // 当前选中的 profile 名
   data: null,          // 当前 profile 的完整数据
   dirty: false,
-  logCursor: 0,
+  logCursor: 0,        // 短任务日志游标
   taskRunning: false,
+  sessions: [],        // 运行中的注入会话
+  activeSession: null, // 当前查看日志的会话 key（localId 或 id）
+  sessionCursors: {},  // key -> 游标（每个会话独立）
+  cssDirty: false,
   wizard: null,        // 向导状态
 };
 
@@ -49,6 +53,47 @@ const esc = (s) => String(s == null ? '' : s)
 
 const yn = (v) => v === true ? '是' : v === false ? '否' : '未知';
 
+// ─────────────────────────── 界面主题 ───────────────────────────
+
+/**
+ * 三态循环：跟随系统 → 深色 → 浅色 → 跟随系统 …
+ *
+ * 实现方式：把选择写到 <html data-theme>。不设置时 CSS 里有一段
+ * @media (prefers-color-scheme: light) 覆盖，自动跟随系统。
+ * 选择记在 localStorage，下次打开还记得。
+ */
+const THEME_KEY = 'noglass-ui-theme';
+const THEMES = ['', 'dark', 'light'];   // '' = 跟随系统
+const THEME_LABEL = { '': '跟随系统', dark: '深色', light: '浅色' };
+
+function applyTheme(theme) {
+  const html = document.documentElement;
+  if (theme) html.setAttribute('data-theme', theme);
+  else html.removeAttribute('data-theme');
+  const b = $('btnTheme');
+  if (b) b.textContent = `主题：${THEME_LABEL[theme] || '跟随系统'}`;
+  try {
+    if (theme) localStorage.setItem(THEME_KEY, theme);
+    else localStorage.removeItem(THEME_KEY);
+  } catch (_) { /* 无 localStorage 就算了，只影响记忆 */ }
+}
+
+function initTheme() {
+  let saved = '';
+  try { saved = localStorage.getItem(THEME_KEY) || ''; } catch (_) { saved = ''; }
+  if (!THEMES.includes(saved)) saved = '';
+  applyTheme(saved);
+}
+
+function cycleTheme() {
+  let cur = '';
+  try { cur = localStorage.getItem(THEME_KEY) || ''; } catch (_) { cur = ''; }
+  if (!THEMES.includes(cur)) cur = '';
+  const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+  applyTheme(next);
+  toast(`界面主题：${THEME_LABEL[next]}`, 'ok', 2200);
+}
+
 // ─────────────────────────── 初始化 ───────────────────────────
 
 window.addEventListener('pywebviewready', init);
@@ -61,6 +106,7 @@ async function init() {
   inited = true;
   STATE.ready = true;
 
+  initTheme();
   bindUI();
 
   const st = unwrap(await api().get_state());
@@ -137,6 +183,7 @@ async function selectProfile(name, keepScroll = false) {
   STATE.dirty = false;
   renderList();
   renderDetail(keepScroll);
+  await loadCustomCss();
 }
 
 function renderDetail(keepScroll = false) {
@@ -228,6 +275,8 @@ const FIELDS = [
   { key: 'urlFilter', label: 'urlFilter（正则）', type: 'text', wide: true, note: '只注入匹配的页面，放过第三方网页' },
   { key: 'isolateEnv', label: 'isolateEnv（私有隔离开关）', type: 'kv', wide: true, note: 'JSON 对象；应用覆盖了 userData 时必需' },
   { key: 'dataDirEnv', label: 'dataDirEnv', type: 'text', note: '指定数据目录的环境变量名' },
+  { key: 'emulateColorScheme', label: '配色模拟', type: 'enum', options: ['', 'dark', 'light'], note: '只对已写 prefers-color-scheme 的应用有效' },
+  { key: 'appArgs', label: '传给应用的启动参数', type: 'strlist', wide: true, note: '逗号分隔；如 --disable-lcd-text（Chromium 只在启动时读）' },
   { key: 'native.enabled', label: '启用 --native', type: 'bool', note: 'fuse 禁用 --inspect 时不可用' },
   { key: 'native.darkBg', label: '深色窗口底色', type: 'text' },
   { key: 'native.lightBg', label: '浅色窗口底色', type: 'text' },
@@ -259,6 +308,14 @@ function renderForm(p) {
       input = `<label class="check"><input type="checkbox" data-key="${f.key}" ${v === true ? 'checked' : ''}> 启用</label>`;
     } else if (f.type === 'textarea') {
       input = `<textarea data-key="${f.key}" placeholder="（可留空）">${esc(v || '')}</textarea>`;
+    } else if (f.type === 'enum') {
+      const opts = (f.options || []).map((o) =>
+        `<option value="${esc(o)}" ${String(v || '') === o ? 'selected' : ''}>${o === '' ? '（不模拟）' : o}</option>`
+      ).join('');
+      input = `<select data-key="${f.key}" class="select-inline">${opts}</select>`;
+    } else if (f.type === 'strlist') {
+      const s = Array.isArray(v) ? v.join(', ') : (v || '');
+      input = `<input type="text" data-key="${f.key}" value="${esc(s)}" placeholder="如 --disable-lcd-text, --font-render-hinting=none">`;
     } else if (f.type === 'list') {
       const s = Array.isArray(v) ? v.join(', ') : (v || '');
       input = `<input type="text" data-key="${f.key}" value="${esc(s)}" placeholder="如 9527, 8080">`;
@@ -299,6 +356,11 @@ function collectForm() {
     if (f.type === 'list') {
       const arr = raw ? raw.split(',').map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)) : [];
       setPath(out, f.key, arr);
+    } else if (f.type === 'strlist') {
+      const arr = raw ? raw.split(',').map((x) => x.trim()).filter(Boolean) : [];
+      setPath(out, f.key, arr);
+    } else if (f.type === 'enum') {
+      setPath(out, f.key, raw === '' ? null : raw);
     } else if (f.type === 'kv') {
       if (!raw) { setPath(out, f.key, null); continue; }
       let obj;
@@ -346,38 +408,169 @@ async function launchInjector() {
   if (!STATE.current) return;
   const isolate = $('optIsolate').checked;
   const extra = $('optExtra').value.trim();
+  const emulate = $('optEmulate').value || null;
+  const appArgsRaw = $('optAppArgs').value.trim();
+  // 按空格切分，但保留带引号的整体（简单处理：够用且可预期）
+  const appArgs = appArgsRaw ? appArgsRaw.match(/"[^"]*"|\S+/g).map((s) => s.replace(/^"|"$/g, '')) : [];
 
-  const res = await api().launch(STATE.current, isolate, extra || null);
+  const res = await api().launch(STATE.current, isolate, extra || null, emulate, appArgs);
   if (!res) { toast('界面桥未就绪', 'err'); return; }
   if (res.ok === false) {
     toast(res.error || '启动失败', res.forbidden ? 'warn' : 'err', res.forbidden ? 7000 : 4000);
     return;
   }
   toast('已启动注入器（--watch 常驻）', 'ok');
+  // 立刻切到这个会话的日志
+  if (res.localId) STATE.activeSession = res.localId;
+  await refresh();
+  await updateTaskUI();
+}
+
+async function stopSession(key) {
+  const s = STATE.sessions.find((x) => (x.localId || x.id) === key);
+  const nm = s ? (s.displayName || s.profile) : key;
+
+  const res = await api().stop_session(
+    s && s.localId ? s.localId : null,
+    s && s.id ? s.id : null
+  );
+  if (!res) { toast('界面桥未就绪', 'err'); return; }
+  if (res.ok === false) { toast(res.error || '停止失败', 'err', 4000); return; }
+
+  toast(`已请求停止 ${nm}。目标应用不会被关闭。`, 'ok', 5000);
   await updateTaskUI();
 }
 
 async function stopTask() {
-  const res = unwrap(await api().stop_task());
-  if (!res) return;
-  toast('已停止注入器。目标应用不受影响。', 'ok');
-  await updateTaskUI();
+  // 旧的「停止」按钮：停当前选中的会话，没有就停任意一个
+  const key = STATE.activeSession;
+  if (key) return stopSession(key);
+  const running = STATE.sessions.find((s) => s.running);
+  if (running) return stopSession(running.localId || running.id);
+  toast('没有运行中的注入会话', 'warn');
 }
 
 async function updateTaskUI() {
   const res = await api().get_task_status();
-  const running = !!(res && res.ok && res.task && res.task.running);
-  STATE.taskRunning = running;
+  const st = (res && res.ok && res.task) || {};
+  STATE.taskRunning = !!st.taskRunning;
+
+  // 会话列表走 get_overview —— 它带 5 秒 TTL 缓存，且内部会实时刷新
+  // 会话部分（读磁盘注册表，很廉价）。这样高频轮询不会反复跑 node。
+  let sess = [];
+  try {
+    const sr = await api().get_overview();
+    if (sr && sr.ok) sess = sr.sessions || [];
+  } catch (_) { /* 忽略 */ }
+  STATE.sessions = sess;
+
+  renderSessionTabs();
+
+  const running = sess.filter((s) => s.running);
   const b = $('taskBadge');
-  if (running) {
-    b.textContent = res.task.kind === 'injector' ? '注入中' : '任务运行中';
+  if (running.length) {
+    b.textContent = `${running.length} 个注入中`;
+    b.className = 'badge ok';
+  } else if (STATE.taskRunning) {
+    b.textContent = '任务运行中';
     b.className = 'badge ok';
   } else {
     b.textContent = '空闲';
     b.className = 'badge';
   }
-  $('btnStop').disabled = !running;
-  $('btnLaunch').disabled = running;
+
+  const cur = STATE.current;
+  const mine = sess.find((s) => s.profile === cur && s.running);
+  $('btnStop').disabled = !mine && !STATE.taskRunning;
+  $('btnLaunch').disabled = !!mine;
+}
+
+function renderSessionTabs() {
+  const box = $('sessionTabs');
+  const live = STATE.sessions.filter((s) => s.running || s.id);
+
+  // 若当前查看的会话没了，回退到第一个
+  const keys = live.map((s) => s.localId || s.id);
+  if (STATE.activeSession && !keys.includes(STATE.activeSession)) {
+    STATE.activeSession = keys[0] || null;
+  }
+  if (!STATE.activeSession && keys.length) STATE.activeSession = keys[0];
+
+  box.innerHTML = live.map((s) => {
+    const key = s.localId || s.id;
+    const nm = s.displayName || s.profile || '(未知)';
+    const cls = ['stab'];
+    if (s.running) cls.push('run'); else cls.push('dead');
+    if (key === STATE.activeSession) cls.push('active');
+    const port = s.port != null ? `<span class="pt">:${s.port}</span>` : '';
+    const ext = s.external ? '<span class="ext" title="外部启动的注入器（无实时日志）">外部</span>' : '';
+    const x = s.running ? `<span class="x" data-stop="${esc(key)}" title="停止（不关应用）">✕</span>` : '';
+    return `<span class="${cls.join(' ')}" data-key="${esc(key)}" title="${esc(nm)}">
+      <span class="dot"></span><span class="nm">${esc(nm)}</span>${port}${ext}${x}
+    </span>`;
+  }).join('');
+
+  // 切标签
+  box.querySelectorAll('.stab').forEach((el) => {
+    el.onclick = (e) => {
+      if (e.target.dataset.stop) return;   // 点的是 ✕
+      STATE.activeSession = el.dataset.key;
+      $('log').innerHTML = '';
+      renderSessionTabs();
+      pollSessionLog();
+    };
+  });
+  // 停止按钮
+  box.querySelectorAll('[data-stop]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      stopSession(el.dataset.stop);
+    };
+  });
+
+  const cur = STATE.sessions.find((s) => (s.localId || s.id) === STATE.activeSession);
+  $('logTitle').textContent = cur
+    ? `输出 · ${cur.displayName || cur.profile}${cur.external ? '（外部，无实时日志）' : ''}`
+    : '输出';
+}
+
+/** 轮询当前选中会话的日志。每个会话有独立游标。 */
+async function pollSessionLog() {
+  const key = STATE.activeSession;
+  if (!key) {
+    // 没有会话时退回短任务日志
+    return pollTaskLog();
+  }
+  const s = STATE.sessions.find((x) => (x.localId || x.id) === key);
+  if (!s) return pollTaskLog();
+
+  const cursor = STATE.sessionCursors[key] || 0;
+  const res = await api().get_session_log(
+    s.localId || null, s.id || null, cursor
+  );
+  if (!res || res.ok === false) return;
+
+  if (res.live) {
+    STATE.sessionCursors[key] = res.cursor;
+    appendLog(res.lines || []);
+  } else {
+    // 外部会话：整段返回，直接替换显示（避免重复追加）
+    if (res.lines && res.lines.length) {
+      const box = $('log');
+      const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+      box.innerHTML = res.lines
+        .map((l) => `<span class="${classify(l)}">${esc(l)}</span>`).join('\n');
+      if ($('optFollow').checked && atBottom) box.scrollTop = box.scrollHeight;
+    }
+  }
+}
+
+/** 短任务日志（probe / build / doctor）—— 没有会话时显示这个。 */
+async function pollTaskLog() {
+  const res = await api().get_logs(STATE.logCursor);
+  if (!res || res.ok === false) return;
+  STATE.logCursor = res.cursor;
+  appendLog(res.lines || []);
 }
 
 // ─────────────────────────── 日志轮询 ───────────────────────────
@@ -408,19 +601,90 @@ function appendLog(lines) {
 }
 
 async function pollLogs() {
-  const res = await api().get_logs(STATE.logCursor);
-  if (!res || res.ok === false) return;
-  STATE.logCursor = res.cursor;
-  appendLog(res.lines || []);
+  await pollSessionLog();
 }
 
+/**
+ * 分层轮询 —— 这是修「进程雪崩」的关键。
+ *
+ * 之前是每 300ms 同时做两件事：拉日志 + 刷新会话列表。
+ * 而刷新会话列表要查进程表（起 PowerShell，1-2 秒），于是调用严重重叠，
+ * 实测派生出 25+ 个 powershell、CPU 100%、内存掉到 583MB。
+ *
+ * 现在分开：
+ *   · 日志轮询 300ms —— 纯内存读取（本地会话读缓冲区，外部会话读一个小文件）
+ *   · 会话/任务状态 2 秒 —— 且后端本身还有 TTL 缓存兜底
+ *
+ * 另外每个轮询都有「在飞」标志，防止上一次没回来就发下一次（防重入）。
+ */
+const POLL_LOG_MS = 300;
+const POLL_STATE_MS = 2000;
+
+const _inFlight = { log: false, state: false };
+
 function startPolling() {
-  const tick = async () => {
-    if (!STATE.ready) return;
-    try { await pollLogs(); } catch (_) { /* 忽略瞬时错误 */ }
+  // 日志：高频，但很轻
+  setInterval(async () => {
+    if (!STATE.ready || _inFlight.log) return;
+    _inFlight.log = true;
+    try { await pollLogs(); } catch (_) { /* 忽略 */ }
+    finally { _inFlight.log = false; }
+  }, POLL_LOG_MS);
+
+  // 状态：低频。后端另有 TTL 缓存，即使这里发得勤也不会真去查进程表。
+  setInterval(async () => {
+    if (!STATE.ready || _inFlight.state) return;
+    _inFlight.state = true;
     try { await updateTaskUI(); } catch (_) { /* 忽略 */ }
-  };
-  setInterval(tick, 300);
+    finally { _inFlight.state = false; }
+  }, POLL_STATE_MS);
+
+  // 首次立刻刷新一次状态，不用等 2 秒
+  setTimeout(async () => {
+    if (_inFlight.state) return;
+    _inFlight.state = true;
+    try { await updateTaskUI(); } catch (_) { /* 忽略 */ }
+    finally { _inFlight.state = false; }
+  }, 100);
+}
+
+// ─────────────────────────── 自定义 CSS ───────────────────────────
+
+async function loadCustomCss() {
+  if (!STATE.current) return;
+  const res = await api().get_custom_css(STATE.current);
+  if (!res) return;
+  if (res.ok === false) {
+    $('cssStatus').textContent = res.error || '读取失败';
+    return;
+  }
+  $('cssEditor').value = res.css || '';
+  STATE.cssDirty = false;
+  $('cssPathHint').textContent = res.exists ? '（已有片段）' : '（尚未创建，保存后自动创建）';
+  $('cssStatus').textContent = '';
+}
+
+async function saveCustomCss() {
+  if (!STATE.current) return;
+  const css = $('cssEditor').value;
+  const res = await api().save_custom_css(STATE.current, css);
+  if (!res) { toast('界面桥未就绪', 'err'); return; }
+  if (res.ok === false) {
+    toast(res.error || '保存失败', res.forbidden ? 'warn' : 'err', 5000);
+    return;
+  }
+  STATE.cssDirty = false;
+
+  // 如果该应用正在被注入，注入器会通过热重载自动重新注入
+  const running = STATE.sessions.find((s) => s.profile === STATE.current && s.running);
+  if (running) {
+    toast('已保存。注入器会自动重新注入（无需重启应用）。', 'ok', 5000);
+    $('cssStatus').textContent = '已保存 · 等待热重载';
+    setTimeout(() => { $('cssStatus').textContent = ''; }, 3000);
+  } else {
+    toast('已保存。该应用当前没有运行中的注入，下次启动时生效。', 'ok', 5000);
+  }
+  await loadCustomCss();
 }
 
 // ─────────────────────────── 新建向导 ───────────────────────────
@@ -608,6 +872,7 @@ async function wizCreate() {
 
 function bindUI() {
   $('btnRefresh').onclick = refresh;
+  $('btnTheme').onclick = cycleTheme;
   $('btnNew').onclick = openWizard;
   $('btnDoctor').onclick = async () => {
     unwrap(await api().run_task('doctor'));
@@ -622,9 +887,30 @@ function bindUI() {
     toast('已撤销未保存的修改', 'ok');
   };
   $('btnClearLog').onclick = async () => {
-    const res = await api().clear_logs();
-    if (res && res.ok) { STATE.logCursor = res.cursor; $('log').innerHTML = ''; }
+    const key = STATE.activeSession;
+    if (key) {
+      STATE.sessionCursors[key] = 0;
+      $('log').innerHTML = '';
+      await pollSessionLog();
+    } else {
+      const res = await api().clear_logs();
+      if (res && res.ok) { STATE.logCursor = res.cursor; $('log').innerHTML = ''; }
+    }
   };
+  $('btnPrune').onclick = async () => {
+    const res = await api().prune_sessions();
+    if (res && res.ok) {
+      toast(res.removed ? `已清理 ${res.removed} 个残留注册项` : '没有需要清理的', 'ok');
+      await updateTaskUI();
+    }
+  };
+  $('btnSaveCss').onclick = saveCustomCss;
+  $('btnReloadCss').onclick = loadCustomCss;
+
+  $('cssEditor').addEventListener('input', () => {
+    STATE.cssDirty = true;
+    $('cssStatus').textContent = '未保存';
+  });
 
   $('wizClose').onclick = closeWizard;
   $('wizCancel').onclick = closeWizard;

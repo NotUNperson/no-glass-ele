@@ -44,6 +44,120 @@ const DEFAULT_PORT = 9333;
 const DEFAULT_STYLE_ID = '__noglass__';
 const POLL_MS = 400;          // 目标扫描间隔：越短，注入延迟越小
 const NATIVE_EVERY = 25;      // watch 模式下约每 N 次扫描补一次窗口侧设置
+const STOP_POLL_MS = 1000;    // 停止文件检查间隔
+const LIVENESS_EVERY = 5;     // 每 N 次巡检做一次目标应用存活性检查
+
+// ─────────────────────── 会话注册表（run/ 目录）───────────────────────
+/**
+ * 为什么要一个注册表：
+ *   注入器是 detached 后台进程，启动它的人（UI / .cmd / 自启动项）未必一直活着。
+ *   把会话状态落到磁盘上，任何一方都能看到「现在有哪些注入在跑」，也能请求停止。
+ *
+ * 文件布局（这就是与 gen.js / app.py 的契约，三处必须一致）：
+ *   run/sessions/<id>.json   会话状态：pid/port/profile/exe/startedAt/source
+ *   run/sessions/<id>.stop   停止请求：文件存在即请求停止
+ *   run/logs/<id>.log        该会话日志（追加写）
+ *
+ * 为什么用「停止文件」而不是直接杀进程：
+ *   注入器启动目标应用时虽然用了 detached，但 Windows 进程表里仍记录着父子关系。
+ *   用 taskkill /T 会顺着进程树把目标应用一起杀掉 —— 那会关掉用户正在用的窗口。
+ *   所以停止走协作式：请求方放一个文件，注入器自己优雅退出，目标应用不受影响。
+ */
+const RUN_DIR = path.join(HERE, '..', 'run');
+const SESS_DIR = path.join(RUN_DIR, 'sessions');
+const LOG_DIR = path.join(RUN_DIR, 'logs');
+
+function ensureRunDirs() {
+  for (const d of [SESS_DIR, LOG_DIR]) {
+    try { fs.mkdirSync(d, { recursive: true }); } catch { /* 已存在或无权限，后面写入时会报 */ }
+  }
+}
+
+/** 会话 id：profile 名（已净化）+ pid，保证唯一且文件系统安全。 */
+function makeSessionId(cfg) {
+  const slug = String(cfg.profile.name || cfg.name || 'app').replace(/[^A-Za-z0-9._-]/g, '-');
+  return `${slug}-${process.pid}`;
+}
+
+class SessionRegistry {
+  constructor(cfg, opts = {}) {
+    this.id = makeSessionId(cfg);
+    this.file = path.join(SESS_DIR, `${this.id}.json`);
+    this.stopFile = path.join(SESS_DIR, `${this.id}.stop`);
+    this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.active = false;
+    this._logStream = null;
+    this._meta = null;
+
+    this.meta = {
+      id: this.id,
+      pid: process.pid,
+      profile: cfg.profile.name || cfg.name,
+      profilePath: cfg.profile.__path || null,
+      displayName: cfg.profile.displayName || cfg.name,
+      appName: cfg.name,
+      processName: cfg.processName || null,
+      exe: cfg.exe || null,
+      port: cfg.port,
+      inspectPort: cfg.inspectPort,
+      watch: !!cfg.watch,
+      isolate: !!cfg.isolate,
+      native: !!cfg.native,
+      css: cfg.css || null,
+      cssExtra: cfg.cssExtra || null,
+      emulateColorScheme: cfg.emulateColorScheme || null,
+      startedAt: new Date().toISOString(),
+      source: opts.source || 'cli',
+    };
+  }
+
+  /** 写注册项并打开日志文件。失败不致命（只读目录等），只是失去可观测性。 */
+  open() {
+    try {
+      ensureRunDirs();
+      // 上一次的停止请求不应该影响这一次启动
+      try { fs.unlinkSync(this.stopFile); } catch { /* 不存在是常态 */ }
+
+      this._logStream = fs.createWriteStream(this.logFile, { flags: 'a' });
+      fs.writeFileSync(this.file, JSON.stringify(this.meta, null, 2) + '\n', 'utf8');
+      this.active = true;
+      return true;
+    } catch (e) {
+      this.active = false;
+      this.openError = e.message;
+      return false;
+    }
+  }
+
+  /** 追加一行日志（同时给控制台用；控制台由 log() 负责）。 */
+  append(text) {
+    if (!this.active || !this._logStream) return;
+    try {
+      this._logStream.write(text + '\n');
+    } catch { /* 忽略写失败 */ }
+  }
+
+  /** 请求方是否要求停止。 */
+  stopRequested() {
+    try { return fs.existsSync(this.stopFile); } catch { return false; }
+  }
+
+  /** 更新注册项里的字段（如页面数变化）。 */
+  update(patch) {
+    if (!this.active) return;
+    Object.assign(this.meta, patch);
+    try { fs.writeFileSync(this.file, JSON.stringify(this.meta, null, 2) + '\n', 'utf8'); } catch { /* 忽略 */ }
+  }
+
+  /** 清理：删注册项与停止文件，关闭日志流。退出路径上必须调用。 */
+  close() {
+    if (!this.active) return;
+    try { this._logStream && this._logStream.end(); } catch { /* 忽略 */ }
+    try { fs.unlinkSync(this.file); } catch { /* 忽略 */ }
+    try { fs.unlinkSync(this.stopFile); } catch { /* 忽略 */ }
+    this.active = false;
+  }
+}
 
 // ─────────────────────────── 参数 ───────────────────────────
 
@@ -75,6 +189,14 @@ function parseArgs(argv) {
     processName: null, styleId: null,
     displayName: null,
     quiet: false,
+    source: 'cli',
+    // 传给**目标应用**的额外参数（不是传给本注入器）。
+    // 用途：Chromium 渲染开关，例如 --disable-lcd-text（强制灰度抗锯齿）、
+    // --font-render-hinting=none。这些参数 Chromium 只在启动时读，所以要透传给应用。
+    appArgs: [],
+    // 传给本注入器的额外参数（由 --app-arg 之外的场景使用，如自启动脚本标记来源）
+    emulateColorScheme: null,
+    cssExtra: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i], next = () => argv[++i];
@@ -90,14 +212,28 @@ function parseArgs(argv) {
       case '--isolate': o.isolate = true; o.launch = true; break;
       case '--exe': o.exe = next(); break;
       case '--css': o.css = path.resolve(next()); break;
+      case '--css-extra': o.cssExtra = path.resolve(next()); break;
       case '--data-dir': o.dataDir = path.resolve(next()); break;
       case '--timeout': o.timeout = Number(next()); break;
       case '--process-name': o.processName = next(); break;
       case '--style-id': o.styleId = next(); break;
       case '--name': o.displayName = next(); break;
+      case '--emulate-color-scheme': o.emulateColorScheme = next(); break;
+      case '--source': o.source = next(); break;
       case '-q': case '--quiet': o.quiet = true; break;
       case '-h': case '--help': printHelp(); process.exit(0); break;
-      default: if (a.startsWith('--')) { console.error(`未知参数: ${a}`); process.exit(2); }
+      default:
+        // --app-arg=<flag> / --app-arg <flag>：透传给目标应用
+        if (a === '--app-arg') { o.appArgs.push(next()); break; }
+        if (a.startsWith('--app-arg=')) { o.appArgs.push(a.slice('--app-arg='.length)); break; }
+        if (a.startsWith('--')) {
+          // 这里刻意不 exit(2)：以前的行为是「未知参数直接崩」，
+          // 导致 `start.cmd --font-render-hinting=none` 把注入器打死而不是把参数交给应用。
+          // 现在把不认识的参数当作「想传给目标应用」处理，并明确告知。
+          o.appArgs.push(a);
+          console.error(`[noglass] 未识别的参数 ${a} —— 按目标应用参数处理（等同 --app-arg=${a}）`);
+          break;
+        }
     }
   }
   return o;
@@ -111,6 +247,7 @@ function resolveConfig(opts) {
   const prof = loadProfile(opts.profile);
 
   const name = opts.displayName || prof.displayName || prof.name || 'app';
+  const profName = prof.name || null;
   const cfg = {
     profile: prof,
     name,
@@ -132,6 +269,10 @@ function resolveConfig(opts) {
     urlFilter: prof.urlFilter || null,
     nativeColors: prof.native || null,
     notes: prof.notes || {},
+    appArgs: [...(prof.appArgs || []), ...(opts.appArgs || [])],
+    emulateColorScheme: opts.emulateColorScheme || prof.emulateColorScheme || null,
+    source: opts.source || 'cli',
+    profileName: profName,
   };
   if (cfg.inspectPort == null) cfg.inspectPort = cfg.port + 1;
 
@@ -140,11 +281,46 @@ function resolveConfig(opts) {
     const alt = path.join(HERE, 'no-glass.css');
     if (fs.existsSync(alt)) cfg.css = alt;
   }
+
+  // ── 自定义 CSS 片段（追加在内置样式表之后）──
+  // 两条来源，后者优先：
+  //   1. 约定文件 css/<profile名>.custom.css —— 无需配置，存在即生效
+  //   2. profile.cssExtra / --css-extra 显式指定
+  // 这样用户给「电脑端没有深色模式」的应用补样式时，不用改内置样式表，
+  // 也不会因为工具升级覆盖掉自己的片段。
+  cfg.cssExtra = null;
+  if (opts.cssExtra) {
+    cfg.cssExtra = opts.cssExtra;
+  } else if (prof.cssExtra) {
+    cfg.cssExtra = path.resolve(prof.__dir, prof.cssExtra);
+  } else if (profName) {
+    const conv = path.join(HERE, '..', 'css', `${profName}.custom.css`);
+    if (fs.existsSync(conv)) cfg.cssExtra = conv;
+  }
+
   if (cfg.isolate && !cfg.dataDir) {
     const slug = String(cfg.name).replace(/[^A-Za-z0-9._-]/g, '-');
     cfg.dataDir = path.join(os.tmpdir(), `noglass-${slug}-${process.pid}`);
   }
   return cfg;
+}
+
+/**
+ * 拼出最终注入的 CSS：内置样式表 + （可选）自定义片段。
+ * 中间插一行注释，便于在 DevTools 里看出分界。
+ */
+function composeCss(cfg) {
+  let css = '';
+  try { css = fs.readFileSync(cfg.css, 'utf8'); } catch { css = ''; }
+
+  if (cfg.cssExtra && fs.existsSync(cfg.cssExtra)) {
+    let extra = '';
+    try { extra = fs.readFileSync(cfg.cssExtra, 'utf8'); } catch { extra = ''; }
+    if (extra.trim()) {
+      css += `\n\n/* ===== 以下是自定义片段：${path.basename(cfg.cssExtra)} ===== */\n` + extra;
+    }
+  }
+  return css;
 }
 
 function printHelp() {
@@ -168,7 +344,20 @@ noglass —— 给 Electron 应用注入「去毛玻璃」样式（通用版）
   --process-name <n> 进程名（用于探测/结束进程）
   --style-id <id>   注入的 <style> 元素 id（默认 ${DEFAULT_STYLE_ID}）
   --name <name>     日志中显示的应用名
+  --css-extra <path> 追加的自定义样式片段（默认自动找 css/<profile>.custom.css）
+  --emulate-color-scheme <dark|light>
+                    让页面认为系统处于深色/浅色模式。
+                    只对已写 @media (prefers-color-scheme: ...) 的应用有效。
+  --app-arg=<flag>  传给**目标应用**的额外参数（可重复）。
+                    用于 Chromium 渲染开关，如 --disable-lcd-text（强制灰度抗锯齿）、
+                    --font-render-hinting=none。
+  --source <tag>    会话来源标记（写入注册表，如 ui / autostart）
   -q, --quiet       减少输出
+
+会话注册表：
+  注入器会在 run/sessions/<id>.json 登记自己，日志写到 run/logs/<id>.log。
+  用 \`node gen.js ps\` 查看、\`node gen.js stop <id>\` 停止。
+  停止是协作式的：注入器自己退出，**不会关掉目标应用**。
 `);
 }
 
@@ -396,19 +585,44 @@ class PageSession {
     await cdp.send('Page.enable');
     await cdp.send('Runtime.enable');
 
-    const src = buildInjectScript(this.cfg.cssText, this.cfg.styleId, this.cfg.name);
-    // 持久化：此后每次导航/刷新都会先执行
-    await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: src, runImmediately: true });
-    // 立即对当前文档生效
-    await cdp.send('Runtime.evaluate', { expression: src, returnByValue: true });
+    // 配色方案模拟：让页面认为系统处于深色/浅色模式。
+    // 只对**已经写了** @media (prefers-color-scheme: dark) 的应用有效 ——
+    // 如果应用桌面版 CSS 里根本没有这段媒体查询，模拟不会产生任何变化，
+    // 那种情况只能靠自定义 CSS 片段（css/<name>.custom.css）。
+    if (this.cfg.emulateColorScheme) {
+      try {
+        await cdp.send('Emulation.setEmulatedMedia', {
+          features: [{ name: 'prefers-color-scheme', value: this.cfg.emulateColorScheme }],
+        });
+      } catch { /* 老版本不支持就算了，不致命 */ }
+    }
+
+    await this.applyCss();
 
     cdp.handlers.set('Page.frameNavigated', [() => {
-      // 刷新/跳转后自动补一次（注册通常已覆盖，这是兜底）
-      cdp.send('Runtime.evaluate', { expression: src, returnByValue: true }).catch(() => {});
+      // 刷新/跳转后自动补一次（注册通常已覆盖，这是兜底）。
+      // 注意：导航后 emulated media 会失效，所以要重新设置。
+      if (this.cfg.emulateColorScheme) {
+        cdp.send('Emulation.setEmulatedMedia', {
+          features: [{ name: 'prefers-color-scheme', value: this.cfg.emulateColorScheme }],
+        }).catch(() => {});
+      }
+      cdp.send('Runtime.evaluate', { expression: this._src, returnByValue: true }).catch(() => {});
     }]);
 
     this.report = await this.verify();
     return this;
+  }
+
+  /** 注入当前 CSS（可重复调用 —— 热重载就靠它）。 */
+  async applyCss() {
+    if (!this.cdp || this.dead) return;
+    const src = buildInjectScript(this.cfg.cssText, this.cfg.styleId, this.cfg.name);
+    this._src = src;
+    // 持久化：此后每次导航/刷新都会先执行
+    await this.cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: src, runImmediately: true });
+    // 立即对当前文档生效
+    await this.cdp.send('Runtime.evaluate', { expression: src, returnByValue: true });
   }
 
   async verify() {
@@ -502,9 +716,33 @@ async function main() {
   ({ log, warn } = makeLoggers(cfg));
 
   if (!fs.existsSync(cfg.css)) throw new Error(`样式表不存在: ${cfg.css}`);
-  cfg.cssText = fs.readFileSync(cfg.css, 'utf8');
+  cfg.cssText = composeCss(cfg);
+
+  // 会话登记：让 UI / CLI / 自启动脚本都能看到这个后台注入器。
+  // 登记失败不致命（可能目录只读），只是失去可观测性。
+  const registry = new SessionRegistry(cfg, { source: cfg.source });
+  if (registry.open()) {
+    // 把日志同时写一份到 run/logs/<id>.log，供 UI 统一查看
+    const origLog = log, origWarn = warn;
+    log = (m) => { origLog(m); registry.append(`[noglass] ${m}`); };
+    warn = (m) => { origWarn(m); registry.append(`[noglass] ${m}`); };
+    log(`会话已登记：${registry.id}（run/sessions/${registry.id}.json）`);
+  } else {
+    warn(`会话登记失败（${registry.openError || '未知原因'}）—— 不影响注入，但 UI 里看不到它。`);
+  }
 
   if (cfg.profile.__path) log(`profile: ${cfg.profile.__path}`);
+  if (cfg.cssExtra) log(`自定义片段：${cfg.cssExtra}`);
+  if (cfg.emulateColorScheme) log(`模拟配色方案：${cfg.emulateColorScheme}`);
+
+  // 退出路径统一走这里，保证注册项被清理
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try { registry.close(); } catch { /* 忽略 */ }
+  };
+  process.on('exit', cleanup);
 
   // 1) 端口上是否已有可用的 CDP
   let version = await fetchJson(`http://127.0.0.1:${cfg.port}/json/version`, 1500);
@@ -523,6 +761,7 @@ async function main() {
       warn('调试端口只能在启动时设置，因此注入需要「带参数重启」一次。');
       warn(`请先退出 ${cfg.name} 再重试，或用 --restart 代为重启（会打断当前会话），`);
       warn('或用 --isolate 跑独立实例。');
+      cleanup();
       process.exit(3);
     }
     if (running > 0 && cfg.restart) {
@@ -548,15 +787,37 @@ async function main() {
       if (cfg.dataDirEnv) env[cfg.dataDirEnv] = cfg.dataDir;
       else args.push(`--user-data-dir=${cfg.dataDir}`);
     }
+
+    // 目标应用的额外参数（如 Chromium 字体渲染开关）。
+    // 放在最后：Chromium 的参数解析对位置不敏感，但用户参数应能覆盖我们的默认。
+    if (cfg.appArgs.length) {
+      args.push(...cfg.appArgs);
+      log(`目标应用参数：${cfg.appArgs.join(' ')}`);
+    }
+
     log(`启动 ${cfg.name}：${exe}`);
     log(`  调试端口 ${cfg.port}，主进程端口 ${cfg.inspectPort}${cfg.dataDir ? `，数据目录 ${cfg.dataDir}` : ''}`);
-    spawn(exe, args, { detached: true, stdio: 'ignore', env, windowsHide: false }).unref();
+
+    // 保留 spawn 句柄：应用被外部结束时要能感知（配合 browserCdp.onclose 与巡检兜底）
+    let appProc = null;
+    try {
+      appProc = spawn(exe, args, { detached: true, stdio: 'ignore', env, windowsHide: false });
+      appProc.unref();
+      appProc.on('error', (e) => warn(`启动应用出错：${e.message}`));
+    } catch (e) {
+      throw new Error(`启动 ${cfg.name} 失败：${e.message}`);
+    }
+    registry.update({ appPid: appProc ? appProc.pid : null });
 
     log('等待调试端口就绪…');
     const deadline = Date.now() + cfg.timeout;
     while (Date.now() < deadline) {
       version = await fetchJson(`http://127.0.0.1:${cfg.port}/json/version`, 2000);
       if (version && version.webSocketDebuggerUrl) break;
+      // 应用可能在启动过程中就退出了（崩溃 / 单实例锁冲突）——不必等满超时
+      if (appProc && appProc.exitCode !== null) {
+        throw new Error(`应用在调试端口就绪前已退出（退出码 ${appProc.exitCode}）。`);
+      }
       await sleep(400);
     }
     if (!version) throw new Error(`等待调试端口 ${cfg.port} 超时。`);
@@ -564,6 +825,7 @@ async function main() {
   } else {
     warn(`端口 ${cfg.port} 上没有调试端点。`);
     warn(`打包版默认不开放调试端口；请加 --launch，或用生成的启动脚本。`);
+    cleanup();
     process.exit(3);
   }
 
@@ -669,11 +931,13 @@ async function main() {
 
   log('进入 watch 模式（事件驱动 + 慢速兜底巡检）。Ctrl+C 退出。');
 
-  // ── 事件驱动：订阅浏览器级目标的创建/销毁，新页面一出现立刻注入 ──
-  // 此前是每 400ms 轮询 /json/list；那是固定开销（实测约 9ms CPU/秒），
-  // 而且发现新窗口最坏要等一个轮询周期。
-  // 改用 Target.setDiscoverTargets 后：新页面是「事件推来」的，注入更快，
-  // 同时把巡检降级成几十秒一次的兜底（应对连接断开等异常）。
+  // 先声明所有需要在 shutdown 里清理的句柄。
+  // 必须在 shutdown 定义之前用 let 声明（而不是后面用 const）——
+  // 否则 shutdown 在声明前被调用会踩到 TDZ，那是最难查的一类崩溃。
+  let timer = null;
+  let stopTimer = null;
+  let cssWatcher = null;
+
   let eventsSeen = 0;
   const browserCdp = version.webSocketDebuggerUrl ? new CDP(version.webSocketDebuggerUrl) : null;
   if (browserCdp) {
@@ -703,29 +967,122 @@ async function main() {
     warn('浏览器级端点不可用，退回轮询模式。');
   }
 
+  // ── 退出路径 ──
+  let shuttingDown = false;
+  const shutdown = (reason, code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try { if (timer) clearInterval(timer); } catch { /* 忽略 */ }
+    try { if (stopTimer) clearInterval(stopTimer); } catch { /* 忽略 */ }
+    try { if (cssWatcher) cssWatcher.close(); } catch { /* 忽略 */ }
+    if (browserCdp) browserCdp.close();
+    for (const s of sessions.values()) s.close();
+    log(reason);
+    cleanup();
+    process.exit(code);
+  };
+
+  // ── 应用退出自感知 ──
+  // 目标应用被关掉后，注入器必须自己退出，否则会留下一个空转的后台进程
+  // （UI 里显示「运行中」、终端窗口不关）。
+  // 主信号：浏览器级 CDP 连接断开 —— 应用进程死亡时它会关。
+  if (browserCdp && !browserCdp.closed) {
+    const origOnClose = browserCdp.ws.onclose;
+    browserCdp.ws.onclose = (ev) => {
+      try { origOnClose && origOnClose(ev); } catch { /* 忽略 */ }
+      // 只有在 watch 期间断开才意味着应用没了；启动阶段由别处处理
+      if (!shuttingDown) {
+        setTimeout(() => {
+          if (!shuttingDown) shutdown('目标应用已退出（调试连接断开），注入器随之退出。');
+        }, 500);
+      }
+    };
+  }
+
+  // 兜底：有些情况下 websocket 不会立刻关（网络层缓冲等），
+  // 所以再按进程名做一次低频存活检查。
+  const canPollProcess = !!cfg.processName;
+  if (!canPollProcess) {
+    warn('profile 未设 processName，无法在应用退出后自动收尾（建议补上）。');
+  }
+
+  // ── CSS 热重载 ──
+  // 改完样式不用重启应用：文件一变就重新读取并注入到所有页面。
+  let reloadTimer = null;
+  const watchTargets = [cfg.css, cfg.cssExtra].filter(Boolean);
+  if (watchTargets.length) {
+    try {
+      cssWatcher = fs.watch(path.dirname(watchTargets[0]), (evt, fname) => {
+        if (!fname) return;
+        const hit = watchTargets.some((t) => path.basename(t) === fname.toString());
+        if (!hit) return;
+        // 编辑器保存往往触发多次事件，合并一下
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(async () => {
+          try {
+            cfg.cssText = composeCss(cfg);
+            log('检测到样式表变更，正在重新注入…');
+            for (const s of sessions.values()) {
+              try { await s.applyCss(); } catch { /* 单个页面失败不影响其他 */ }
+            }
+            log(`已重新注入 ${sessions.size} 个页面。`);
+          } catch (e) {
+            warn(`重新注入失败：${e.message}`);
+          }
+        }, 250);
+      });
+      log('已启用样式热重载（改 CSS 后自动重新注入，无需重启应用）。');
+    } catch (e) {
+      warn(`样式热重载不可用：${e.message}`);
+    }
+  }
+
   // 慢速兜底：只用来修复意外（连接断开、事件丢失），不承担主要发现职责。
   const SAFETY_MS = browserCdp && !browserCdp.closed ? 20000 : POLL_MS;
   log(`兜底巡检间隔：${(SAFETY_MS / 1000).toFixed(1)}s`);
   let ticks = 0;
-  const timer = setInterval(async () => {
+  timer = setInterval(async () => {
     ticks++;
     try { await sweep(); } catch { /* 忽略瞬时错误 */ }
     if (ticks % NATIVE_EVERY === 0) await applyNative();  // 应用主题/缩放变化会重设标题栏，定期补涂
+    if (canPollProcess && ticks % LIVENESS_EVERY === 0) {
+      // 进程数为 0 说明应用已经没了。给一点宽容度：应用重启瞬间也会是 0。
+      const alive = psCount(cfg.processName);
+      if (alive === 0) {
+        registry.update({ lastSeenAlive: false });
+        shutdown(`目标应用（${cfg.processName}）已退出，注入器随之退出。`);
+      }
+    }
+    registry.update({ pages: sessions.size, lastTick: new Date().toISOString() });
   }, SAFETY_MS);
 
-  const stop = () => {
-    clearInterval(timer);
-    if (browserCdp) browserCdp.close();
-    for (const s of sessions.values()) s.close();
-    log('已退出。');
-    process.exit(0);
-  };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
+  // ── 停止请求轮询 ──
+  // 用文件而不是信号/杀进程：请求方可能来自另一个进程（UI / CLI），
+  // 而且这样注入器能自己收尾（清注册项、关日志），目标应用不受影响。
+  stopTimer = setInterval(() => {
+    if (registry.stopRequested()) {
+      shutdown('收到停止请求，已优雅退出（目标应用保持运行）。');
+    }
+  }, STOP_POLL_MS);
+
+  const onSignal = () => shutdown('收到中断信号，已退出。');
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 }
 
 if (require.main === module) {
   main().catch((e) => { console.error(`[noglass] 出错：${e.message}`); process.exit(1); });
 }
 
-module.exports = { main, resolveConfig, parseArgs, buildInjectScript, buildVerifyScript };
+module.exports = {
+  main,
+  resolveConfig,
+  parseArgs,
+  composeCss,
+  buildInjectScript,
+  buildVerifyScript,
+  SessionRegistry,
+  RUN_DIR,
+  SESS_DIR,
+  LOG_DIR,
+};
