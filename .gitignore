@@ -1,0 +1,17 @@
+# 探测/构建的临时产物
+*.tmp
+*.log
+
+# bundle 产物是可再生的，但保留它们也合理（便于直接拷走）。
+# 如果你不想让 bundle 进版本库，取消下面这行注释：
+# apps/*-bundle/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# Node（本工具零依赖，但以防将来加了 devDependencies）
+node_modules/
+package-lock.json

@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "no-glass-ele profile 模板。复制后填入你的应用。",
+    "",
+    "生成方式（推荐）：",
+    "  node gen.js new <name> --exe <path>",
+    "它会自动做静态探测并预填 detected 块。",
+    "",
+    "字段分两类：",
+    "  · 客观事实（detected）—— 由 probe 自动填充，不要手改，重跑 probe 会覆盖。",
+    "  · 人工决策（其余）—— 必须你来定，工具测不出来。下面每个都标了。"
+  ],
+
+  "name": "myapp",
+  "displayName": "MyApp",
+  "_displayName_comment": "人工：显示名，出现在日志和 README 里。",
+
+  "exe": "D:\\path\\to\\MyApp.exe",
+  "_exe_comment": "人工：主程序 exe 绝对路径。",
+  "exeGlob": null,
+  "_exeGlob_comment": "人工：安装目录带版本号时用（如 'app-*\\\\MyApp.exe'）。只读一个父目录取最高版本，不递归。设了就无需 exe。",
+
+  "processName": "MyApp",
+  "_processName_comment": "人工：Windows 进程名（不含 .exe），用于探测运行状态和 --restart。通常等于 exe 的文件名。",
+
+  "styleId": "__noglass_myapp__",
+  "_styleId_comment": "人工：注入的 <style> 元素 id。多应用同时注入时靠它区分，别重名。",
+
+  "defaultPort": 9333,
+  "_defaultPort_comment": "人工：CDP 端口。必须与其他 profile 不同。运行 doctor 会检查冲突。",
+
+  "reservedPorts": [],
+  "_reservedPorts_comment": "人工：该应用自身占用的端口（网关、本地服务等）。避免 defaultPort 落进来。例如 AgentHub 的网关是 9527。",
+
+  "singleInstance": null,
+  "_singleInstance_comment": "人工/探测：是否有单实例锁。probe --deep 会自动填 detected.singleInstance；这里保留为人工覆盖位。",
+
+  "isolateEnv": null,
+  "_isolateEnv_comment": "人工：让 --isolate 生效所需的私有环境变量。应用若在代码里覆盖了 userData，--user-data-dir 会失效，必须用它自己的开关。例如 ZCode 是 {\"ZCODE_DESKTOP_USE_ELECTRON_DEFAULT_USER_DATA\": \"1\"}。",
+
+  "dataDirEnv": null,
+  "_dataDirEnv_comment": "人工：指定数据目录用的私有环境变量名。为空则用标准的 --user-data-dir。",
+
+  "urlFilter": null,
+  "_urlFilter_comment": "人工：只注入匹配此正则的页面。用于放过内置浏览器里的第三方网页，避免误伤。例如 \"^file:///.*app\\\\.asar\"。",
+
+  "css": null,
+  "_css_comment": "人工：自定义样式表路径（相对本文件）。为空则用 css/no-glass.css。",
+
+  "native": {
+    "enabled": false,
+    "darkBg": "#161616",
+    "lightBg": "#f8f8f8",
+    "darkSymbol": "#f5f5f5",
+    "lightSymbol": "#1f1f1f"
+  },
+  "_native_comment": "人工：--native 的窗口侧参数。darkBg/lightBg 是窗口实色底（去掉亚克力后铺的色），symbol* 是标题栏按钮颜色。enabled 为 true 时 doctor 会检查 fuse 是否允许 --inspect。",
+
+  "notes": {
+    "watchRequired": null,
+    "portConflict": null,
+    "extra": null
+  },
+  "_notes_comment": "人工：会写进生成的 README。watchRequired 用于「这个应用必须常驻注入」的原因（如窗口会被销毁重建）；portConflict 说明已知端口冲突；extra 是自由补充。",
+
+  "detected": {
+    "_comment": "由 probe 自动填充，勿手改。",
+    "probedAt": null,
+    "electron": null,
+    "fuses": null,
+    "canUseNative": null,
+    "windowLayerGlass": null,
+    "windowLayerReasons": [],
+    "hasPageGlass": null,
+    "singleInstance": null,
+    "userDataOverride": null
+  }
+}

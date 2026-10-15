@@ -1,0 +1,19 @@
+# 生成器与注入内核：保持 LF 即可（Node 不在乎）
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.css  text eol=lf
+
+# ── 关键：生成的 .cmd 必须锁死 CRLF ────────────────────────────────────────
+# 中文版 Windows 的 cmd 默认按 GBK(936) 解析。若 .cmd 存成 UTF-8 且含中文，
+# 字节被错读后会产生 & | 之类的分隔符，把 rem 注释行撕成一条条"命令"，
+# 报出 'xxx' 不是内部或外部命令。
+#
+# 本机 core.autocrlf 未设置，所以必须在这里显式声明——否则将来一次 clone
+# 或 checkout 就可能把 CRLF 变成 LF，触发上面那个坑。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 这两个文件本身也保持 LF（否则 autocrlf=true 会把它们签出成 CRLF，无害但不整洁）
+.gitattributes text eol=lf
+.gitignore     text eol=lf
