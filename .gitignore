@@ -28,3 +28,6 @@ __pycache__/
 # Node（本工具零依赖，但以防将来加了 devDependencies）
 node_modules/
 package-lock.json
+
+# 试验过但已弃用的方案（保留在本地备查；对应内容都在 git 历史里）
+archive/

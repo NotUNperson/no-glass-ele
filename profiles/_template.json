@@ -51,7 +51,13 @@
   "_cssExtra_comment": "人工：追加的自定义 CSS 片段。留空则自动找 css/<name>.custom.css（存在即生效，无需配置）。用途：给「电脑端没有深色模式」的应用补样式。注入器会监听该文件，改完保存即自动重新注入，不用重启应用。",
 
   "emulateColorScheme": null,
-  "_emulateColorScheme_comment": "人工：dark 或 light。让页面认为系统处于该配色模式，经 CDP Emulation.setEmulatedMedia 实现。**只对已经写了 @media (prefers-color-scheme: ...) 的应用有效** —— 如果应用桌面版 CSS 里根本没有这段媒体查询，模拟不会产生任何变化，那种情况只能靠 cssExtra 手写样式。",
+  "_emulateColorScheme_comment": "人工：dark 或 light。让页面认为系统处于该配色模式，经 CDP Emulation.setEmulatedMedia 实现。**只对已经写了 @media (prefers-color-scheme: ...) 的应用有效** —— 如果应用桌面版 CSS 里根本没有这段媒体查询，模拟不会产生任何变化，那种情况改用 darkreader 或 cssExtra。",
+
+  "darkreader": null,
+  "_darkreader_comment": "人工：auto / dark / light / off（或 null 关闭）。借 Dark Reader 引擎（vendor/darkreader.js，MIT）上深色，**不用写 CSS、不用读源码**。auto = 跟随系统深浅色并监听变化（推荐）。它会自动覆盖新开的窗口与弹窗（走 addScriptToEvaluateOnNewDocument 注册）。**不要与 cssExtra 深色同时用** —— 两份深色方案会互相干扰，Dark Reader 会把你的手写深色再算一遍，导致彩色标签失真。",
+
+  "darkreaderTheme": null,
+  "_darkreaderTheme_comment": "人工：Dark Reader 的主题参数。engine 默认 dynamicTheme（效果最好，能保留品牌色）；可选 staticTheme / cssFilter / svgFilter —— 后两者是整页反色，会把彩色图标和标签一起反掉，是「颜色丢失」的来源，一般别用。其他可调字段：brightness / contrast / sepia / grayscale（数值）。例：{\"engine\":\"dynamicTheme\",\"brightness\":100,\"contrast\":100}",
 
   "appArgs": [],
   "_appArgs_comment": "人工：传给**目标应用**的额外启动参数（不是给注入器的）。用途：Chromium 渲染开关，如 \"--disable-lcd-text\"（强制灰度抗锯齿，配合 MacType 用）、\"--font-render-hinting=none\"。命令行也可临时试：--app-arg=--disable-lcd-text",

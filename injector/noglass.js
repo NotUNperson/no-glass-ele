@@ -65,6 +65,10 @@ const LIVENESS_EVERY = 5;     // 每 N 次巡检做一次目标应用存活性�
  */
 const RUN_DIR = path.join(HERE, '..', 'run');
 const SESS_DIR = path.join(RUN_DIR, 'sessions');
+
+// Dark Reader 引擎（可选功能，借它给「完全没有深色模式」的应用上深色）。
+// 只有 profile 里开了 darkreader 才会读，读不到就跳过 —— 不因为缺文件而失败。
+const DR_ENGINE = path.join(HERE, '..', 'vendor', 'darkreader.js');
 const LOG_DIR = path.join(RUN_DIR, 'logs');
 
 function ensureRunDirs() {
@@ -197,6 +201,11 @@ function parseArgs(argv) {
     // 传给本注入器的额外参数（由 --app-arg 之外的场景使用，如自启动脚本标记来源）
     emulateColorScheme: null,
     cssExtra: null,
+    // Dark Reader：借它的引擎给「完全没有深色模式」的应用上深色。
+    // 值 = 模式（auto / dark / light / off），false/null = 不用。
+    darkreader: null,
+    // Dark Reader 的主题参数（引擎、亮度、对比度…），见 resolveConfig。
+    darkreaderTheme: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i], next = () => argv[++i];
@@ -219,6 +228,12 @@ function parseArgs(argv) {
       case '--style-id': o.styleId = next(); break;
       case '--name': o.displayName = next(); break;
       case '--emulate-color-scheme': o.emulateColorScheme = next(); break;
+      case '--darkreader': o.darkreader = next(); break;
+      case '--darkreader-engine': {
+        const v = next();
+        o.darkreaderTheme = { ...(o.darkreaderTheme || {}), engine: v };
+        break;
+      }
       case '--source': o.source = next(); break;
       case '-q': case '--quiet': o.quiet = true; break;
       case '-h': case '--help': printHelp(); process.exit(0); break;
@@ -271,6 +286,10 @@ function resolveConfig(opts) {
     notes: prof.notes || {},
     appArgs: [...(prof.appArgs || []), ...(opts.appArgs || [])],
     emulateColorScheme: opts.emulateColorScheme || prof.emulateColorScheme || null,
+    darkreader: opts.darkreader || prof.darkreader || null,
+    // Dark Reader 的引擎与参数。engine 默认锁 dynamicTheme —— 这是效果最好的
+    // 那种；filter 类引擎会把彩色图标/标签一起反掉（"颜色丢失"的来源）。
+    darkreaderTheme: opts.darkreaderTheme || prof.darkreaderTheme || null,
     source: opts.source || 'cli',
     profileName: profName,
   };
@@ -348,6 +367,17 @@ noglass —— 给 Electron 应用注入「去毛玻璃」样式（通用版）
   --emulate-color-scheme <dark|light>
                     让页面认为系统处于深色/浅色模式。
                     只对已写 @media (prefers-color-scheme: ...) 的应用有效。
+  --darkreader <auto|dark|light|off>
+                    借 Dark Reader 引擎上深色（读 vendor/darkreader.js）。
+                    auto  = 跟随系统深浅色（推荐）
+                    dark  = 强制深色
+                    light = 强制浅色
+                    同时会覆盖新开的窗口/弹窗。与自定义 CSS 可叠加，但**不建议**
+                    （两份深色方案会互相干扰，见 README）。
+  --darkreader-engine <name>
+                    Dark Reader 的引擎（默认 dynamicTheme，效果最好）：
+                    dynamicTheme / staticTheme / cssFilter / svgFilter
+                    后两者是整页反色，会把彩色图标和标签一起反掉。
   --app-arg=<flag>  传给**目标应用**的额外参数（可重复）。
                     用于 Chromium 渲染开关，如 --disable-lcd-text（强制灰度抗锯齿）、
                     --font-render-hinting=none。
@@ -541,6 +571,55 @@ function buildInjectScript(css, styleId, appName) {
 })()`;
 }
 
+// ─────────── Dark Reader 注入脚本（可选功能）───────────
+
+/**
+ * 拼出 Dark Reader 的注入脚本。
+ *
+ * 为什么要拼成"先装引擎、再调 API"的一整段：
+ * Page.addScriptToEvaluateOnNewDocument 只在页面**新文档诞生时**执行一次，
+ * 所以这段必须自给自足 —— 不能依赖外面先跑过什么。
+ * 每个新窗口/新页面都会重跑这段，于是弹窗也会被覆盖。
+ *
+ * 引擎只在页面里不存在时才整份注入（页面刷新后自然就没有了，
+ * 会被重新注入，这是期望行为）。
+ *
+ * 关于四种引擎（Dark Reader 的 ThemeEngine 枚举，通过 theme.engine 指定）：
+ *   dynamicTheme —— 动态解析样式表、逐条改写颜色。**效果最好**，默认。
+ *   staticTheme  —— 预生成一套固定规则，不看页面实际样式。快但糙。
+ *   cssFilter    —— 整页 filter: invert() 反色。会破坏图片/彩色图标。
+ *   svgFilter    —— 同上但用 SVG 滤镜，可调项更多。
+ * 你看到"标签颜色丢失"，通常是落到了 filter 类引擎（它会把彩色一起反掉）。
+ * 所以这里默认锁死 dynamicTheme，并允许 profile 显式改。
+ */
+function buildDarkReaderScript(mode, engineSrc, themeOpts) {
+  const OPTIONS = { brightness: 100, contrast: 100, sepia: 0, ...(themeOpts || {}) };
+  const ensure = `if (typeof DarkReader === 'undefined') { ${engineSrc} }`;
+
+  let action;
+  if (mode === 'dark') {
+    action = `DarkReader.auto(false); DarkReader.enable(${JSON.stringify(OPTIONS)});`;
+  } else if (mode === 'light') {
+    action = `DarkReader.auto(false); DarkReader.disable();`;
+  } else {
+    // auto：读 matchMedia('(prefers-color-scheme: dark)') 并监听其变化，
+    // 所以系统切深浅色时页面会自己跟着变。
+    action = `DarkReader.auto(${JSON.stringify(OPTIONS)});`;
+  }
+
+  return `(() => {
+  try {
+    ${ensure}
+    ${action}
+    return true;
+  } catch (e) {
+    // 深色失败不该影响去毛玻璃，所以吞掉异常只做记录
+    try { console.warn('[noglass] Dark Reader 失败：' + (e && e.message)); } catch (_) {}
+    return false;
+  }
+})()`;
+}
+
 function buildVerifyScript(styleId) {
   return `JSON.stringify((() => {
     let blurred = 0;
@@ -575,6 +654,7 @@ class PageSession {
     this.cdp = null;
     this.dead = false;
     this.report = null;
+    this._drSrc = null;
   }
 
   async start() {
@@ -608,6 +688,10 @@ class PageSession {
         }).catch(() => {});
       }
       cdp.send('Runtime.evaluate', { expression: this._src, returnByValue: true }).catch(() => {});
+      // Dark Reader 也补一次（注册已经管了，这里防的是"注册丢失"的边缘情况）
+      if (this._drSrc) {
+        cdp.send('Runtime.evaluate', { expression: this._drSrc, returnByValue: true }).catch(() => {});
+      }
     }]);
 
     this.report = await this.verify();
@@ -619,10 +703,23 @@ class PageSession {
     if (!this.cdp || this.dead) return;
     const src = buildInjectScript(this.cfg.cssText, this.cfg.styleId, this.cfg.name);
     this._src = src;
+    // Dark Reader（可选）：跟 CSS 一样走 addScriptToEvaluateOnNewDocument，
+    // 这样**新开的窗口/弹窗**一诞生就带上深色，不用等下一次巡检。
+    let drSrc = null;
+    if (this.cfg.darkreaderSrc && this.cfg.darkreader) {
+      drSrc = buildDarkReaderScript(this.cfg.darkreader, this.cfg.darkreaderSrc, this.cfg.darkreaderTheme);
+      this._drSrc = drSrc;
+    }
     // 持久化：此后每次导航/刷新都会先执行
     await this.cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: src, runImmediately: true });
+    if (drSrc) {
+      await this.cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: drSrc, runImmediately: true });
+    }
     // 立即对当前文档生效
     await this.cdp.send('Runtime.evaluate', { expression: src, returnByValue: true });
+    if (drSrc) {
+      await this.cdp.send('Runtime.evaluate', { expression: drSrc, returnByValue: true });
+    }
   }
 
   async verify() {
@@ -734,6 +831,29 @@ async function main() {
   if (cfg.profile.__path) log(`profile: ${cfg.profile.__path}`);
   if (cfg.cssExtra) log(`自定义片段：${cfg.cssExtra}`);
   if (cfg.emulateColorScheme) log(`模拟配色方案：${cfg.emulateColorScheme}`);
+
+  // ── Dark Reader 引擎（可选）──
+  // 读一次放内存，之后每个页面会话复用它。读不到就降级为"不用它"，
+  // 不因为缺文件而让整个注入失败。
+  cfg.darkreaderSrc = null;
+  if (cfg.darkreader && cfg.darkreader !== 'off' && cfg.darkreader !== 'false') {
+    try {
+      cfg.darkreaderSrc = fs.readFileSync(DR_ENGINE, 'utf8');
+      // 引擎锁死 dynamicTheme（作者标注效果最好）。filter 类引擎会把彩色
+      // 图标/标签一起反色 —— 那正是"颜色丢失"的来源，所以默认不用。
+      // 想换风格可在 profile 里写 darkreaderTheme.engine，或 --darkreader-engine。
+      const theme = { engine: 'dynamicTheme', ...(cfg.darkreaderTheme || {}) };
+      cfg.darkreaderTheme = theme;
+      log(`Dark Reader 引擎已加载（${(cfg.darkreaderSrc.length / 1024).toFixed(0)} KB），模式：${cfg.darkreader}，引擎：${theme.engine}`);
+      if (cfg.darkreader === 'auto') {
+        log('  auto 模式会读 matchMedia(prefers-color-scheme)，跟随系统深浅色。');
+      }
+    } catch (e) {
+      warn(`Dark Reader 引擎读取失败，已跳过：${e.message}`);
+      warn(`  期望位置：${DR_ENGINE}`);
+      cfg.darkreaderSrc = null;
+    }
+  }
 
   // 退出路径统一走这里，保证注册项被清理
   let cleanedUp = false;
