@@ -258,6 +258,7 @@ function renderDetail(keepScroll = false) {
   ).join('');
 
   renderForm(p);
+  loadDarkreader();
 
   if (keepScroll) $('.pane-detail').scrollTop = scrollTop;
 }
@@ -276,6 +277,8 @@ const FIELDS = [
   { key: 'isolateEnv', label: 'isolateEnv（私有隔离开关）', type: 'kv', wide: true, note: 'JSON 对象；应用覆盖了 userData 时必需' },
   { key: 'dataDirEnv', label: 'dataDirEnv', type: 'text', note: '指定数据目录的环境变量名' },
   { key: 'emulateColorScheme', label: '配色模拟', type: 'enum', options: ['', 'dark', 'light'], note: '只对已写 prefers-color-scheme 的应用有效' },
+  { key: 'darkreader', label: '深色模式（Dark Reader）', type: 'enum', options: ['', 'auto', 'dark', 'light', 'off'], note: '给没有深色模式的应用用；上方卡片可一键生效' },
+  { key: 'darkreaderTheme', label: 'Dark Reader 参数', type: 'kv', wide: true, note: 'JSON 对象；常用 {"engine":"dynamicTheme","brightness":100,"contrast":100}' },
   { key: 'appArgs', label: '传给应用的启动参数', type: 'strlist', wide: true, note: '逗号分隔；如 --disable-lcd-text（Chromium 只在启动时读）' },
   { key: 'native.enabled', label: '启用 --native', type: 'bool', note: 'fuse 禁用 --inspect 时不可用' },
   { key: 'native.darkBg', label: '深色窗口底色', type: 'text' },
@@ -678,6 +681,74 @@ function startPolling() {
   }, 100);
 }
 
+// ─────────────────────────── 深色模式（Dark Reader）───────────────────────────
+
+/** 把 profile 里的 darkreader 配置回填到卡片控件。 */
+function loadDarkreader() {
+  const p = STATE.data || {};
+  const mode = p.darkreader || '';
+  const th = p.darkreaderTheme || {};
+
+  $('drMode').value = mode;
+  $('drEngine').value = th.engine || 'dynamicTheme';
+  $('drBright').value = th.brightness != null ? th.brightness : 100;
+  $('drContrast').value = th.contrast != null ? th.contrast : 100;
+  $('drBrightVal').textContent = $('drBright').value;
+  $('drContrastVal').textContent = $('drContrast').value;
+
+  // 状态提示：应用自身有没有深色模式 + 会话在不在跑（跑着的话带上它实际用的模式）
+  const d = p.detected || {};
+  const parts = [];
+  if (d.prefersColorScheme === true) {
+    parts.push('该应用自带深色模式（可先用「配色模拟」，不必开这里）');
+  } else if (d.prefersColorScheme === false) {
+    parts.push('该应用没有深色模式');
+  }
+  const sess = STATE.sessions.find((s) => s.profile === p.name && s.running);
+  if (sess) {
+    // 会话注册项里记的是**启动时**的模式，可能与表单里刚改的还没保存的值不同
+    const live = sess.darkreader || '未启用';
+    parts.push(`运行中 · 会话：${esc(live)}`);
+  } else {
+    parts.push('未运行注入');
+  }
+  $('drStatus').textContent = parts.length ? `（${parts.join(' · ')}）` : '';
+  $('drHint').textContent = '';
+}
+
+/** 保存并立即生效：写 profile + 推给正在运行的注入器。 */
+async function applyDarkreader() {
+  if (!STATE.current) return;
+  const mode = $('drMode').value || null;
+  const engine = $('drEngine').value || 'dynamicTheme';
+  const brightness = Number($('drBright').value);
+  const contrast = Number($('drContrast').value);
+
+  const res = await api().set_darkreader(STATE.current, mode, engine, brightness, contrast);
+  if (!res) { toast('界面桥未就绪', 'err'); return; }
+  if (res.ok === false) {
+    toast(res.error || '保存失败', 'err', 6000);
+    return;
+  }
+
+  // 同步本地缓存，避免「未保存修改」的脏标记干扰
+  STATE.data.darkreader = mode;
+  STATE.data.darkreaderTheme = { engine, brightness, contrast };
+
+  if (res.applied) {
+    toast(`已保存并立即生效（${res.applied} 个页面）。`, 'ok', 5000);
+    $('drHint').textContent = `已应用到 ${res.applied} 个页面`;
+  } else if (res.reason) {
+    toast(`已保存。${res.reason}`, 'ok', 6000);
+    $('drHint').textContent = '已保存到 profile';
+  } else {
+    toast('已保存。该应用当前没有运行中的注入，下次启动时生效。', 'ok', 5000);
+    $('drHint').textContent = '已保存到 profile';
+  }
+  await refreshProfiles();
+  renderDetail(true);
+}
+
 // ─────────────────────────── 自定义 CSS ───────────────────────────
 
 async function loadCustomCss() {
@@ -936,6 +1007,19 @@ function bindUI() {
   };
   $('btnSaveCss').onclick = saveCustomCss;
   $('btnReloadCss').onclick = loadCustomCss;
+
+  $('btnApplyDr').onclick = applyDarkreader;
+  // 滑块实时显示数值（真正的应用要等点按钮，避免拖动时反复调后端）
+  $('drBright').addEventListener('input', () => {
+    $('drBrightVal').textContent = $('drBright').value;
+    $('drHint').textContent = '未应用';
+  });
+  $('drContrast').addEventListener('input', () => {
+    $('drContrastVal').textContent = $('drContrast').value;
+    $('drHint').textContent = '未应用';
+  });
+  $('drMode').addEventListener('change', () => { $('drHint').textContent = '未应用'; });
+  $('drEngine').addEventListener('change', () => { $('drHint').textContent = '未应用'; });
 
   $('cssEditor').addEventListener('input', () => {
     STATE.cssDirty = true;

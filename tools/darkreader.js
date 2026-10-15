@@ -23,6 +23,16 @@ const { execFileSync } = require('child_process');
 const PORT = Number(process.argv[2] || 9343);
 const MODE = process.argv[3] || 'auto';
 
+// 可选参数：--engine <name> / --brightness <n> / --contrast <n>
+// （UI 会带这些参数调本脚本，这样「保存并立即生效」不用重启注入器）
+function optValue(flag) {
+  const i = process.argv.indexOf(flag);
+  return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : null;
+}
+const OPT_ENGINE = optValue('--engine');
+const OPT_BRIGHTNESS = optValue('--brightness');
+const OPT_CONTRAST = optValue('--contrast');
+
 // 引擎位置：优先 vendor/（正式位置），退回 run/_dr（早期测试时下载的）
 const ENGINE_CANDIDATES = [
   path.resolve(__dirname, '..', 'vendor', 'darkreader.js'),
@@ -99,17 +109,31 @@ function cdp(wsUrl) {
   };
 }
 
-const OPTIONS = { brightness: 100, contrast: 100, sepia: 0 };
+// 主题参数：命令行可覆盖（UI 的滑块走这里）
+const OPTIONS = {
+  brightness: OPT_BRIGHTNESS != null ? Number(OPT_BRIGHTNESS) : 100,
+  contrast: OPT_CONTRAST != null ? Number(OPT_CONTRAST) : 100,
+  sepia: 0,
+};
+// 引擎锁 dynamicTheme（效果最好，保留品牌色）；filter 类会把彩色一起反掉。
+if (OPT_ENGINE) OPTIONS.engine = OPT_ENGINE;
 
 // 每个页面各自执行。整份引擎注入一次，之后只调 API。
+//
+// 为什么每次都先 disable() 再启用：Dark Reader 在"已启用"状态下会把
+// enable() 的参数与上一次比对，若主题选项相同就跳过重算 —— 于是改了
+// brightness 却看不到变化（实测：dark(60) 之后回 auto 仍停在暗的）。
+// 先关再开，保证新参数一定被重新应用。
 function scriptFor(mode) {
   const ensure = `if (typeof DarkReader === 'undefined') { ${SRC} }`;
+  const reset = `if (typeof DarkReader !== 'undefined' && DarkReader.isEnabled()) DarkReader.disable();`;
   switch (mode) {
     case 'dark':
       return `${ensure}
+        ${reset}
         DarkReader.auto(false);
         DarkReader.enable(${JSON.stringify(OPTIONS)});
-        JSON.stringify({ mode: 'dark', enabled: DarkReader.isEnabled() });`;
+        JSON.stringify({ mode: 'dark', enabled: DarkReader.isEnabled(), opts: ${JSON.stringify(OPTIONS)} });`;
     case 'light':
       // 强制浅色 = 确保不启用
       return `${ensure}
@@ -119,11 +143,13 @@ function scriptFor(mode) {
     case 'auto':
       // auto() 读 matchMedia('(prefers-color-scheme: dark)')，跟随系统
       return `${ensure}
+        ${reset}
         DarkReader.auto(${JSON.stringify(OPTIONS)});
         JSON.stringify({
           mode: 'auto',
           enabled: DarkReader.isEnabled(),
-          systemPrefersDark: matchMedia('(prefers-color-scheme: dark)').matches
+          systemPrefersDark: matchMedia('(prefers-color-scheme: dark)').matches,
+          opts: ${JSON.stringify(OPTIONS)}
         });`;
     case 'off':
       return `(() => {

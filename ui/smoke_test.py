@@ -147,6 +147,24 @@ def run():
             check("CSS 编辑器可写",
                   "smoke" in (win.evaluate_js("document.getElementById('cssEditor').value") or ""), True)
 
+            # 16b) 深色模式卡片（Dark Reader）
+            check("深色模式卡片存在",
+                  win.evaluate_js("!!document.getElementById('drMode')"), True)
+            # 关闭 / 跟随系统 / 强制深色 / 强制浅色
+            check("模式下拉含 4 项",
+                  win.evaluate_js("document.querySelectorAll('#drMode option').length") == 4, True)
+            # dynamicTheme / staticTheme / cssFilter / svgFilter
+            check("引擎下拉含 4 项",
+                  win.evaluate_js("document.querySelectorAll('#drEngine option').length") == 4, True)
+            check("亮度滑块存在",
+                  win.evaluate_js(
+                      "(() => { const e = document.getElementById('drBright');"
+                      "return !!e && e.type === 'range'; })()"), True)
+            check("立即生效按钮存在",
+                  win.evaluate_js("!!document.getElementById('btnApplyDr')"), True)
+            check("set_darkreader 对未知 profile 安全报错",
+                  api.set_darkreader("_smoke_nope_", "auto").get("ok") is False, True)
+
             # 17) 配色模拟下拉存在，且含 dark/light 选项
             n_opts = win.evaluate_js("document.querySelectorAll('#optEmulate option').length")
             check("配色模拟下拉存在", n_opts == 3, True)

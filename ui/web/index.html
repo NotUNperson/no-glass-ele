@@ -102,13 +102,59 @@
         <div class="presets" id="dPresets"></div>
       </div>
 
+      <!-- 深色模式（Dark Reader）-->
+      <div class="card">
+        <h3>深色模式
+          <span class="dim tiny" id="drStatus"></span>
+        </h3>
+        <p class="hint" style="margin-top:0">
+          借 Dark Reader 引擎给<strong>没有深色模式</strong>的应用上色。
+          不用写 CSS、不用读源码，可跟随系统深浅色，新开的窗口和弹窗也会自动覆盖。
+        </p>
+        <div class="form">
+          <div class="field">
+            <label>模式</label>
+            <select id="drMode" class="select-inline">
+              <option value="">关闭</option>
+              <option value="auto">跟随系统（推荐）</option>
+              <option value="dark">强制深色</option>
+              <option value="light">强制浅色</option>
+            </select>
+            <div class="note">auto 会监听系统深浅色变化，无需重启</div>
+          </div>
+          <div class="field">
+            <label>引擎</label>
+            <select id="drEngine" class="select-inline">
+              <option value="dynamicTheme">dynamicTheme（推荐）</option>
+              <option value="staticTheme">staticTheme（快但糙）</option>
+              <option value="cssFilter">cssFilter（整页反色）</option>
+              <option value="svgFilter">svgFilter（整页反色）</option>
+            </select>
+            <div class="note">dynamicTheme 保留品牌色；filter 类会把彩色标签一起反掉</div>
+          </div>
+          <div class="field">
+            <label>亮度 <span class="dim tiny" id="drBrightVal">100</span></label>
+            <input type="range" id="drBright" min="50" max="150" value="100">
+          </div>
+          <div class="field">
+            <label>对比度 <span class="dim tiny" id="drContrastVal">100</span></label>
+            <input type="range" id="drContrast" min="50" max="150" value="100">
+          </div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary" id="btnApplyDr">保存并立即生效</button>
+          <span class="dim tiny" id="drHint"></span>
+        </div>
+      </div>
+
       <!-- 自定义 CSS -->
       <div class="card">
-        <h3>自定义样式片段
+        <h3>自定义样式片段（备用）
           <span class="dim tiny" id="cssPathHint"></span>
         </h3>
         <p class="hint" style="margin-top:0">
-          追加在内置样式表之后，用于给应用补它没有的样式（如深色模式）。
+          <strong>优先用上方的深色模式</strong>——两者同时启用会互相干扰（彩色标签会被压平）。
+          这里留给 Dark Reader 不适用的情况：需要精确控制品牌色、或只想改某一处样式。
           保存后<strong>注入器会自动重新注入</strong>，不用重启应用。
         </p>
         <textarea class="css-editor" id="cssEditor"

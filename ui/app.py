@@ -866,6 +866,8 @@ class Api:
                 "pages": (meta or {}).get("pages"),
                 "cssExtra": (meta or {}).get("cssExtra"),
                 "emulateColorScheme": (meta or {}).get("emulateColorScheme"),
+                "darkreader": (meta or {}).get("darkreader"),
+                "darkreaderTheme": (meta or {}).get("darkreaderTheme"),
             })
             if pid:
                 seen_pids.add(pid)
@@ -893,6 +895,8 @@ class Api:
                 "pages": r.get("pages"),
                 "cssExtra": r.get("cssExtra"),
                 "emulateColorScheme": r.get("emulateColorScheme"),
+                "darkreader": r.get("darkreader"),
+                "darkreaderTheme": r.get("darkreaderTheme"),
             })
 
         # 过滤掉连 pid 都没有的僵尸项（理论上不该出现）
@@ -1062,6 +1066,111 @@ class Api:
             p = Path(extra)
             return p if p.is_absolute() else (PROFILES_DIR / p)
         return CSS_DIR / f"{name}.custom.css"
+
+    # ── 深色模式（Dark Reader）──
+    def set_darkreader(self, name, mode, engine=None, brightness=None, contrast=None):
+        """
+        保存 Dark Reader 配置到 profile，并对**正在运行的**会话立即生效。
+
+        为什么用「对运行中的注入器推一次」而不是重启：
+        重启注入器 = 重启目标应用 = 打断用户正在做的事。而深色模式只是样式，
+        完全可以对已连接的页面直接生效。走 tools/darkreader.js 那条已实测的通道。
+        """
+        try:
+            check_forbidden(name)
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)):
+                return {"ok": False, "error": "profile 名不合法"}
+
+            MODES = ("", "auto", "dark", "light", "off")
+            m = (mode or "").strip()
+            if m not in MODES:
+                return {"ok": False, "error": f"模式不合法：{mode}（可用 auto/dark/light 或留空关闭）"}
+            ENGINES = ("dynamicTheme", "staticTheme", "cssFilter", "svgFilter")
+            eng = (engine or "dynamicTheme").strip()
+            if eng not in ENGINES:
+                return {"ok": False, "error": f"引擎不合法：{engine}"}
+
+            # 1) 写 profile（整份读改写，与 save_profile 一致）
+            prof = read_profile(name)
+            prof["darkreader"] = None if m in ("", "off") else m
+            theme = {"engine": eng}
+            if brightness is not None:
+                theme["brightness"] = int(brightness)
+            if contrast is not None:
+                theme["contrast"] = int(contrast)
+            prof["darkreaderTheme"] = theme
+            write_profile(name, prof)
+
+            # 2) 若该 profile 有会话在跑，立即推送
+            #    （找不到会话就只保存 —— 下次启动时生效）
+            try:
+                reg = sessions.list_all()
+            except Exception:                            # noqa: BLE001
+                reg = []
+            live = [r for r in reg
+                    if r.get("profile") == name and r.get("alive") and r.get("port")]
+
+            if not live:
+                return {"ok": True, "applied": 0,
+                        "reason": "该应用当前没有运行中的注入，下次启动时生效。"}
+
+            total = 0
+            errors = []
+            for r in live:
+                port = r.get("port")
+                push_mode = m if m else "off"
+                okk, err = self._push_darkreader(port, push_mode, eng,
+                                                 brightness, contrast)
+                if okk:
+                    total += okk
+                else:
+                    errors.append(f"端口 {port}：{err}")
+
+            if total == 0 and errors:
+                return {"ok": False, "error": "；".join(errors)}
+            res = {"ok": True, "applied": total}
+            if errors:
+                res["reason"] = "部分会话失败：" + "；".join(errors)
+            return res
+        except ForbiddenApp as e:
+            return {"ok": False, "error": str(e), "forbidden": True}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _push_darkreader(port, mode, engine, brightness, contrast):
+        """
+        对某个调试端口执行一次 Dark Reader 注入（不重启任何东西）。
+        复用 tools/darkreader.js 里已经实测过的逻辑。
+        返回 (注入的页面数, 错误信息)。
+        """
+        script = ROOT / "tools" / "darkreader.js"
+        if not script.exists():
+            return 0, f"找不到 {script}"
+        # 亮度/对比度只在 enable/auto 时才传，off 传不传无所谓
+        args = [str(script), str(port), mode, "--engine", engine]
+        if brightness is not None:
+            args += ["--brightness", str(brightness)]
+        if contrast is not None:
+            args += ["--contrast", str(contrast)]
+        try:
+            r = subprocess.run(
+                ["node", *args],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+            out = (r.stdout or "") + (r.stderr or "")
+            # 从输出里数 "✓" 的个数（每注入一个页面一行）
+            n = out.count("✓")
+            if r.returncode != 0 and n == 0:
+                tail = "\n".join(out.strip().splitlines()[-3:]) or "无输出"
+                return 0, tail
+            return n, ""
+        except subprocess.TimeoutExpired:
+            return 0, "注入超时"
+        except Exception as e:                           # noqa: BLE001
+            return 0, str(e)
 
     # ── 新建向导辅助 ──
     def list_running(self):

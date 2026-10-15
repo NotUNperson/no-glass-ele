@@ -106,6 +106,8 @@ function toDetected(pr) {
     hasPageGlass: c.hasPageGlass,
     singleInstance: c.singleInstance,
     userDataOverride: c.userDataOverride,
+    // 应用自带深色模式吗（决定要不要 darkreader / emulateColorScheme）
+    prefersColorScheme: c.prefersColorScheme === undefined ? null : c.prefersColorScheme,
   };
   if (pr.deep && pr.deep.markers) d.markers = pr.deep.markers;
   return d;
@@ -536,6 +538,8 @@ function collectSessionData() {
       lastTick: s.lastTick || null,
       cssExtra: s.cssExtra || null,
       emulateColorScheme: s.emulateColorScheme || null,
+      darkreader: s.darkreader || null,
+      darkreaderTheme: s.darkreaderTheme || null,
       alive: s.alive !== false,
       external: !!s.external,
       logFile: s.__logFile || null,
@@ -575,6 +579,10 @@ function cmdPs(args) {
     if (s.pages != null) say(dim(`    页面 ${s.pages}`));
     if (s.cssExtra) say(dim(`    自定义 CSS ${s.cssExtra}`));
     if (s.emulateColorScheme) say(dim(`    配色模拟 ${s.emulateColorScheme}`));
+    if (s.darkreader) {
+      const eng = (s.darkreaderTheme && s.darkreaderTheme.engine) || 'dynamicTheme';
+      say(dim(`    Dark Reader ${s.darkreader}（引擎 ${eng}）`));
+    }
     if (s.id) say(dim(`    id ${s.id}`));
     else say(dim(`    无 id —— 这是旧版本启动的注入器，无法用 stop 优雅停止`));
     say();
@@ -834,6 +842,35 @@ function collectDoctorData() {
       if (age > 180) issues.push(`探测结果已 ${Math.round(age)} 天，应用可能已更新，建议重跑 probe`);
     }
     if (!d.fuses) issues.push('未探测到 fuse 表（可能是非 Electron 应用或裁剪构建）');
+
+    // ── Dark Reader 字段校验 ──
+    // 这是 profile 里唯一有明确值域约束的字段组，之前没有校验：
+    // 写错值（如 "blue"）会被注入器静默当成 auto 用，doctor 完全无感。
+    const DR_MODES = ['auto', 'dark', 'light', 'off'];
+    const drOn = p.darkreader && DR_MODES.includes(p.darkreader) && p.darkreader !== 'off';
+    if (p.darkreader != null && !DR_MODES.includes(p.darkreader)) {
+      issues.push(`darkreader 值非法："${p.darkreader}"（只能是 ${DR_MODES.join(' / ')}，或留空关闭）`);
+    }
+    if (drOn) {
+      // 引擎文件是可选的，但开了 darkreader 就必须有
+      const enginePath = path.join(ROOT, 'vendor', 'darkreader.js');
+      if (!fs.existsSync(enginePath)) {
+        issues.push('启用了 darkreader，但 vendor/darkreader.js 不存在（运行 tools/darkreader.js 会自动下载，或手工放入）');
+      }
+      const eng = (p.darkreaderTheme && p.darkreaderTheme.engine) || 'dynamicTheme';
+      const ENGINES = ['dynamicTheme', 'staticTheme', 'cssFilter', 'svgFilter'];
+      if (!ENGINES.includes(eng)) {
+        issues.push(`darkreaderTheme.engine 值非法："${eng}"（只能是 ${ENGINES.join(' / ')}）`);
+      } else if (eng === 'cssFilter' || eng === 'svgFilter') {
+        issues.push(`darkreaderTheme.engine=${eng} 是整页反色，会把彩色图标和标签一起反掉（"颜色丢失"的来源），一般不建议`);
+      }
+      // 两份深色方案会互相干扰（Dark Reader 会把已有深色再算一遍）
+      const convCss = path.join(ROOT, 'css', `${n}.custom.css`);
+      const hasCss = !!(p.cssExtra || fs.existsSync(convCss));
+      if (hasCss) {
+        issues.push('同时启用了 darkreader 和自定义深色 CSS → 两份方案会互相干扰（彩色标签会被压平），建议二选一');
+      }
+    }
 
     // 生成产物是否最新 —— 用内容指纹比对，不用 mtime
     // （mtime 在 git clone/checkout 后全被刷成同一刻，判断不了新旧）

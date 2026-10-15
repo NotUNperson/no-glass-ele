@@ -110,6 +110,9 @@ class SessionRegistry {
       css: cfg.css || null,
       cssExtra: cfg.cssExtra || null,
       emulateColorScheme: cfg.emulateColorScheme || null,
+      // 深色方案状态：让 UI/CLI 能看出这个会话在用哪种
+      darkreader: cfg.darkreader || null,
+      darkreaderTheme: cfg.darkreaderTheme || null,
       startedAt: new Date().toISOString(),
       source: opts.source || 'cli',
     };
@@ -815,6 +818,26 @@ async function main() {
   if (!fs.existsSync(cfg.css)) throw new Error(`样式表不存在: ${cfg.css}`);
   cfg.cssText = composeCss(cfg);
 
+  // ── Dark Reader 引擎（可选）──
+  // 注意顺序：必须在建 SessionRegistry **之前** 把 darkreaderTheme 的默认
+  // 引擎补上，否则注册项里记的是 null，UI 会话标签显示不出引擎。
+  // 读一次放内存，之后每个页面会话复用它。读不到就降级为"不用它"，
+  // 不因为缺文件而让整个注入失败。
+  cfg.darkreaderSrc = null;
+  if (cfg.darkreader && cfg.darkreader !== 'off' && cfg.darkreader !== 'false') {
+    try {
+      cfg.darkreaderSrc = fs.readFileSync(DR_ENGINE, 'utf8');
+      // 引擎锁死 dynamicTheme（作者标注效果最好）。filter 类引擎会把彩色
+      // 图标/标签一起反色 —— 那正是"颜色丢失"的来源，所以默认不用。
+      // 想换风格可在 profile 里写 darkreaderTheme.engine，或 --darkreader-engine。
+      cfg.darkreaderTheme = { engine: 'dynamicTheme', ...(cfg.darkreaderTheme || {}) };
+    } catch (e) {
+      warn(`Dark Reader 引擎读取失败，已跳过：${e.message}`);
+      warn(`  期望位置：${DR_ENGINE}`);
+      cfg.darkreaderSrc = null;
+    }
+  }
+
   // 会话登记：让 UI / CLI / 自启动脚本都能看到这个后台注入器。
   // 登记失败不致命（可能目录只读），只是失去可观测性。
   const registry = new SessionRegistry(cfg, { source: cfg.source });
@@ -831,27 +854,10 @@ async function main() {
   if (cfg.profile.__path) log(`profile: ${cfg.profile.__path}`);
   if (cfg.cssExtra) log(`自定义片段：${cfg.cssExtra}`);
   if (cfg.emulateColorScheme) log(`模拟配色方案：${cfg.emulateColorScheme}`);
-
-  // ── Dark Reader 引擎（可选）──
-  // 读一次放内存，之后每个页面会话复用它。读不到就降级为"不用它"，
-  // 不因为缺文件而让整个注入失败。
-  cfg.darkreaderSrc = null;
-  if (cfg.darkreader && cfg.darkreader !== 'off' && cfg.darkreader !== 'false') {
-    try {
-      cfg.darkreaderSrc = fs.readFileSync(DR_ENGINE, 'utf8');
-      // 引擎锁死 dynamicTheme（作者标注效果最好）。filter 类引擎会把彩色
-      // 图标/标签一起反色 —— 那正是"颜色丢失"的来源，所以默认不用。
-      // 想换风格可在 profile 里写 darkreaderTheme.engine，或 --darkreader-engine。
-      const theme = { engine: 'dynamicTheme', ...(cfg.darkreaderTheme || {}) };
-      cfg.darkreaderTheme = theme;
-      log(`Dark Reader 引擎已加载（${(cfg.darkreaderSrc.length / 1024).toFixed(0)} KB），模式：${cfg.darkreader}，引擎：${theme.engine}`);
-      if (cfg.darkreader === 'auto') {
-        log('  auto 模式会读 matchMedia(prefers-color-scheme)，跟随系统深浅色。');
-      }
-    } catch (e) {
-      warn(`Dark Reader 引擎读取失败，已跳过：${e.message}`);
-      warn(`  期望位置：${DR_ENGINE}`);
-      cfg.darkreaderSrc = null;
+  if (cfg.darkreaderSrc) {
+    log(`Dark Reader 引擎已加载（${(cfg.darkreaderSrc.length / 1024).toFixed(0)} KB），模式：${cfg.darkreader}，引擎：${cfg.darkreaderTheme.engine}`);
+    if (cfg.darkreader === 'auto') {
+      log('  auto 模式会读 matchMedia(prefers-color-scheme)，跟随系统深浅色。');
     }
   }
 
