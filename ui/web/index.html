@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- CSP：只允许本地资源；pywebview 的 api 桥不走网络，无需放行外部域 -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'">
+<title>no-glass-ele</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <strong>no-glass-ele</strong>
+    <span class="sub" id="rootPath">…</span>
+  </div>
+  <div class="topbar-actions">
+    <span class="badge" id="nodeBadge" title="Node 是否可用">node ?</span>
+    <span class="badge" id="taskBadge" title="当前任务状态">空闲</span>
+    <button class="btn ghost" id="btnRefresh" title="重新读取 profiles">刷新</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- 左：profile 列表 -->
+  <aside class="pane pane-list">
+    <div class="pane-head">
+      <h2>应用</h2>
+      <button class="btn small primary" id="btnNew" title="从 exe 新建 profile">+ 新建</button>
+    </div>
+    <div class="list" id="profileList"></div>
+    <div class="pane-foot">
+      <button class="btn ghost small" id="btnDoctor">校验全部</button>
+    </div>
+  </aside>
+
+  <!-- 中：详情 / 编辑 -->
+  <section class="pane pane-detail">
+    <div class="empty" id="detailEmpty">
+      <p>从左侧选择一个应用</p>
+      <p class="dim">或点「+ 新建」探测一个新应用</p>
+    </div>
+    <div class="detail hidden" id="detailBody">
+
+      <div class="detail-head">
+        <h2 id="dTitle">—</h2>
+        <div class="detail-badges" id="dBadges"></div>
+      </div>
+
+      <!-- 探测结果 -->
+      <div class="card">
+        <h3>探测结果 <span class="dim tiny">（只读 exe 字节，未启动应用）</span></h3>
+        <div class="facts" id="dFacts"></div>
+        <details class="fuse-wrap">
+          <summary>fuse 明细</summary>
+          <table class="fuse-table" id="dFuses"></table>
+        </details>
+      </div>
+
+      <!-- 校验问题 -->
+      <div class="card hidden" id="dIssuesCard">
+        <h3>校验问题</h3>
+        <ul class="issues" id="dIssues"></ul>
+      </div>
+
+      <!-- 启动 -->
+      <div class="card">
+        <h3>启动注入</h3>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="optIsolate"> 隔离实例（不影响正在运行的）</label>
+        </div>
+        <div class="row">
+          <input class="input" id="optExtra" placeholder="额外参数（可选），如 --port 9500">
+        </div>
+        <div class="row">
+          <button class="btn primary" id="btnLaunch">启动（--launch --watch）</button>
+          <button class="btn danger" id="btnStop" disabled>停止</button>
+        </div>
+        <p class="hint">
+          停止只会结束注入器 —— 目标应用是用 detached 方式启动的，
+          <strong>不会被关掉</strong>。
+        </p>
+        <div class="presets" id="dPresets"></div>
+      </div>
+
+      <!-- 编辑 -->
+      <div class="card">
+        <h3>编辑 profile</h3>
+        <div class="form" id="dForm"></div>
+        <div class="row">
+          <button class="btn primary" id="btnSave">保存</button>
+          <button class="btn ghost" id="btnRevert">撤销修改</button>
+          <button class="btn" id="btnBuild">重新生成启动器</button>
+        </div>
+        <p class="hint">保存后需点「重新生成启动器」，产物才会更新（校验会检查这一点）。</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- 右：日志 -->
+  <aside class="pane pane-log">
+    <div class="pane-head">
+      <h2>输出</h2>
+      <div class="pane-head-actions">
+        <label class="check tiny"><input type="checkbox" id="optFollow" checked> 跟随</label>
+        <button class="btn ghost small" id="btnClearLog">清空</button>
+      </div>
+    </div>
+    <pre class="log" id="log"></pre>
+  </aside>
+
+</main>
+
+<!-- 新建向导 -->
+<div class="modal hidden" id="wizard">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>新建应用</h2>
+      <button class="btn ghost small" id="wizClose">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="wiz-step">
+        <label class="lbl">1. 选择可执行文件</label>
+        <div class="row">
+          <input class="input" id="wizExe" placeholder="D:\path\to\App.exe">
+          <button class="btn" id="wizBrowse">浏览…</button>
+        </div>
+        <div class="row">
+          <button class="btn ghost small" id="wizFromRunning">从运行中的应用里挑</button>
+        </div>
+        <div class="running-list hidden" id="wizRunning"></div>
+      </div>
+
+      <div class="wiz-step">
+        <label class="lbl">2. 探测</label>
+        <div class="row">
+          <button class="btn primary" id="wizProbe">开始探测</button>
+          <span class="dim tiny">只读 exe 字节，不启动应用</span>
+        </div>
+        <div class="probe-result hidden" id="wizProbeResult"></div>
+      </div>
+
+      <div class="wiz-step">
+        <label class="lbl">3. 确认信息</label>
+        <div class="form" id="wizForm"></div>
+      </div>
+    </div>
+
+    <div class="modal-foot">
+      <span class="dim tiny" id="wizStatus"></span>
+      <div>
+        <button class="btn ghost" id="wizCancel">取消</button>
+        <button class="btn primary" id="wizCreate" disabled>创建 profile</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

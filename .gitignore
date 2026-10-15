@@ -2,6 +2,11 @@
 *.tmp
 *.log
 
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
 # bundle 产物是可再生的，但保留它们也合理（便于直接拷走）。
 # 如果你不想让 bundle 进版本库，取消下面这行注释：
 # apps/*-bundle/

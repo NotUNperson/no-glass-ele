@@ -115,15 +115,42 @@ function cmdProbe(args) {
   }
 
   const deep = args.flags.deep === true;
-  say(`${C.b}探测${C.x} ${abs}`);
-  if (deep) say(dim('  （--deep：额外扫描 resources/app.asar 找行为标记）'));
-  say();
+  const asJson = args.flags.json === true;
+  if (!asJson) {
+    say(`${C.b}探测${C.x} ${abs}`);
+    if (deep) say(dim('  （--deep：额外扫描 resources/app.asar 找行为标记）'));
+    say();
+  }
 
   const t0 = Date.now();
   const pr = probe.probeExe(abs, { deep });
   const ms = Date.now() - t0;
 
-  if (!pr.ok) { bad(pr.error); process.exit(1); }
+  if (!pr.ok) {
+    if (asJson) { say(JSON.stringify({ ok: false, error: pr.error, exe: abs }, null, 2)); process.exit(1); }
+    bad(pr.error); process.exit(1);
+  }
+
+  const c = probe.conclusions(pr);
+
+  // JSON 模式：一次给出全部结论，供 UI 使用
+  if (asJson) {
+    const suggested = {
+      name: path.basename(abs, '.exe').toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+      displayName: path.basename(abs, '.exe'),
+      exe: abs,
+      processName: path.basename(abs, '.exe'),
+    };
+    say(JSON.stringify({
+      ok: true, exe: abs, elapsedMs: ms,
+      electron: pr.electron, size: pr.size,
+      fuses: pr.fuses, conclusions: c, warnings: pr.warnings,
+      deep: pr.deep ? { asar: pr.deep.asar, asarName: pr.deep.asarName, asarSize: pr.deep.asarSize, markers: pr.deep.markers } : null,
+      detected: toDetected(pr),
+      suggested,
+    }, null, 2));
+    return;
+  }
 
   say(`${C.b}文件${C.x}`);
   say(`  Electron      ${pr.electron || dim('(未识别)')}`);
@@ -149,7 +176,6 @@ function cmdProbe(args) {
   }
   say();
 
-  const c = probe.conclusions(pr);
   say(`${C.b}结论${C.x}`);
   say(`  CSS 注入（主战场）  ${C.g}可用${C.x} ${dim('— --remote-debugging-port 不受任何 fuse 影响')}`);
   say(`  --native            ${c.canUseNative ? C.g + '可用' + C.x : C.r + '不可用' + C.x + dim(c.nativeBlockedBy ? ` — ${c.nativeBlockedBy} 已关闭` : '')}`);
@@ -365,75 +391,129 @@ function cmdBuild(args) {
 
 // ─────────────────────────── list ───────────────────────────
 
-function cmdList() {
+/**
+ * 采集 list 需要的结构化数据。
+ *
+ * 文本输出与 --json 共用这一份 —— 这样 UI 拿到的状态与终端看到的永远一致，
+ * 不会出现"两套判断逻辑各说各话"。
+ */
+function collectListData() {
   const names = listProfiles();
-  if (!names.length) { say('（还没有 profile。用 `node gen.js new <name> --exe <path>` 创建）'); return; }
-
-  // 先算出纯文本，再上色 —— 否则 ANSI 转义序列会破坏 padEnd 的宽度计算
   const rows = names.map((n) => {
     let p;
-    try { p = loadProfile(n); } catch (e) { return { err: `${n}: ${e.message}` }; }
+    try { p = loadProfile(n); } catch (e) { return { name: n, error: `${n}: ${e.message}` }; }
     const d = p.detected || {};
     const appDir = path.join(APPS_DIR, n);
-    let cmds = 0;
-    try { cmds = fs.readdirSync(appDir).filter((f) => f.endsWith('.cmd')).length; } catch { /* none */ }
+    let cmds = [];
+    try { cmds = fs.readdirSync(appDir).filter((f) => f.endsWith('.cmd')); } catch { /* none */ }
+
+    // 产物是否与当前 profile 一致（复用 doctor 的指纹判断）
+    let stale = null;
+    if (!cmds.length) stale = true;
+    else {
+      const presets = render.planPresets(p);
+      const wantFp = render.fingerprint(p, presets.map((x) => x.file).join(','));
+      stale = true;
+      try {
+        for (const f of [...cmds, 'README.md']) {
+          const txt = fs.readFileSync(path.join(appDir, f), 'utf8');
+          const m = txt.match(/profile-fingerprint: `?([0-9a-f]{12})`?/);
+          if (m && m[1] === wantFp) { stale = false; break; }
+        }
+      } catch { /* 读不到就当作过期 */ }
+    }
+
     return {
       name: n,
-      electron: String(d.electron || '?'),
-      port: String(p.defaultPort || '?'),
-      native: d.canUseNative === false ? '不可用' : d.canUseNative === true ? '可用' : '?',
-      nativeTone: d.canUseNative === false ? 'r' : d.canUseNative === true ? 'g' : 'dim',
-      glass: d.hasPageGlass === true ? '有' : d.hasPageGlass === false ? '未发现' : '?',
-      glassTone: d.hasPageGlass === true ? 'g' : 'dim',
-      cmds: cmds ? `${cmds} 个` : '未生成',
-      cmdsTone: cmds ? 'plain' : 'dim',
+      displayName: p.displayName || n,
+      electron: d.electron || null,
+      port: p.defaultPort != null ? p.defaultPort : null,
+      processName: p.processName || null,
+      exe: p.exe || null,
+      exeExists: p.exe ? fs.existsSync(p.exe) : false,
+      canUseNative: d.canUseNative === undefined ? null : d.canUseNative,
+      hasPageGlass: d.hasPageGlass === undefined ? null : d.hasPageGlass,
+      windowLayerGlass: d.windowLayerGlass === undefined ? null : d.windowLayerGlass,
+      singleInstance: d.singleInstance === undefined ? null : d.singleInstance,
+      userDataOverride: d.userDataOverride === undefined ? null : d.userDataOverride,
+      hardened: (d.fuses && d.fuses.hardened) || [],
+      reservedPorts: p.reservedPorts || [],
+      presets: cmds.map((f) => f.replace(/\.cmd$/, '')),
+      generated: cmds.length > 0,
+      stale,
+      probedAt: d.probedAt || null,
+    };
+  });
+  return { profiles: rows };
+}
+
+function cmdList(args) {
+  const data = collectListData();
+  if (args && args.flags.json === true) { say(JSON.stringify(data, null, 2)); return; }
+
+  if (!data.profiles.length) { say('（还没有 profile。用 `node gen.js new <name> --exe <path>` 创建）'); return; }
+
+  const rows = data.profiles.map((r) => {
+    if (r.error) return r;
+    return {
+      ...r,
+      electronText: String(r.electron || '?'),
+      portText: String(r.port != null ? r.port : '?'),
+      nativeText: r.canUseNative === false ? '不可用' : r.canUseNative === true ? '可用' : '?',
+      nativeTone: r.canUseNative === false ? 'r' : r.canUseNative === true ? 'g' : 'dim',
+      glassText: r.hasPageGlass === true ? '有' : r.hasPageGlass === false ? '未发现' : '?',
+      glassTone: r.hasPageGlass === true ? 'g' : 'dim',
+      cmdsText: r.presets.length ? `${r.presets.length} 个` : '未生成',
+      cmdsTone: r.presets.length ? (r.stale ? 'y' : 'plain') : 'dim',
     };
   });
 
-  const bad_rows = rows.filter((r) => r.err);
-  const good = rows.filter((r) => !r.err);
+  const bad_rows = rows.filter((r) => r.error);
+  const good = rows.filter((r) => !r.error);
 
   // 按显示宽度对齐（中文按 2 列算）
   const w = (s) => [...String(s)].reduce((a, c) => a + (c.charCodeAt(0) > 0x2e80 ? 2 : 1), 0);
   const pad = (s, n) => String(s) + ' '.repeat(Math.max(0, n - w(s)));
   const col = {
     name: Math.max(4, ...good.map((r) => w(r.name))) + 2,
-    electron: Math.max(8, ...good.map((r) => w(r.electron))) + 2,
-    port: Math.max(4, ...good.map((r) => w(r.port))) + 2,
-    native: Math.max(6, ...good.map((r) => w(r.native))) + 2,
-    glass: Math.max(8, ...good.map((r) => w(r.glass))) + 2,
+    electron: Math.max(8, ...good.map((r) => w(r.electronText))) + 2,
+    port: Math.max(4, ...good.map((r) => w(r.portText))) + 2,
+    native: Math.max(6, ...good.map((r) => w(r.nativeText))) + 2,
+    glass: Math.max(8, ...good.map((r) => w(r.glassText))) + 2,
   };
-  const tone = (s, t) => (t === 'dim' ? dim(s) : t === 'g' ? `${C.g}${s}${C.x}` : t === 'r' ? `${C.r}${s}${C.x}` : s);
+  const tone = (s, t) =>
+    t === 'dim' ? dim(s) : t === 'g' ? `${C.g}${s}${C.x}` : t === 'r' ? `${C.r}${s}${C.x}` : t === 'y' ? `${C.y}${s}${C.x}` : s;
 
-  say(`${C.b}profiles${C.x} ${dim(`(${names.length})`)}`);
+  say(`${C.b}profiles${C.x} ${dim(`(${data.profiles.length})`)}`);
   say();
   say(`  ${pad('名称', col.name)}${pad('Electron', col.electron)}${pad('端口', col.port)}${pad('native', col.native)}${pad('页面玻璃', col.glass)}启动器`);
   say(`  ${'-'.repeat(col.name + col.electron + col.port + col.native + col.glass + 10)}`);
   for (const r of good) {
     say(
-      `  ${pad(r.name, col.name)}${pad(r.electron, col.electron)}${pad(r.port, col.port)}` +
-        `${tone(pad(r.native, col.native), r.nativeTone)}${tone(pad(r.glass, col.glass), r.glassTone)}${tone(r.cmds, r.cmdsTone)}`
+      `  ${pad(r.name, col.name)}${pad(r.electronText, col.electron)}${pad(r.portText, col.port)}` +
+        `${tone(pad(r.nativeText, col.native), r.nativeTone)}${tone(pad(r.glassText, col.glass), r.glassTone)}${tone(r.cmdsText, r.cmdsTone)}`
     );
   }
-  for (const r of bad_rows) bad(r.err);
+  for (const r of bad_rows) bad(r.error);
   say();
 }
 
 // ─────────────────────────── doctor ───────────────────────────
 
-function cmdDoctor() {
+/**
+ * 采集 doctor 需要的结构化数据（文本与 --json 共用）。
+ * 返回 { ok, profiles: [{ name, issues: [] }], problemCount }
+ */
+function collectDoctorData() {
   const names = listProfiles();
-  if (!names.length) { say('（还没有 profile）'); return; }
-
-  let problems = 0;
   const ports = new Map();
-
-  say(`${C.b}校验 profiles${C.x}`);
-  say();
+  const profiles = [];
+  let problemCount = 0;
 
   for (const n of names) {
     let p;
-    try { p = loadProfile(n); } catch (e) { bad(`${n}: profile 解析失败 — ${e.message}`); problems++; continue; }
+    try { p = loadProfile(n); }
+    catch (e) { profiles.push({ name: n, parseError: e.message, issues: [`profile 解析失败 — ${e.message}`] }); problemCount++; continue; }
 
     const d = p.detected || {};
     const issues = [];
@@ -487,8 +567,7 @@ function cmdDoctor() {
         for (const f of fs.readdirSync(appDir)) {
           if (!f.endsWith('.cmd') && f !== 'README.md') continue;
           const txt = fs.readFileSync(path.join(appDir, f), 'utf8');
-          const m = txt.match(/profile-fingerprint: ([0-9a-f]{12})/) ||
-                    txt.match(/profile-fingerprint: `([0-9a-f]{12})`/);
+          const m = txt.match(/profile-fingerprint: `?([0-9a-f]{12})`?/);
           if (!m) { stale = true; break; }
           if (m[1] === wantFp) { found = true; break; }
         }
@@ -497,18 +576,35 @@ function cmdDoctor() {
       else if (!found) issues.push('生成产物与当前 profile 不一致 → 重新 build');
     }
 
-    if (issues.length) {
-      say(`  ${C.y}${n}${C.x}`);
-      for (const i of issues) say(`    ${C.y}!${C.x} ${i}`);
-      problems += issues.length;
-    } else {
-      say(`  ${C.g}${n}${C.x} ${dim('无问题')}`);
-    }
+    problemCount += issues.length;
+    profiles.push({ name: n, issues });
+  }
+
+  return { ok: problemCount === 0, profiles, problemCount };
+}
+
+function cmdDoctor(args) {
+  const data = collectDoctorData();
+  if (args && args.flags.json === true) {
+    say(JSON.stringify(data, null, 2));
+    if (!data.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (!data.profiles.length) { say('（还没有 profile）'); return; }
+
+  say(`${C.b}校验 profiles${C.x}`);
+  say();
+
+  for (const r of data.profiles) {
+    if (!r.issues.length) { say(`  ${C.g}${r.name}${C.x} ${dim('无问题')}`); continue; }
+    say(`  ${C.y}${r.name}${C.x}`);
+    for (const i of r.issues) say(`    ${C.y}!${C.x} ${i}`);
   }
 
   say();
-  if (problems) {
-    say(`${C.y}共 ${problems} 项待处理。${C.x}`);
+  if (data.problemCount) {
+    say(`${C.y}共 ${data.problemCount} 项待处理。${C.x}`);
     process.exitCode = 1;
   } else {
     ok('全部通过。');
@@ -530,9 +626,10 @@ ${C.b}命令${C.x}
   ${C.c}doctor${C.x}                        校验 exe 存在性、端口冲突、fuse 与预设矛盾
 
 ${C.b}选项${C.x}
-  --deep      深层探测：额外扫描 resources/app.asar 找行为标记
+  --deep      深层探测：额外扫描 resources/*.asar 找行为标记
   --bundle    生成自包含版本（配置与样式内联，目录可单独拷走）
   --port <n>  new 时指定默认端口
+  --json      probe / list / doctor 输出 JSON（供 UI 调用，人类可读输出不变）
 
 ${C.b}说明${C.x}
   · 全程**不启动**目标应用，只读 exe / asar 的字节。
@@ -552,8 +649,8 @@ function main() {
     case 'probe': return cmdProbe(args);
     case 'new': return cmdNew(args);
     case 'build': return cmdBuild(args);
-    case 'list': case 'ls': return cmdList();
-    case 'doctor': case 'check': return cmdDoctor();
+    case 'list': case 'ls': return cmdList(args);
+    case 'doctor': case 'check': return cmdDoctor(args);
     case undefined: case '-h': case '--help': case 'help': return usage();
     default:
       bad(`未知命令: ${cmd}`);

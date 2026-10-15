@@ -4,6 +4,12 @@
 *.md   text eol=lf
 *.css  text eol=lf
 
+# Python：LF。Python 3 对两种换行都接受，但统一 LF 更整洁。
+*.py   text eol=lf
+
+# 前端：LF（浏览器不在乎，但保持一致）
+*.html text eol=lf
+
 # ── 关键：生成的 .cmd 必须锁死 CRLF ────────────────────────────────────────
 # 中文版 Windows 的 cmd 默认按 GBK(936) 解析。若 .cmd 存成 UTF-8 且含中文，
 # 字节被错读后会产生 & | 之类的分隔符，把 rem 注释行撕成一条条"命令"，
