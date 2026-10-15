@@ -427,15 +427,18 @@ async function launchInjector() {
 }
 
 async function stopSession(key) {
-  const s = STATE.sessions.find((x) => (x.localId || x.id) === key);
+  const s = STATE.sessions.find((x) => x.key === key);
   const nm = s ? (s.displayName || s.profile) : key;
 
+  // 外部发现的旧版注入器既没有 localId 也没有 id —— 只能按 pid 强停。
+  // 后端 stop_session 也认 pid（通过 ext:<pid> 形式的 key 或直接传 pid）。
   const res = await api().stop_session(
     s && s.localId ? s.localId : null,
-    s && s.id ? s.id : null
+    s && s.id ? s.id : null,
+    s && s.pid ? s.pid : null
   );
   if (!res) { toast('界面桥未就绪', 'err'); return; }
-  if (res.ok === false) { toast(res.error || '停止失败', 'err', 4000); return; }
+  if (res.ok === false) { toast(res.error || '停止失败', 'err', 5000); return; }
 
   toast(`已请求停止 ${nm}。目标应用不会被关闭。`, 'ok', 5000);
   await updateTaskUI();
@@ -487,23 +490,24 @@ async function updateTaskUI() {
 
 function renderSessionTabs() {
   const box = $('sessionTabs');
-  const live = STATE.sessions.filter((s) => s.running || s.id);
+  // 只显示有 key 的（后端保证非空；这里再兜一层，防御脏数据）
+  const live = STATE.sessions.filter((s) => s.key);
 
   // 若当前查看的会话没了，回退到第一个
-  const keys = live.map((s) => s.localId || s.id);
+  const keys = live.map((s) => s.key);
   if (STATE.activeSession && !keys.includes(STATE.activeSession)) {
     STATE.activeSession = keys[0] || null;
   }
   if (!STATE.activeSession && keys.length) STATE.activeSession = keys[0];
 
   box.innerHTML = live.map((s) => {
-    const key = s.localId || s.id;
+    const key = s.key;
     const nm = s.displayName || s.profile || '(未知)';
     const cls = ['stab'];
     if (s.running) cls.push('run'); else cls.push('dead');
     if (key === STATE.activeSession) cls.push('active');
     const port = s.port != null ? `<span class="pt">:${s.port}</span>` : '';
-    const ext = s.external ? '<span class="ext" title="外部启动的注入器（无实时日志）">外部</span>' : '';
+    const ext = s.external ? '<span class="ext" title="外部启动的注入器（无实时日志，可看磁盘日志）">外部</span>' : '';
     const x = s.running ? `<span class="x" data-stop="${esc(key)}" title="停止（不关应用）">✕</span>` : '';
     return `<span class="${cls.join(' ')}" data-key="${esc(key)}" title="${esc(nm)}">
       <span class="dot"></span><span class="nm">${esc(nm)}</span>${port}${ext}${x}
@@ -514,8 +518,12 @@ function renderSessionTabs() {
   box.querySelectorAll('.stab').forEach((el) => {
     el.onclick = (e) => {
       if (e.target.dataset.stop) return;   // 点的是 ✕
-      STATE.activeSession = el.dataset.key;
+      const k = el.dataset.key;
+      if (!k) return;                      // 没有 key 就不切（不该发生）
+      if (STATE.activeSession === k) return;  // 重复点同一个：不重绘，避免闪
+      STATE.activeSession = k;
       $('log').innerHTML = '';
+      $('logTitle').textContent = '输出 · 加载中…';
       renderSessionTabs();
       pollSessionLog();
     };
@@ -528,39 +536,61 @@ function renderSessionTabs() {
     };
   });
 
-  const cur = STATE.sessions.find((s) => (s.localId || s.id) === STATE.activeSession);
+  const cur = STATE.sessions.find((s) => s.key === STATE.activeSession);
   $('logTitle').textContent = cur
-    ? `输出 · ${cur.displayName || cur.profile}${cur.external ? '（外部，无实时日志）' : ''}`
+    ? `输出 · ${cur.displayName || cur.profile}${cur.external ? '（外部）' : ''}`
     : '输出';
 }
 
-/** 轮询当前选中会话的日志。每个会话有独立游标。 */
+/**
+ * 轮询当前选中会话的日志。
+ * 每个会话有独立游标，所以切标签不会互相污染。
+ */
 async function pollSessionLog() {
   const key = STATE.activeSession;
   if (!key) {
     // 没有会话时退回短任务日志
     return pollTaskLog();
   }
-  const s = STATE.sessions.find((x) => (x.localId || x.id) === key);
-  if (!s) return pollTaskLog();
+  const s = STATE.sessions.find((x) => x.key === key);
+  if (!s) {
+    // 会话可能刚好消失了 —— 不要静默留空白，给一句提示
+    const box = $('log');
+    if (!box.textContent.trim()) {
+      box.innerHTML = '<span class="l-dim">（该会话已结束）</span>';
+    }
+    return;
+  }
 
   const cursor = STATE.sessionCursors[key] || 0;
   const res = await api().get_session_log(
-    s.localId || null, s.id || null, cursor
+    s.localId || null, s.id || null, cursor, s.pid || null
   );
-  if (!res || res.ok === false) return;
+  if (!res || res.ok === false) {
+    // 后端明确报错时也要让用户看见，而不是留一片空白
+    const box = $('log');
+    if (!box.textContent.trim()) {
+      box.innerHTML = `<span class="l-err">（读日志失败：${esc((res && res.error) || '未知错误')}）</span>`;
+    }
+    return;
+  }
 
   if (res.live) {
     STATE.sessionCursors[key] = res.cursor;
     appendLog(res.lines || []);
+    if (!res.lines.length && !$('log').textContent.trim()) {
+      $('log').innerHTML = '<span class="l-dim">（该会话暂无输出）</span>';
+    }
   } else {
     // 外部会话：整段返回，直接替换显示（避免重复追加）
+    const box = $('log');
     if (res.lines && res.lines.length) {
-      const box = $('log');
       const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
       box.innerHTML = res.lines
         .map((l) => `<span class="${classify(l)}">${esc(l)}</span>`).join('\n');
       if ($('optFollow').checked && atBottom) box.scrollTop = box.scrollHeight;
+    } else if (!box.textContent.trim()) {
+      box.innerHTML = `<span class="l-dim">（${esc(res.note || '该会话没有日志')}）</span>`;
     }
   }
 }

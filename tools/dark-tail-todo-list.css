@@ -1,0 +1,505 @@
+/* ==========================================================================
+   尾部：结构性精修（手工维护）
+   --------------------------------------------------------------------------
+   自动生成的中段负责"按类名前缀通配"，但它有两个盲区：
+
+     1. **挂载在 body 下的浮层** —— 日期选择器、下拉、tooltip 是 append 到
+        <body> 的，不在 .base-layout 里，前缀通配命中不到。
+     2. **应用自身的布局类** —— 侧栏/底栏/内容区这些大块需要精确指定底色，
+        用通配压成同一个灰会失去层次。
+
+   所以这一节手工处理这两类。类名全部来自实测（tools/audit-dark.js
+   与 tools/dump-app-css.js 的输出），不是猜的。
+   ========================================================================== */
+
+/* ══════════════════════════════════════════════════════════════════════
+   ① 最底层：窗口与根容器
+   ══════════════════════════════════════════════════════════════════════ */
+html, body, #app {
+  background-color: var(--t-bg) !important;
+  color: var(--t-text) !important;
+}
+
+/* 主要布局区：用后代通配兜住所有未被前缀命中的元素。
+   这是"标题发黑"问题的第二道保险 —— 即便某个叶子类名没被前缀覆盖，
+   这里的通配也会给它一个可读的颜色。 */
+.base-layout,
+.base-layout *,
+.el-main,
+.el-main * {
+  color: var(--t-text) !important;
+}
+
+/* 次级文字：这些区域本来就更淡，压成主色会失去层次 */
+.sidebar-nav-item,
+.todo-list-item__desc,
+.todo-list-item__meta,
+.todo-list-item__time,
+.todo-date-selector__date,
+.el-form-item__label,
+.el-pagination,
+.el-pagination * {
+  color: var(--t-text-2) !important;
+}
+
+/* 最淡的：占位、禁用、辅助说明 */
+.todo-list-item__hint,
+.el-input__inner::placeholder,
+.el-textarea__inner::placeholder,
+.el-select-dropdown__item.is-disabled,
+.is-disabled,
+[disabled] {
+  color: var(--t-text-3) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ② 布局大块：分层底色
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* 侧栏（实测 bg=rgb(248,248,248)，151200px²）*/
+.base-layout__sidebar,
+.sidebar,
+.sidebar-nav {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+}
+.sidebar-nav-item { background-color: transparent !important; }
+.sidebar-nav-item:hover { background-color: var(--t-bg-hover) !important; }
+.sidebar-nav-item--active,
+.sidebar-nav-item.router-link-exact-active {
+  background-color: var(--t-bg-hover) !important;
+}
+
+/* 侧栏搜索框（实测 bg=rgb(245,244,245)）*/
+.main-nav-search,
+.main-nav-search__input {
+  background-color: var(--t-bg-inset) !important;
+  border-color: var(--t-line) !important;
+}
+
+/* 底栏（实测 bg=#fff + rgb(235,242,243)）*/
+.base-layout__footer,
+.base-layout__footer-content {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+}
+
+/* 主内容区 */
+.base-layout__main,
+.base-layout__content,
+.base-layout__container,
+.base-layout__container__wrap,
+.main-content,
+.page,
+.page__main,
+.page-container,
+.todo-list,
+.todo-list__body {
+  background-color: var(--t-bg) !important;
+}
+
+/* 番茄钟（实测 bg=rgb(235,242,243)，75150px²）*/
+.tomato-timer,
+.tomato-timer__body,
+.tomato-timer__footer,
+.tomato-timer__header {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+}
+/* "白噪音"按钮（实测 bg=rgb(215,230,232)）*/
+.tomato-timer__opt--volume-mute {
+  background-color: var(--t-bg-hover) !important;
+}
+/* 番茄钟悬浮按钮（实测 rgba(255,255,255,.95)）*/
+.btn-tomato-timer {
+  background-color: var(--t-bg-hover) !important;
+  color: var(--t-brand) !important;
+}
+.btn-tomato-timer:hover { background-color: var(--t-line) !important; }
+
+/* 待办条目分层（原来是纯白 / 近白）*/
+.todo-list-item {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line-soft) !important;
+}
+.todo-list-item:hover { background-color: var(--t-bg-hover) !important; }
+.todo-list-item--lv1 { background-color: var(--t-bg) !important; }
+.todo-list-item--lv2 { background-color: var(--t-bg-soft) !important; }
+.todo-list-item--lv3 { background-color: var(--t-bg-hover) !important; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   ③ 挂载在 body 下的浮层
+   ──────────────────────────────────────────────────────────────────────
+   前缀通配覆盖不到它们（不在 .base-layout 里）。
+   实测：mx-datepicker 弹窗曾是最后一个白底大块（125312px²）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* mx-datepicker（另一个日期库，类名与 Element 不同）*/
+.mx-datepicker-main,
+.mx-datepicker-popup,
+.mx-datepicker-content,
+.mx-datepicker-header,
+.mx-datepicker-footer,
+.mx-calendar,
+.mx-calendar-header,
+.mx-calendar-content,
+.mx-panel,
+.mx-panel-header,
+.mx-panel-content,
+.mx-time,
+.mx-time-header,
+.mx-time-content,
+.mx-table,
+.mx-table-header,
+.mx-table-date,
+.mx-btn {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.mx-table td,
+.mx-table th,
+.mx-table .cell,
+.mx-table-date .cell {
+  background-color: transparent !important;
+  color: var(--t-text) !important;
+}
+.mx-table td:hover,
+.mx-table td:hover .cell { background-color: var(--t-bg-hover) !important; }
+/* 非本月 / 禁用：变淡 */
+.mx-table td.not-current-month,
+.mx-table td.disabled,
+.mx-table td.not-current-month .cell,
+.mx-table td.disabled .cell {
+  color: var(--t-text-3) !important;
+  background-color: transparent !important;
+}
+.mx-table td.active,
+.mx-table td.current { background-color: var(--t-bg-hover) !important; }
+.mx-table td.active .cell,
+.mx-table td.current .cell,
+.mx-table td.today .cell { color: var(--t-brand) !important; }
+
+/* body 下的 Element 浮层（下拉/提示/对话框 wrapper）*/
+body > .el-popper,
+body > .el-select-dropdown,
+body > .el-picker-panel,
+body > .el-dropdown-menu,
+body > .el-autocomplete-suggestion,
+body > .el-message-box__wrapper,
+body > .el-dialog__wrapper,
+body > .el-table-filter,
+body > .el-tooltip__popper {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+body > .el-popper *,
+body > .el-select-dropdown *,
+body > .el-picker-panel *,
+body > .el-dropdown-menu *,
+body > .el-autocomplete-suggestion *,
+body > .el-table-filter *,
+body > .el-tooltip__popper * {
+  color: var(--t-text) !important;
+}
+/* 但强调色要还原 */
+body > .el-select-dropdown .el-select-dropdown__item.selected,
+body > .el-picker-panel .el-date-table td.today span,
+body > .el-picker-panel .el-pager li.active {
+  color: var(--t-brand) !important;
+}
+body > .el-picker-panel .el-date-table td.current:not(.disabled) span,
+body > .el-picker-panel .el-date-table td.selected span {
+  color: #fff !important;
+}
+/* 弹出层箭头，否则会留白色小三角 */
+.el-popper__arrow::before,
+.el-popover__arrow::before {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ④ 日历视图（FullCalendar）
+   ──────────────────────────────────────────────────────────────────────
+   应用有多个视图：#/todo-list/today、#/todo-list/calendar 等。
+   日历用 FullCalendar（.fc-*），实测该视图里日历容器是 580356px² 的白块。
+   ══════════════════════════════════════════════════════════════════════ */
+.calendar-container,
+.calendar-container__top,
+.calendar-container__bottom,
+.calendar-container__left,
+.calendar-container__right,
+.custom-calendar {
+  background-color: var(--t-bg) !important;
+  color: var(--t-text) !important;
+  border-color: var(--t-line) !important;
+}
+.fc, .fc * { border-color: var(--t-line-soft) !important; }
+.fc-theme-standard td,
+.fc-theme-standard th,
+.fc-scrollgrid,
+.fc-scrollgrid-section > td {
+  background-color: var(--t-bg) !important;
+  border-color: var(--t-line-soft) !important;
+}
+/* 星期标题行（实测 bg=#fff，30840px²）*/
+.fc-col-header,
+.fc-col-header-cell,
+.fc-col-header-cell-cushion {
+  background-color: var(--t-bg-soft) !important;
+  color: var(--t-text-2) !important;
+  text-decoration: none !important;
+}
+.fc-daygrid-day,
+.fc-daygrid-day-frame,
+.fc-daygrid-day-events,
+.fc-daygrid-day-top,
+.fc-daygrid-day-number {
+  background-color: var(--t-bg) !important;
+  color: var(--t-text) !important;
+}
+.fc-daygrid-day:hover .fc-daygrid-day-frame {
+  background-color: var(--t-bg-soft) !important;
+}
+/* "今天"高亮 */
+.fc .fc-day-today,
+.fc .fc-day-today .fc-daygrid-day-frame {
+  background-color: rgba(17, 171, 172, .14) !important;
+}
+.fc-day-today .fc-daygrid-day-number {
+  color: var(--t-brand) !important;
+  font-weight: 600;
+}
+.fc-day-other,
+.fc-day-other .fc-daygrid-day-frame { background-color: var(--t-bg) !important; }
+.fc-day-other .fc-daygrid-day-number { color: var(--t-text-3) !important; }
+
+/* 事件块（实测 bg=rgb(233,231,233) / rgb(245,244,245)）*/
+.fc-event,
+.fc-daygrid-event,
+.fc-h-event,
+.fc-timegrid-event,
+.fc-daygrid-block-event {
+  background-color: var(--t-bg-hover) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.fc-event-main,
+.fc-event-title,
+.fc-event-title-container,
+.fc-sticky {
+  background-color: transparent !important;
+  color: var(--t-text) !important;
+}
+.fc-event:hover { background-color: var(--t-line) !important; }
+.fc-daygrid-more-link {
+  background-color: var(--t-bg-soft) !important;
+  color: var(--t-brand) !important;
+}
+
+/* 周/日视图时间轴 */
+.fc-timegrid-slot,
+.fc-timegrid-slot-lane,
+.fc-timegrid-axis,
+.fc-timegrid-col,
+.fc-timegrid-col-frame {
+  background-color: var(--t-bg) !important;
+  border-color: var(--t-line-soft) !important;
+}
+.fc-timegrid-slot-label,
+.fc-timegrid-axis-cushion,
+.fc-timegrid-slot-label-cushion { color: var(--t-text-3) !important; }
+.fc-timegrid-now-indicator-line { border-color: var(--t-brand) !important; }
+.fc-timegrid-now-indicator-arrow {
+  border-color: var(--t-brand) !important;
+  background-color: var(--t-brand) !important;
+}
+
+/* 工具栏 */
+.fc-toolbar, .fc-toolbar * { color: var(--t-text) !important; }
+.fc-button,
+.fc-button-primary {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.fc-button:hover,
+.fc-button-primary:hover {
+  background-color: var(--t-bg-hover) !important;
+  border-color: var(--t-brand) !important;
+  color: var(--t-text) !important;
+}
+
+/* 日期选择器头部（实测 bg=rgb(248,248,248)）*/
+.todo-date-selector,
+.todo-date-selector__date,
+.todo-date-selector__prev,
+.todo-date-selector__next {
+  background-color: var(--t-bg-soft) !important;
+  color: var(--t-text) !important;
+  border-color: var(--t-line) !important;
+}
+.todo-date-selector__prev:hover,
+.todo-date-selector__next:hover {
+  background-color: var(--t-bg-hover) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ⑤ 弹窗与表单内部组件
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* 弹窗容器 */
+.modal,
+.modal__body,
+.modal__content,
+.modal-dialog {
+  background-color: var(--t-bg-soft) !important;
+  color: var(--t-text) !important;
+}
+.modal *, .modal-dialog * { border-color: var(--t-line) !important; }
+.modal .el-input__inner,
+.modal .el-textarea__inner,
+.modal input,
+.modal textarea {
+  background-color: var(--t-bg-inset) !important;
+  color: var(--t-text) !important;
+}
+.modal .title-text,
+.modal__header .title-text,
+.el-dialog__body,
+.el-message-box__message { color: var(--t-text) !important; }
+
+/* 弹窗底部操作条（实测 bg=#fff，18704px²）*/
+.bottom,
+.modal__footer,
+.modal__header {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.bottom *, .modal__footer * { color: var(--t-text) !important; }
+
+/* 日期快捷段（实测 bg=rgb(248,248,248)，8890px²）*/
+.todo-date-segments,
+.todo-date-segment {
+  background-color: var(--t-bg-inset) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text-2) !important;
+}
+.todo-date-segment:hover {
+  background-color: var(--t-bg-hover) !important;
+  color: var(--t-text) !important;
+}
+.todo-date-segment.is-active {
+  background-color: var(--t-brand) !important;
+  color: #fff !important;
+}
+
+/* 子任务编辑框（实测 bg=#fff）*/
+.todo-sublist-editor,
+.todo-sublist-editor__input,
+.todo-sublist-editor * {
+  background-color: var(--t-bg-inset) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+
+/* 自定义下拉（实测 bg=rgb(245,244,245) / rgb(195,195,195)）*/
+.select__option,
+.select__option--lv1,
+.select__option--lv2,
+.select__option--lv3,
+.select__list,
+.select__menu {
+  background-color: var(--t-bg-soft) !important;
+  color: var(--t-text) !important;
+  border-color: var(--t-line) !important;
+}
+.select__option:hover,
+.select__option.is-active,
+.select__option.is-selected {
+  background-color: var(--t-bg-hover) !important;
+  color: var(--t-brand) !important;
+}
+
+/* 标签块（实测 bg=rgb(245,244,245)）*/
+.tag,
+.tag--round,
+.tag--rect,
+.todo-tag,
+.todo-tag__item {
+  background-color: var(--t-bg-hover) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.tag:hover, .tag--round:hover, .todo-tag__item:hover {
+  background-color: var(--t-line) !important;
+}
+
+/* 右键菜单 */
+.context-menu,
+.contextmenu,
+.dropdown-menu {
+  background-color: var(--t-bg-soft) !important;
+  border-color: var(--t-line) !important;
+  color: var(--t-text) !important;
+}
+.context-menu *, .contextmenu * { color: var(--t-text) !important; }
+.context-menu li:hover, .contextmenu li:hover {
+  background-color: var(--t-bg-hover) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ⑥ 登录页
+   ──────────────────────────────────────────────────────────────────────
+   应用启动后先是登录页（app://./index.html#/auth/login/account），
+   自动登录后才进入主界面。不覆盖的话启动瞬间是刺眼的白。
+   ══════════════════════════════════════════════════════════════════════ */
+[class*="login"],
+[class*="auth"] {
+  background-color: var(--t-bg) !important;
+  color: var(--t-text) !important;
+}
+[class*="login"] .el-input__inner,
+[class*="auth"] .el-input__inner {
+  background-color: var(--t-bg-inset) !important;
+  border-color: var(--t-line) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ⑦ 兜底：内联写死的颜色
+   ──────────────────────────────────────────────────────────────────────
+   应用里有内联 style 写死颜色的地方（实测整页 20 处带内联 color）。
+   ══════════════════════════════════════════════════════════════════════ */
+[style*="background-color: rgb(255, 255, 255)"],
+[style*="background: rgb(255, 255, 255)"],
+[style*="background-color:#fff"],
+[style*="background:#fff"],
+[style*="background-color: #fff"],
+[style*="background: #fff"],
+[style*="background-color:#f1f1f1"],
+[style*="background-color: #f1f1f1"] {
+  background-color: var(--t-bg-hover) !important;
+}
+[style*="color: rgb(0, 0, 0)"],
+[style*="color: #000"],
+[style*="color:#000"],
+[style*="color: rgb(51, 51, 51)"],
+[style*="color: #333"],
+[style*="color:#333"] {
+  color: var(--t-text) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   ⑧ 滚动条
+   ══════════════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--t-bg); }
+::-webkit-scrollbar-thumb {
+  background: #39404d;
+  border-radius: 5px;
+  border: 2px solid var(--t-bg);
+}
+::-webkit-scrollbar-thumb:hover { background: #48505f; }

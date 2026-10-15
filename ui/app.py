@@ -817,7 +817,16 @@ class Api:
     def list_sessions(self):
         """
         列出所有注入会话：本地启动的 + 从注册表读到的 + 进程表发现的。
-        合并成一个列表给前端，每项带 localId（本地句柄）或 id（注册表 id）。
+
+        每个会话都带一个**稳定的 key**，前端用它做标签身份与日志游标。
+        为什么必须有 key：外部发现的注入器既没有 localId 也没有 id
+        （旧版本没登记），早期版本直接返回 None，前端 `localId || id`
+        得到空值 —— 所有外部标签撞成同一个空 key，点一下日志区就永久空白。
+
+        key 的构成（按优先级）：
+          1. localId（本地启动的，有实时日志缓冲）
+          2. id（注册表登记的，如 obsidian-1234）
+          3. ext:<pid>（外部发现的，pid 一定存在）
         """
         try:
             status = RUNNER.status()
@@ -839,9 +848,12 @@ class Api:
             pid = s.get("pid")
             # 从注册表补齐元数据
             meta = next((r for r in reg if r.get("pid") == pid), None)
+            reg_id = meta.get("id") if meta else None
             out.append({
+                # key 永不为空：localId 一定有值（字典键）
+                "key": lid or (reg_id or (f"ext:{pid}" if pid else None)),
                 "localId": lid,
-                "id": meta.get("id") if meta else None,
+                "id": reg_id,
                 "profile": s.get("profile"),
                 "displayName": (meta or {}).get("displayName") or s.get("profile"),
                 "pid": pid,
@@ -862,12 +874,16 @@ class Api:
         for r in reg:
             if r.get("pid") in seen_pids:
                 continue
+            pid = r.get("pid")
+            reg_id = r.get("id")
             out.append({
+                # 外部发现的一定有 pid，所以 key 也一定非空
+                "key": reg_id or (f"ext:{pid}" if pid else None),
                 "localId": None,
-                "id": r.get("id"),
+                "id": reg_id,
                 "profile": r.get("profile"),
                 "displayName": r.get("displayName") or r.get("appName") or r.get("profile"),
-                "pid": r.get("pid"),
+                "pid": pid,
                 "port": r.get("port"),
                 "running": bool(r.get("alive")),
                 "startedAt": r.get("startedAt"),
@@ -879,27 +895,60 @@ class Api:
                 "emulateColorScheme": r.get("emulateColorScheme"),
             })
 
+        # 过滤掉连 pid 都没有的僵尸项（理论上不该出现）
+        out = [x for x in out if x.get("key")]
+
         out.sort(key=lambda x: (not x.get("running"), str(x.get("startedAt") or "")))
         return {"ok": True, "sessions": out}
 
-    def stop_session(self, local_id=None, session_id=None):
-        """停止一个会话。优先本地句柄（有实时日志），否则走注册表 id。"""
+    def stop_session(self, local_id=None, session_id=None, pid=None):
+        """
+        停止一个会话。三种定位方式，按优先级：
+          1. localId —— 本地启动的，有实时日志缓冲
+          2. sessionId —— 注册表登记的，走协作式停止文件
+          3. pid —— 外部发现的旧版注入器，没有登记项，只能按 pid 强停
+
+        强停**不带 /T**：目标应用虽由注入器 detached 启动，
+        但 Windows 进程表里仍记录父子关系，/T 会顺树把应用一起杀掉。
+        """
         try:
             if local_id:
                 return RUNNER.stop_session(local_id)
+
             if session_id:
                 okr, err = sessions.request_stop(session_id)
                 if not okr:
                     return {"ok": False, "error": err}
                 return {"ok": True, "graceful": True}
-            return {"ok": False, "error": "需要 localId 或 sessionId"}
+
+            if pid:
+                # 外部注入器：先看它是否其实有登记项（可能只是注册表被清了）
+                try:
+                    for r in sessions.list_registered(force=True):
+                        if str(r.get("pid")) == str(pid):
+                            okr, err = sessions.request_stop(r.get("id"))
+                            if okr:
+                                return {"ok": True, "graceful": True}
+                            break
+                except Exception:                        # noqa: BLE001
+                    pass
+                okk, err = sessions.force_kill(pid)
+                if not okk:
+                    return {"ok": False, "error": err}
+                return {"ok": True, "graceful": False,
+                        "note": "这是外部发现的旧版注入器，已按 pid 结束。目标应用未受影响。"}
+
+            return {"ok": False, "error": "需要 localId / sessionId / pid 之一"}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
-    def get_session_log(self, local_id=None, session_id=None, cursor=0):
+    def get_session_log(self, local_id=None, session_id=None, cursor=0, pid=None):
         """
         取某会话的日志。
-        本地会话走内存缓冲（增量、游标）；外部会话直接读磁盘日志文件。
+
+        · 本地会话走内存缓冲（增量、游标）
+        · 外部会话（有登记项）读磁盘日志文件
+        · 外部发现的旧版注入器没有日志文件，返回明确提示而不是空白
         """
         try:
             if local_id:
@@ -913,11 +962,31 @@ class Api:
             if session_id:
                 text, _ = sessions.read_log(session_id)
                 lines = text.splitlines()
-                # 文件日志没有游标语义，按行数返回尾部
+                if not lines:
+                    return {"ok": True, "lines": [], "cursor": 0, "live": False,
+                            "path": sessions.log_path(session_id),
+                            "note": "该会话暂无日志文件内容。"}
                 return {"ok": True, "lines": lines[-400:], "cursor": 0,
                         "live": False, "path": sessions.log_path(session_id)}
 
-            return {"ok": False, "error": "需要 localId 或 sessionId", "lines": [], "cursor": cursor}
+            if pid:
+                # 外部发现的旧版注入器：查它有没有登记项
+                try:
+                    for r in sessions.list_registered(force=True):
+                        if str(r.get("pid")) == str(pid):
+                            text, _ = sessions.read_log(r.get("id"))
+                            lines = text.splitlines()
+                            return {"ok": True, "lines": lines[-400:], "cursor": 0,
+                                    "live": False,
+                                    "path": sessions.log_path(r.get("id"))}
+                except Exception:                        # noqa: BLE001
+                    pass
+                return {"ok": True, "lines": [], "cursor": 0, "live": False,
+                        "note": "这是外部发现的旧版注入器 —— 它不写 run/logs/，"
+                                "所以没有可读日志。重启该注入器后即可看到日志。"}
+
+            return {"ok": False, "error": "需要 localId / sessionId / pid",
+                    "lines": [], "cursor": cursor}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e), "lines": [], "cursor": cursor}
 
