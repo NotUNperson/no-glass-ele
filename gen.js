@@ -264,7 +264,10 @@ function buildOne(name, opts = {}) {
   const outDir = opts.bundle ? path.join(APPS_DIR, `${name}-bundle`) : path.join(APPS_DIR, name);
   fs.mkdirSync(outDir, { recursive: true });
 
-  const results = { name, outDir, files: [], skipped: [] };
+  // 指纹含预设列表与 bundle 标志：预设集合变化也算"产物过期"
+  const fp = render.fingerprint(prof, presets.map((p) => p.file).join(',') + (opts.bundle ? '|bundle' : ''));
+
+  const results = { name, outDir, files: [], skipped: [], fingerprint: fp };
 
   if (opts.bundle) {
     // 自包含：内核 + 内联配置 + 内联样式
@@ -283,6 +286,7 @@ function buildOne(name, opts = {}) {
         defaultArgs: p.args,
         notes: [...p.notes, 'Bundled build: profile and stylesheet are inlined in noglass.js.'],
         preset: p.preset,
+        fingerprint: fp,
       });
       const cf = path.join(outDir, p.file);
       fs.writeFileSync(cf, cmd, 'ascii');
@@ -290,7 +294,7 @@ function buildOne(name, opts = {}) {
     }
   } else {
     // 共享内核：启动器调用根目录的 injector
-    const relInjector = path.relative(outDir, INJECTOR).replace(/\\/g, '\\');
+    const relInjector = path.relative(outDir, INJECTOR);
     const relProfile = path.relative(outDir, path.join(PROFILES_DIR, `${name}.json`));
     for (const p of presets) {
       const cmd = render.renderCmd({
@@ -300,6 +304,7 @@ function buildOne(name, opts = {}) {
         defaultArgs: p.args,
         notes: p.notes,
         preset: p.preset,
+        fingerprint: fp,
       });
       const cf = path.join(outDir, p.file);
       fs.writeFileSync(cf, cmd, 'ascii');
@@ -326,7 +331,7 @@ function buildOne(name, opts = {}) {
   }
 
   // README
-  const md = render.renderAppReadme(prof, CSS_FILE, presets);
+  const md = render.renderAppReadme(prof, CSS_FILE, presets, { fingerprint: fp });
   const mf = path.join(outDir, 'README.md');
   fs.writeFileSync(mf, md, 'utf8');
   results.files.push(mf);
@@ -470,19 +475,26 @@ function cmdDoctor() {
     }
     if (!d.fuses) issues.push('未探测到 fuse 表（可能是非 Electron 应用或裁剪构建）');
 
-    // 生成产物是否最新
+    // 生成产物是否最新 —— 用内容指纹比对，不用 mtime
+    // （mtime 在 git clone/checkout 后全被刷成同一刻，判断不了新旧）
     const appDir = path.join(APPS_DIR, n);
     if (!fs.existsSync(appDir)) issues.push('尚未生成启动器（运行 build）');
     else {
-      const profPath = path.join(PROFILES_DIR, `${n}.json`);
-      const profTime = fs.statSync(profPath).mtimeMs;
-      let stale = false;
+      const presets = render.planPresets(p);
+      const wantFp = render.fingerprint(p, presets.map((x) => x.file).join(','));
+      let found = false, stale = false;
       try {
         for (const f of fs.readdirSync(appDir)) {
-          if (fs.statSync(path.join(appDir, f)).mtimeMs < profTime) { stale = true; break; }
+          if (!f.endsWith('.cmd') && f !== 'README.md') continue;
+          const txt = fs.readFileSync(path.join(appDir, f), 'utf8');
+          const m = txt.match(/profile-fingerprint: ([0-9a-f]{12})/) ||
+                    txt.match(/profile-fingerprint: `([0-9a-f]{12})`/);
+          if (!m) { stale = true; break; }
+          if (m[1] === wantFp) { found = true; break; }
         }
       } catch { /* ignore */ }
-      if (stale) issues.push('生成产物早于 profile 修改时间 → 需重新 build');
+      if (stale) issues.push('生成产物缺少指纹（旧版本生成）→ 重新 build');
+      else if (!found) issues.push('生成产物与当前 profile 不一致 → 重新 build');
     }
 
     if (issues.length) {
