@@ -565,12 +565,12 @@ node tools/audit-dark.js <调试端口>
 | 静态：扫 asar 里的 CSS | 编译期样式（绝大多数） | `dump-app-css.js` → `gen-dark-css.js` |
 | 动态：读运行时的计算样式 | 运行时注入的 scoped 样式、独立窗口 | `harvest-selectors.js` |
 
-动态采集的类名存进 `tools/harvested-selectors.json`，生成时会精确合并进去。
+动态采集的类名存进 `local/dark/harvested-selectors.json`（本机数据，不进版本库），生成时会精确合并进去。
 
 ```bash
 # 应用跑起来之后（有独立窗口就打开它），采集漏网的类名
 node tools/harvest-selectors.js <调试端口> "" 800
-# 把输出的类名填进 tools/harvested-selectors.json
+# 把输出的类名填进 local/dark/harvested-selectors.json
 # 重新生成
 node tools/build-dark-css.js <profile名>
 ```
@@ -874,6 +874,8 @@ no-glass-ele/
   local/                本机配置与开发记录（不进版本库）
     tools-config.json   分析脚本的 asar 路径
     profiles-config.js  make-profiles.js 的应用清单
+    dark/               深色相关的本机数据：手工精修段（head/tail）、
+                        运行时采集的类名 —— 都只对生成它的应用有意义
   tools/
     local-paths.js      asar 路径解析（命令行 → 环境变量 → local/ 配置）
     make-profiles.js    批量重建 profile（按本机清单，现算探测结果）

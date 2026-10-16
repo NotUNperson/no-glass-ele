@@ -20,8 +20,8 @@ const { execFileSync } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const name = process.argv[2] || 'todo-list';
 
-const HEAD = path.join(__dirname, `dark-head-${name}.css`);
-const TAIL = path.join(__dirname, `dark-tail-${name}.css`);
+const HEAD = path.join(ROOT, 'local', 'dark', `dark-head-${name}.css`);
+const TAIL = path.join(ROOT, 'local', 'dark', `dark-tail-${name}.css`);
 const OUT = path.join(ROOT, 'css', `${name}.custom.css`);
 
 // 1) 生成中段

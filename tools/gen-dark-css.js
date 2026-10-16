@@ -133,8 +133,9 @@ fs.closeSync(fd);
 //   只扫文件必然漏掉它（实测漏了一个 4750px² 的白块）。
 //
 // 采集方式：tools/harvest-selectors.js 在运行中的应用上读计算样式，
-// 输出类名清单，存到 tools/harvested-selectors.json。
-const HARVEST = path.join(__dirname, 'harvested-selectors.json');
+// 输出类名清单，存到 local/dark/harvested-selectors.json
+// （放 local/ 是因为这些类名只对那一个应用有意义，不进版本库）。
+const HARVEST = path.join(__dirname, '..', 'local', 'dark', 'harvested-selectors.json');
 let harvested = { lightBg: [], darkText: [] };
 if (fs.existsSync(HARVEST)) {
   try {
