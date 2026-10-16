@@ -12,10 +12,9 @@
  * 用法：node tools/assess-portability.js [asar路径]
  */
 const fs = require('fs');
+const { resolveAsar } = require('./local-paths');
 
-const ASAR = process.argv[2] ||
-  process.env.NOGLASS_ASAR ||
-  '<local-path>';
+const ASAR = resolveAsar(process.argv[2]);
 
 function die(msg) {
   console.error(`✗ ${msg}`);

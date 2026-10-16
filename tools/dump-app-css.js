@@ -17,8 +17,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const { resolveAsar } = require('./local-paths');
 
-const ASAR = process.env.NOGLASS_ASAR || '<local-path>';
+const ASAR = resolveAsar();
 const args = process.argv.slice(2);
 const MODE = args[0] || '--summary';
 

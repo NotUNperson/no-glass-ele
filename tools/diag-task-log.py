@@ -1,6 +1,7 @@
 import sys, time
 from pathlib import Path
-ROOT = Path(r"<local-path>")
+# 脚本自己的位置推导仓库根 —— 不写死本机路径
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "ui"))
 import app, webview
 

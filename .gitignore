@@ -11,12 +11,18 @@ run/
 # css/*.custom.css
 
 # 每个应用的 profile：同样是个人配置，且**含本机 exe 绝对路径**
-# （形如 <local-path>
+# （形如 <local-path><你的应用>\App.exe），推到公开仓库等于公开目录结构。
 #
 # _template.json 例外 —— 它是 `gen.js new` 的骨架，必须随仓库走，
 # 否则新 clone 的人建不了第一个 profile。
 profiles/*.json
 !profiles/_template.json
+
+# 开发期本地文档与记录：进度、待修清单、本机环境细节。
+# 这些是给自己看的，不进公开仓库（公开仓库只有 README.md 那份使用文档）。
+# 参考文档随仓库走；README-local.md 是完整版 README（含本机实测数据）。
+local/
+README-local.md
 
 # 生成的启动器产物（apps/<name>/）。
 #

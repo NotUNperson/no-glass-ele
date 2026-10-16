@@ -8,8 +8,9 @@
  * 用法：node tools/list-routes.js
  */
 const fs = require('fs');
+const { resolveAsar } = require('./local-paths');
 
-const ASAR = process.env.NOGLASS_ASAR || '<local-path>';
+const ASAR = resolveAsar();
 const fd = fs.openSync(ASAR, 'r');
 const head = Buffer.alloc(16);
 fs.readSync(fd, head, 0, 16, 0);

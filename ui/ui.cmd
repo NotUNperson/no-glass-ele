@@ -1,4 +1,6 @@
 @echo off
+rem  Force UTF-8 in this console: paths and tool output may contain non-ASCII.
+chcp 65001 >nul 2>nul
 rem ===========================================================================
 rem  no-glass-ele management UI
 rem  Starts the Python + pywebview desktop UI.

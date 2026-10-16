@@ -6,8 +6,9 @@
  * 用法：node tools/extract-rules.js <选择器关键词> [更多关键词...]
  */
 const fs = require('fs');
+const { resolveAsar } = require('./local-paths');
 
-const ASAR = '<local-path>';
+const ASAR = resolveAsar();
 const fd = fs.openSync(ASAR, 'r');
 const head = Buffer.alloc(16);
 fs.readSync(fd, head, 0, 16, 0);

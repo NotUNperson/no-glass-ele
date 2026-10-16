@@ -62,7 +62,7 @@ function toast(msg, kind = '', ms = 3600) {
 function unwrap(res, quiet = false) {
   if (!res) { if (!quiet) toast('界面桥未就绪', 'err'); return null; }
   if (res.ok === false) {
-    if (!quiet) toast(res.error || '操作失败', res.forbidden ? 'warn' : 'err', res.forbidden ? 6000 : 3600);
+    if (!quiet) toast(res.error || '操作失败', 'err', 3600);
     return null;
   }
   return res;
@@ -508,7 +508,7 @@ async function launchInjector() {
   const res = await api().launch(STATE.current, isolate, extra || null, emulate, appArgs);
   if (!res) { toast('界面桥未就绪', 'err'); return; }
   if (res.ok === false) {
-    toast(res.error || '启动失败', res.forbidden ? 'warn' : 'err', res.forbidden ? 7000 : 4000);
+    toast(res.error || '启动失败', 'err', 4000);
     return;
   }
   toast('已启动注入器（--watch 常驻）', 'ok');
@@ -1082,7 +1082,7 @@ async function saveCustomCss() {
   const res = await api().save_custom_css(STATE.current, css);
   if (!res) { toast('界面桥未就绪', 'err'); return; }
   if (res.ok === false) {
-    toast(res.error || '保存失败', res.forbidden ? 'warn' : 'err', 5000);
+    toast(res.error || '保存失败', 'err', 5000);
     return;
   }
   STATE.cssDirty = false;
@@ -1123,7 +1123,7 @@ async function wizBrowse() {
   if (!res) return;
   if (res.ok === false) {
     if (res.cancelled) return;
-    toast(res.error || '选择失败', res.forbidden ? 'warn' : 'err', res.forbidden ? 7000 : 3600);
+    toast(res.error || '选择失败', 'err', 3600);
     return;
   }
   $('wizExe').value = res.exe;
@@ -1167,7 +1167,7 @@ async function wizProbe() {
   $('wizStatus').textContent = '';
 
   if (!res || res.ok === false) {
-    toast((res && res.error) || '探测失败', res && res.forbidden ? 'warn' : 'err', 6000);
+    toast((res && res.error) || '探测失败', 'err', 6000);
     return;
   }
 
@@ -1269,7 +1269,7 @@ async function wizCreate() {
 
   const res = await api().create_profile(name, data);
   if (!res || res.ok === false) {
-    toast((res && res.error) || '创建失败', res && res.forbidden ? 'warn' : 'err', 6000);
+    toast((res && res.error) || '创建失败', 'err', 6000);
     return;
   }
 

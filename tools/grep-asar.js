@@ -6,8 +6,9 @@
  * 用法：node tools/grep-asar.js <关键词> [--limit N]
  */
 const fs = require('fs');
+const { resolveAsar } = require('./local-paths');
 
-const ASAR = '<local-path>';
+const ASAR = resolveAsar();
 const kw = process.argv[2];
 const limitIdx = process.argv.indexOf('--limit');
 const LIMIT = limitIdx > 0 ? Number(process.argv[limitIdx + 1]) : 10;

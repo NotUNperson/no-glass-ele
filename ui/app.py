@@ -17,7 +17,7 @@ app.py —— no-glass-ele 管理界面（pywebview 宿主）
    不指定编码会直接抛 UnicodeDecodeError。这是本项目已经踩过的同类坑
    （.cmd 的 GBK 问题）。
 
-4. **护栏是代码，不是注释。** QQ/微信硬拒绝；--restart 需二次确认；
+4. **护栏是代码，不是注释。** --restart 需二次确认；
    停止只杀注入器、不杀用户的应用。
 
 零新增依赖：只用 Python 标准库 + 已安装的 pywebview。
@@ -80,50 +80,8 @@ PROCESS_LIST_TTL_SEC = 20.0
 _proc_lock = threading.Lock()
 _proc_cache = {"at": 0.0, "data": []}
 
-# 绝不接触的应用。用户明确要求（账号封禁风险）。
-#
-# 为什么要两套规则：只用词边界匹配会漏掉 QQNT.exe（整串是一个词，
-# 边界匹配不到里面的 "qq"）；只用子串匹配又会误伤 QQMusic 这类。
-# 所以短名（qq/微信）用词边界，长名（qqnt/wechat/tencent）用子串。
-FORBIDDEN_WORD_BOUNDED = ("qq", "微信")
-FORBIDDEN_SUBSTRING = ("qqnt", "wechat", "weixin", "tencent")
-
 LOG_LIMIT = 4000          # 环形缓冲行数上限
 POLL_HINT_MS = 300        # 提示前端轮询间隔
-
-
-class ForbiddenApp(Exception):
-    """目标应用在禁止名单里。"""
-
-
-def check_forbidden(*texts):
-    """
-    QQ / 微信 硬拒绝。
-
-    任何要启动应用、探测 exe、或写 profile 的入口都必须先过这里。
-    这是代码级护栏，不是注释级约定 —— 用户明确要求避免账号风险。
-
-    匹配范围含完整路径，所以 <local-path> 也会被拦下。
-    """
-    for t in texts:
-        if not t:
-            continue
-        low = str(t).lower()
-
-        for bad in FORBIDDEN_WORD_BOUNDED:
-            # 词边界：避免 QQMusic 这类含 "qq" 的合法应用被误伤
-            if re.search(r"(^|[^a-z])" + re.escape(bad) + r"([^a-z]|$)", low):
-                raise ForbiddenApp(
-                    f"拒绝操作：{t} 命中禁止名单（QQ / 微信）。"
-                    "这是刻意的护栏，避免账号风险。"
-                )
-
-        for bad in FORBIDDEN_SUBSTRING:
-            if bad in low:
-                raise ForbiddenApp(
-                    f"拒绝操作：{t} 命中禁止名单（QQ / 微信）。"
-                    "这是刻意的护栏，避免账号风险。"
-                )
 
 
 # ─────────────────────────── 子进程与日志 ───────────────────────────
@@ -277,13 +235,8 @@ class TaskRunner:
         if not prof_path.exists():
             return {"ok": False, "error": f"profile 不存在：{prof_path}"}
 
-        # 护栏：读 profile 里的目标应用，确认不在禁止名单
         try:
-            data = json.loads(prof_path.read_text(encoding="utf-8"))
-            check_forbidden(data.get("name"), data.get("displayName"),
-                            data.get("processName"), data.get("exe"))
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
+            json.loads(prof_path.read_text(encoding="utf-8"))
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": f"读取 profile 失败：{e}"}
 
@@ -545,8 +498,6 @@ def read_profile(name):
 
 
 def write_profile(name, data):
-    # 护栏：不允许把禁止名单里的应用写进 profile
-    check_forbidden(name, data.get("displayName"), data.get("processName"), data.get("exe"))
     # 名字必须是安全标识符，避免路径穿越
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
         raise RuntimeError("profile 名只能含字母、数字、点、下划线、连字符（1-64 位）。")
@@ -567,14 +518,9 @@ def list_running_processes():
     """
     列出有路径的进程，供"从运行中的应用里挑 exe"。
 
-    两个必须做的处理：
-
-    1. **强制 UTF-8 输出。** Windows PowerShell 默认按控制台代码页（中文系统
-       是 GBK）输出，用 UTF-8 解码会得到乱码（实测：`小程序` 变成 `С����`）。
-       解法是先设 `[Console]::OutputEncoding`。
-
-    2. **过滤禁止名单。** 进程表里本来就有 QQ / 微信 —— 它们绝不该出现在
-       可选列表里，哪怕用户只是"看到"。所以这里直接剔除，不给误点的机会。
+    **强制 UTF-8 输出。** Windows PowerShell 默认按控制台代码页（中文系统
+    是 GBK）输出，用 UTF-8 解码会得到乱码（实测：`小程序` 变成 `С����`）。
+    解法是先设 `[Console]::OutputEncoding`。
 
     只查进程表，不遍历文件系统。
     """
@@ -606,12 +552,6 @@ def list_running_processes():
             name = d.get("ProcessName") or ""
             path = d.get("Path") or ""
             if not path or not path.lower().endswith(".exe"):
-                continue
-
-            # 禁止名单：连展示都不展示
-            try:
-                check_forbidden(name, path)
-            except ForbiddenApp:
                 continue
 
             # 跳过明显不是主程序的（Electron 的 helper 进程等）
@@ -751,8 +691,6 @@ class Api:
         try:
             path = write_profile(name, data)
             return {"ok": True, "path": path}
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -767,8 +705,6 @@ class Api:
             if not ok:
                 return {"ok": False, "error": err}
             return {"ok": True}
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -782,12 +718,9 @@ class Api:
         向导需要后者，否则得靠"跑完再从日志里抠 JSON"，脆弱且慢。
         """
         try:
-            check_forbidden(exe)
             args = ["probe", exe] + (["--deep"] if deep else []) + ["--json"]
             data = run_node_json(args, timeout=240)
             return {"ok": True, "data": data}
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -796,7 +729,6 @@ class Api:
         if task == "probe":
             if not exe:
                 raise RuntimeError("缺少 exe 路径")
-            check_forbidden(exe)
             return ["probe", exe] + (["--deep"] if deep else []) + (["--json"] if as_json else [])
         if task == "build":
             return ["build"] + ([name] if name else ["--all"])
@@ -808,7 +740,6 @@ class Api:
 
     def launch(self, name, isolate=False, extra=None, emulate=None, appArgs=None):
         try:
-            check_forbidden(name)
             extra_args = None
             if extra:
                 # 只接受数组，避免任意命令注入
@@ -826,8 +757,6 @@ class Api:
                 name, extra_args=extra_args, isolate=bool(isolate),
                 emulate=emulate, app_args=aa,
             )
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -1114,7 +1043,6 @@ class Api:
         不需要重启应用（前提是注入器在运行且监听该文件）。
         """
         try:
-            check_forbidden(name)
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)):
                 return {"ok": False, "error": "profile 名不合法"}
             path = self._custom_css_path(name)
@@ -1122,8 +1050,6 @@ class Api:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(css if css is not None else "")
             return {"ok": True, "path": str(path)}
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -1150,7 +1076,6 @@ class Api:
         完全可以对已连接的页面直接生效。走 tools/darkreader.js 那条已实测的通道。
         """
         try:
-            check_forbidden(name)
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name)):
                 return {"ok": False, "error": "profile 名不合法"}
 
@@ -1205,8 +1130,6 @@ class Api:
             if errors:
                 res["reason"] = "部分会话失败：" + "；".join(errors)
             return res
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
@@ -1274,10 +1197,7 @@ class Api:
             if not result:
                 return {"ok": False, "cancelled": True}
             path = result[0] if isinstance(result, (list, tuple)) else result
-            check_forbidden(path)
             return {"ok": True, "exe": str(path)}
-        except ForbiddenApp as e:
-            return {"ok": False, "error": str(e), "forbidden": True}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
