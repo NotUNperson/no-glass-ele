@@ -240,20 +240,43 @@ class TaskRunner:
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": f"读取 profile 失败：{e}"}
 
-        # 同一个 profile 已经在跑就不重复启动（否则会争同一个调试端口）
+        # 同一个 profile 的**同一种**会话只允许一个。
+        #
+        # 为什么按 isolate 分种类：隔离的语义就是"不影响正在运行的实例" ——
+        # 所以「普通会话在跑 + 勾了隔离」是合法组合，必须放行（早期版本一律
+        # 拒绝，等于把隔离这条路堵死了）。反之「隔离在跑 + 又不勾隔离」也该
+        # 放行（那是要接管/新起普通实例）。但"同一种"再起第二个就是抢同一个
+        # 端口了，必须拒绝。
+        want_isolate = bool(isolate)
         if not detached:
             with self._lock:
                 for sid, s in self._sessions.items():
-                    if s.get("profile") == profile_name and s.get("proc") and s["proc"].poll() is None:
+                    if s.get("profile") != profile_name:
+                        continue
+                    if not (s.get("proc") and s["proc"].poll() is None):
+                        continue
+                    if bool(s.get("isolate")) != want_isolate:
+                        continue
+                    if want_isolate:
                         return {"ok": False,
-                                "error": f"{profile_name} 已经在运行中（会话 {sid}）。"}
+                                "error": f"{profile_name} 已经有一个**隔离实例**在跑"
+                                         f"（会话 {sid}）。先停掉它，或取消勾选隔离以"
+                                         f"另起一个普通实例。"}
+                    return {"ok": False,
+                            "error": f"{profile_name} 已经在运行中（会话 {sid}）。"
+                                     f"想在不影响它的前提下再起一个，请勾选「隔离实例」。"}
         else:
             # 无窗口模式也要防重复：查注册表 + 进程表
             try:
                 for r in sessions.list_all():
-                    if r.get("profile") == profile_name and r.get("alive"):
-                        return {"ok": False,
-                                "error": f"{profile_name} 已经在运行中（pid {r.get('pid')}）。"}
+                    if r.get("profile") != profile_name or not r.get("alive"):
+                        continue
+                    if bool(r.get("isolate")) != want_isolate:
+                        continue
+                    kind = "隔离实例" if want_isolate else "实例"
+                    return {"ok": False,
+                            "error": f"{profile_name} 已经有一个{kind}在运行中"
+                                     f"（pid {r.get('pid')}）。"}
             except Exception:                            # noqa: BLE001
                 pass
 
@@ -329,6 +352,7 @@ class TaskRunner:
                 "profile": profile_name,
                 "proc": proc,
                 "log": log,
+                "isolate": bool(isolate),
                 "startedAt": time.time(),
                 "exitCode": None,
                 "endedAt": None,
@@ -480,6 +504,46 @@ def run_node_json(args, timeout=180):
     except json.JSONDecodeError:
         # gen.js 的 --json 可能因为前置错误打印了非 JSON（如 "exe 不存在"）
         raise RuntimeError(f"输出不是合法 JSON：{out[:400]}")
+
+
+def check_port_conflicts(name, data):
+    """
+    校验端口的唯一性与合法性，返回问题列表（空 = 没问题）。
+
+    规则必须与 `gen.js doctor` 的那套**完全一致**（见 gen.js 的
+    "端口冲突" 与 "端口落在自身保留段里" 两段）—— 否则会出现
+    "界面让保存、doctor 报错" 这种自相矛盾。改这里记得同步改那边。
+
+    为什么要在保存时拦：CDP 端口是"带参数启动"时才用的，两个 profile
+    撞端口不会当场报错，而是等到启动时才发现（端口被先起的那个占着）。
+    等到那时用户已经忘了自己填过什么，所以在这里就拒绝并说明与谁冲突。
+    这是**面向用户的保存入口**的校验，write_profile 本身不加判断 ——
+    set_darkreader 这类内部改写不该被它拦住。
+    """
+    issues = []
+    port = data.get("defaultPort")
+    if port is None:
+        return issues                     # 未填端口由 doctor 报"未设置 defaultPort"
+
+    # 与其他 profile 的 defaultPort 冲突
+    for other in list_profiles_on_disk():
+        if other == name:
+            continue
+        try:
+            op = read_profile(other).get("defaultPort")
+        except Exception:                                # noqa: BLE001
+            continue
+        if op is not None and op == port:
+            issues.append(f"defaultPort {port} 与 profile 「{other}」冲突（它也是 {op}）")
+
+    # 落在自己的保留端口范围内
+    reserved = data.get("reservedPorts")
+    if isinstance(reserved, list) and reserved:
+        lo, hi = min(reserved), max(reserved)
+        if lo <= port <= hi:
+            issues.append(f"defaultPort {port} 落在自身 reservedPorts 范围 {lo}-{hi} 内")
+
+    return issues
 
 
 def list_profiles_on_disk():
@@ -689,7 +753,16 @@ class Api:
 
     def save_profile(self, name, data):
         try:
+            conflicts = check_port_conflicts(name, data)
+            if conflicts:
+                return {"ok": False, "error": "；".join(conflicts) + "。请换一个端口。"}
             path = write_profile(name, data)
+            # 让 get_overview 的 TTL 缓存立即失效 —— 否则刚保存的 profile
+            # 在缓存过期（最多 5 秒）前不在 STATE.profiles 里，向导据此算的
+            # "下一个可用端口"就会重复（这是「连续新建撞端口」的直接成因）。
+            global _overview_cache
+            with _overview_lock:
+                _overview_cache["at"] = 0.0
             return {"ok": True, "path": path}
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e)}
@@ -811,6 +884,10 @@ class Api:
                 "source": (meta or {}).get("source") or "ui",
                 "external": False,
                 "hasLiveLog": True,
+                # isolate 以**注册表**为准（它是注入器自己写的实际值）；
+                # 本地字典里的那份只是启动时的请求，注入器可能因端口被占
+                # 而改用别的端口 —— 但 isolate 本身不会变，两者一致。
+                "isolate": bool((meta or {}).get("isolate", s.get("isolate"))),
                 "pages": (meta or {}).get("pages"),
                 "cssExtra": (meta or {}).get("cssExtra"),
                 "emulateColorScheme": (meta or {}).get("emulateColorScheme"),
@@ -843,6 +920,7 @@ class Api:
                 "source": r.get("source") or ("external" if r.get("external") else "cli"),
                 "external": bool(r.get("external")),
                 "hasLiveLog": False,
+                "isolate": bool(r.get("isolate")),
                 "pages": r.get("pages"),
                 "cssExtra": r.get("cssExtra"),
                 "emulateColorScheme": r.get("emulateColorScheme"),

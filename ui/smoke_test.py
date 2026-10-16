@@ -425,6 +425,64 @@ def run():
                   stop2_d.get("stoppedA") is True and stop2_d.get("stoppedB") is False,
                   True, str(stop2_d) or "未拿到结果")
 
+            # 15f) 启动按钮 vs「隔离实例」复选框（原 bug 的核心）
+            #
+            # 规则：同 profile 只允许一个"同种类"会话 —— 有普通会话在跑时
+            # 勾上隔离应该能启动（隔离的本意就是不影响正在运行的那个）。
+            # 同步函数，直接调用后读按钮状态即可，不用等 Promise。
+            btn = win.evaluate_js("""
+              (() => {
+                const save = { cur: STATE.current, sess: STATE.sessions, ready: STATE.ready };
+                STATE.ready = false;        // 冻结轮询，避免它覆盖 STATE.sessions
+                const iso = document.getElementById('optIsolate');
+                const btnL = document.getElementById('btnLaunch');
+
+                STATE.current = 'A';
+                STATE.sessions = [{ key: 'sess:A', profile: 'A', running: true, isolate: false }];
+
+                iso.checked = false; syncLaunchButtons();
+                const plainBlocked = btnL.disabled;          // 普通实例在跑 + 不勾 -> 禁用
+                const tipPlain = btnL.title;
+
+                iso.checked = true; syncLaunchButtons();
+                const isolateAllowed = !btnL.disabled;       // 普通实例在跑 + 勾隔离 -> 放行 ★
+
+                iso.checked = false; syncLaunchButtons();
+                const backToBlocked = btnL.disabled;
+
+                // 反过来：隔离实例在跑
+                STATE.sessions = [{ key: 'sess:A2', profile: 'A', running: true, isolate: true }];
+                iso.checked = false; syncLaunchButtons();
+                const plainAllowed = !btnL.disabled;         // 隔离在跑 + 不勾 -> 放行
+                iso.checked = true; syncLaunchButtons();
+                const isolateBlocked = btnL.disabled;        // 隔离在跑 + 勾 -> 禁用
+                const tipIsolate = btnL.title;
+
+                // 恢复现场
+                iso.checked = false;
+                STATE.current = save.cur; STATE.sessions = save.sess; STATE.ready = save.ready;
+                syncLaunchButtons();
+                return JSON.stringify({
+                  plainBlocked, isolateAllowed, backToBlocked,
+                  plainAllowed, isolateBlocked,
+                  hasTipPlain: /隔离/.test(tipPlain),
+                  hasTipIsolate: /隔离/.test(tipIsolate),
+                });
+              })()
+            """)
+            try:
+                import json as _json5
+                bd = _json5.loads(btn) if btn else {}
+            except Exception:
+                bd = {}
+            check("普通会话在跑时不勾隔离→禁用", bd.get("plainBlocked") is True, True, str(bd))
+            check("普通会话在跑时勾隔离→放行（原 bug）", bd.get("isolateAllowed") is True, True, str(bd))
+            check("取消勾选隔离→回到禁用", bd.get("backToBlocked") is True, True, str(bd))
+            check("隔离会话在跑时不勾隔离→放行", bd.get("plainAllowed") is True, True, str(bd))
+            check("隔离会话在跑时再勾隔离→禁用", bd.get("isolateBlocked") is True, True, str(bd))
+            check("禁用时给出原因（提示含「隔离」）",
+                  bd.get("hasTipPlain") is True and bd.get("hasTipIsolate") is True, True, str(bd))
+
             # 16) 自定义 CSS 编辑器存在且可写
             win.evaluate_js(
                 "document.getElementById('cssEditor').value = '/* smoke */ .x{color:red}'"
@@ -490,6 +548,55 @@ def run():
             # 22) 会话停止接口对不存在的会话应报错而不是崩
             st = api.stop_session(local_id="不存在的会话", session_id=None)
             check("stop_session 对未知会话安全报错", st.get("ok") is False, True)
+
+            # 23) 端口唯一性校验（bug 5）
+            #
+            # 规则：与其他 profile 的 defaultPort 重复就拒绝。这是权威层 ——
+            # 前端 suggestPort() 可能读到过期的 profile 列表，后端这一关不能少。
+            existing = sorted(A.list_profiles_on_disk())
+            if existing:
+                victim = existing[0]
+                victim_port = A.read_profile(victim).get("defaultPort")
+                tmp = "_smoke_port_test"
+                data = {
+                    "name": tmp, "displayName": tmp, "exe": "X:/none.exe",
+                    "processName": tmp, "styleId": "__smoke__",
+                    "defaultPort": victim_port, "reservedPorts": [],
+                }
+                r = api.save_profile(tmp, data)
+                check("撞其他 profile 端口→拒绝",
+                      r.get("ok") is False and "冲突" in (r.get("error") or ""), True,
+                      str(r)[:120])
+                check("拒绝信息说明了与谁冲突",
+                      victim in (r.get("error") or ""), True, str(r)[:120])
+
+                # 落在自身 reservedPorts 范围里也要拒绝
+                data2 = dict(data, defaultPort=9700, reservedPorts=[9690, 9710])
+                r2 = api.save_profile(tmp, data2)
+                check("端口落在自身保留段→拒绝",
+                      r2.get("ok") is False and "reservedPorts" in (r2.get("error") or ""),
+                      True, str(r2)[:120])
+
+                # 空闲端口应通过
+                data3 = dict(data, defaultPort=9799, reservedPorts=[])
+                r3 = api.save_profile(tmp, data3)
+                check("空闲端口→保存成功", r3.get("ok") is True, True, str(r3)[:120])
+
+                # 不误伤：内部改写路径（set_darkreader 走 write_profile）不该被端口校验拦住。
+                # 用上面刚建好的临时 profile（9799），它端口合法，应当仍能保存成功。
+                # 注意顺序：这一步必须在删文件之前 —— 早期版本先删了再调，报的
+                # "profile 不存在" 会被误读成校验误伤。
+                dr_res = api.set_darkreader(tmp, "auto")
+                check("端口校验不误伤内部改写（set_darkreader）",
+                      dr_res.get("ok") is True, True, str(dr_res)[:140])
+                # 清理临时 profile（set_darkreader 会把它写回磁盘）
+                try:
+                    import os as _os3
+                    _os3.unlink(str(A.PROFILES_DIR / f"{tmp}.json"))
+                except Exception:
+                    pass
+            else:
+                check("端口校验（跳过：没有可用的 profile）", True, True)
 
             # 23) 主题切换：深色 → 浅色时背景色应真的变化
             win.evaluate_js("document.getElementById('btnTheme').click()")  # -> 深色

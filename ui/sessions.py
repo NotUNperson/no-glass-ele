@@ -283,6 +283,10 @@ def _discover_external_blocking():
             "profilePath": prof,
             "profile": Path(prof).stem if prof else None,
             "port": port,
+            # 没登记的注入器只能从命令行判断是否隔离。不判断的话，
+            # 「外部起的隔离实例」会被当成普通会话来限制按钮与守卫 ——
+            # 用户勾了隔离仍被拒绝，且提示自相矛盾。
+            "isolate": "--isolate" in cl,
             "external": True,
             "alive": True,
             "source": "external",

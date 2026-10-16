@@ -448,6 +448,66 @@ const psCount = (processName) => {
 };
 
 /**
+ * 端口上是否已有活的 CDP 端点。与主流程用的是同一个探测方式，
+ * 所以"判定被占用"与"复用"两处结论一致。
+ */
+async function portHasCdp(port) {
+  const v = await fetchJson(`http://127.0.0.1:${port}/json/version`, 800);
+  return !!(v && v.webSocketDebuggerUrl);
+}
+
+/**
+ * 为**隔离实例**另选一个 CDP 端口。
+ *
+ * 为什么隔离实例必须换端口（这是个真 bug，不是优化）：
+ *   下面的主流程一旦在 cfg.port 上发现活的 CDP，就**直接复用**（不启动新进程）
+ *   —— 对「接管已运行的实例」是对的，但对隔离实例是错的：
+ *   隔离的本意是另起一个进程，复用会让注入连到原来那个窗口，
+ *   用户以为在操作隔离实例，其实操作的是原实例（静默说谎）。
+ *
+ * 选端口规则（确定性，无随机）：
+ *   · 从当前端口+1 向上扫（贴着原端口，便于辨认；尊重 --port 显式指定）
+ *   · 跳过候选与候选+1（候选+1 会被当作 --inspect-port）上已有 CDP 的
+ *   · 跳过原实例的 --inspect 端口（= 当前端口+1）—— 它可能正被原实例占着，
+ *     而 Node inspector 也响应 /json/version，探测未必能可靠区分
+ *   · 跳过所有 profile 的 defaultPort，以及"某 profile 的 defaultPort+1"
+ *     （那是它的 inspect 端口）—— 本机端口挤在 9333-9411、step 10，
+ *     随手挑很容易撞上另一个应用的端口
+ *   · 跳过本 profile 的 reservedPorts（应用自己占的）
+ * 扫不到就返回 null，由调用方明确报错（不静默降级成复用）。
+ */
+async function pickIsolatePort(cfg) {
+  const base = cfg.port || cfg.profile.defaultPort || DEFAULT_PORT;
+  const reserved = new Set(Array.isArray(cfg.profile.reservedPorts) ? cfg.profile.reservedPorts : []);
+
+  // 其他 profile 的 defaultPort —— 一次性读 profiles/ 下的小 JSON
+  const otherPorts = new Set();
+  try {
+    const dir = path.join(HERE, '..', 'profiles');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json') || f.startsWith('_')) continue;
+      if (f === `${cfg.profileName}.json`) continue;
+      try {
+        const p = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+        if (p.defaultPort != null) otherPorts.add(p.defaultPort);
+      } catch { /* 单个坏了不影响选端口 */ }
+    }
+  } catch { /* profiles 目录不存在等，忽略 */ }
+
+  for (let port = base + 1; port <= base + 200; port++) {
+    if (port > 65535) break;
+    if (port === base + 1) continue;             // 原实例的 --inspect 端口，别占
+    if (reserved.has(port)) continue;
+    if (otherPorts.has(port)) continue;
+    if (otherPorts.has(port + 1)) continue;      // 别人的 inspect 端口
+    if (await portHasCdp(port)) continue;
+    if (await portHasCdp(port + 1)) continue;    // 候选的 inspect 端口也被占
+    return port;
+  }
+  return null;
+}
+
+/**
  * 解析 exe 路径。顺序：
  *   1. --exe / profile.exe
  *   2. profile.exeGlob（版本化目录，只 readdirSync 一个父目录）
@@ -887,6 +947,23 @@ async function main() {
 
   // 1) 端口上是否已有可用的 CDP
   let version = await fetchJson(`http://127.0.0.1:${cfg.port}/json/version`, 1500);
+  if (version && cfg.isolate && cfg.launch) {
+    // 隔离实例要的是**另一个进程**，但端口已被占用 —— 若在这里复用，
+    // 注入会连到原来那个窗口，隔离就白勾了（而且完全静默）。
+    // 所以另选一个端口，然后走正常的「启动」分支。
+    const alt = await pickIsolatePort(cfg);
+    if (alt == null) {
+      throw new Error(
+        `隔离实例需要另一个调试端口，但 ${cfg.port + 1} 起 200 个端口内没找到可用的。` +
+        `请先停止占用端口的会话，或在 profile 里改 defaultPort。`
+      );
+    }
+    log(`端口 ${cfg.port} 上已有调试端点 —— 隔离实例改用 ${alt}（不影响原实例）`);
+    cfg.port = alt;
+    cfg.inspectPort = alt + 1;
+    registry.update({ port: cfg.port, inspectPort: cfg.inspectPort });
+    version = null;
+  }
   if (version) {
     log(`发现已开启调试端口的应用：${version.Browser || 'Electron'}`);
   } else if (cfg.launch) {
@@ -984,6 +1061,16 @@ async function main() {
       if (version && version.webSocketDebuggerUrl) break;
       // 应用可能在启动过程中就退出了（崩溃 / 单实例锁冲突）——不必等满超时
       if (appProc && appProc.exitCode !== null) {
+        // 隔离实例最可能是撞了单实例锁：应用在代码里写死了 userData，
+        // 而 profile 没提供 isolateEnv 私有开关 —— 这时 --user-data-dir 不生效。
+        // 静默失败最难查，所以把出路直接写进错误里。
+        if (cfg.isolate && !cfg.isolateEnv) {
+          throw new Error(
+            `隔离实例在调试端口就绪前已退出（退出码 ${appProc.exitCode}）—— 很可能撞了单实例锁。` +
+            `该应用覆盖了 userData，但 profile 没填 isolateEnv（私有隔离开关）。` +
+            `两条出路：① 先完全退出该应用再启动；② 找到它的多开开关填进 profile 的 isolateEnv。`
+          );
+        }
         throw new Error(`应用在调试端口就绪前已退出（退出码 ${appProc.exitCode}）。`);
       }
       await sleep(400);
@@ -1261,6 +1348,7 @@ module.exports = {
   composeCss,
   buildInjectScript,
   buildVerifyScript,
+  pickIsolatePort,
   SessionRegistry,
   RUN_DIR,
   SESS_DIR,

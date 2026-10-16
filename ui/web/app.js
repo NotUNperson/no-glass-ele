@@ -143,8 +143,8 @@ async function init() {
   startPolling();
 }
 
-async function refresh() {
-  const res = unwrap(await api().get_overview());
+async function refresh(force = false) {
+  const res = unwrap(await api().get_overview(force));
   if (!res) return;
   STATE.profiles = res.profiles || [];
   renderList();
@@ -617,9 +617,40 @@ async function updateTaskUI() {
   }
 
   const cur = STATE.current;
+  syncLaunchButtons();
+}
+
+/**
+ * 「启动 / 停止」两个按钮的可用状态。
+ *
+ * 为什么要单独抽出来：禁用条件必须与**后端守卫**是同一套规则
+ * （ui/app.py 的 launch_injector：同 profile 的**同一种**会话只允许一个）。
+ * 两边不一致就会出现「按钮能点，点了报错」或「按钮灰着，其实能起」。
+ *
+ * 关键：勾了「隔离实例」时，已有一个普通会话**不算**冲突 ——
+ * 隔离的本意就是"不影响正在运行的那个"。这是原 bug 的核心：
+ * 早期版本一律 `disabled = !!mine`，把隔离这条路堵死了。
+ */
+function syncLaunchButtons() {
+  const cur = STATE.current;
+  const wantIsolate = !!($('optIsolate') && $('optIsolate').checked);
+  const sess = STATE.sessions || [];
   const mine = sess.find((s) => s.profile === cur && s.running);
+  // 与后端同一套判定：同一种类的会话只允许一个
+  const conflicting = sess.find(
+    (s) => s.profile === cur && s.running && !!s.isolate === wantIsolate
+  );
   $('btnStop').disabled = !mine && !STATE.taskRunning;
-  $('btnLaunch').disabled = !!mine;
+  $('btnLaunch').disabled = !!conflicting;
+  // 灰着的时候给个理由（否则用户只看到点不动，不知道勾隔离就能起）
+  if (conflicting) {
+    const kind = wantIsolate ? '隔离实例' : '实例';
+    $('btnLaunch').title = `「${cur}」已有一个${kind}在运行`
+      + (wantIsolate ? '（先停掉它，或取消勾选隔离以另起一个普通实例）'
+                     : '（勾选「隔离实例」可在不影响它的前提下再起一个）');
+  } else {
+    $('btnLaunch').title = '';
+  }
 }
 
 function renderSessionTabs() {
@@ -1173,6 +1204,11 @@ async function wizProbe() {
 
   STATE.wizard.probe = res.data;
   STATE.wizard.name = res.data.suggested.name;
+  // 渲染表单前强制刷新一次 profile 列表：suggestPort() 从 STATE.profiles
+  // 算"已用端口"，而那份数据有 5 秒 TTL 缓存 —— 刚建的 profile 可能还不在
+  // 里面，于是分配到同一个端口（这就是「连续新建撞端口」的成因）。
+  // force=true 绕过缓存（多跑两个 node，但只在打开向导时发生一次）。
+  await refresh(true);
   renderWizardResult(res.data);
   $('wizCreate').disabled = false;
 }
@@ -1294,6 +1330,9 @@ function bindUI() {
   };
   $('btnLaunch').onclick = launchInjector;
   $('btnAdoptArgs').onclick = adoptAppArgs;
+  // 勾/取消「隔离实例」要立刻改变启动按钮的可用状态 ——
+  // 只靠 2 秒轮询的话，用户勾了要等两拍才知道能不能点（原 bug 的体感来源之一）。
+  if ($('optIsolate')) $('optIsolate').onchange = syncLaunchButtons;
   $('btnStop').onclick = stopTask;
   $('btnSave').onclick = saveProfile;
   $('btnBuild').onclick = buildProfile;
