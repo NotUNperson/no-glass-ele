@@ -9,6 +9,7 @@
  *   build  <name>|--all [--bundle] 渲染 apps/<name>/ 下的启动器与 README
  *   list                           列出 profiles 与探测状态
  *   doctor                         校验：exe 存在、端口冲突、fuse 与预设矛盾
+ *   env                            环境自检：Node / Python / pywebview / PowerShell
  *
  * 设计约束：
  *   · 只读静态探测，**绝不启动**目标应用。
@@ -18,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const probe = require('./lib/probe');
 const render = require('./lib/render');
 const sessions = require('./lib/sessions');
@@ -1158,6 +1160,162 @@ function cmdDoctor(args) {
   }
 }
 
+// ─────────────────────────── env（环境自检）───────────────────────────
+
+/**
+ * 检查运行环境是否满足要求。
+ *
+ * 为什么单独做一个命令而不是塞进 doctor：
+ *   · doctor 检查的是**你的 profile 配置**（端口冲突、产物过期…），
+ *     前提是环境已经能跑
+ *   · env 检查的是**这台机器能不能跑这个工具**（Node 版本、Python、
+ *     pywebview、PowerShell）。第一次 clone 下来的人该先跑这个。
+ *
+ * 分两档：
+ *   必需 —— 缺了核心功能就不能用（Node）
+ *   可选 —— 缺了只是某个功能不可用（Python/pywebview 只影响图形界面）
+ */
+function cmdEnv(args) {
+  const asJson = args && args.flags.json === true;
+  const rows = [];
+
+  const add = (key, label, required, ok, detail, hint) => {
+    rows.push({ key, label, required, ok, detail, hint });
+  };
+
+  // 1) Node —— 核心必需
+  const nodeVer = process.version;                    // v24.13.0
+  const major = Number(nodeVer.replace(/^v/, '').split('.')[0]);
+  const nodeOk = major >= 18;
+  add('node', 'Node.js', true, nodeOk, `${nodeVer}（需要 18+）`,
+    nodeOk ? null : '去 https://nodejs.org 装 Node 18 或更高版本。'
+      + '本工具的 CLI 与注入器完全靠它，缺了不能用。');
+
+  // 2) PowerShell —— 核心必需（探测运行中进程、管理自启动项都用它）
+  let psOk = false, psDetail = '未找到';
+  if (process.platform === 'win32') {
+    try {
+      const v = execFileSync('powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()'],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true }).trim();
+      psOk = !!v;
+      psDetail = v || '可用';
+    } catch { psDetail = '调用失败'; }
+  } else {
+    psDetail = `非 Windows（${process.platform}）—— 本工具目前只支持 Windows`;
+  }
+  add('powershell', 'PowerShell', true, psOk, psDetail,
+    psOk ? null : 'Windows 自带的 Windows PowerShell 5.1 即可，通常不需要额外安装。');
+
+  // 3) Python —— 可选（只有图形界面需要）
+  let pyOk = false, pyDetail = '未找到', pyVer = '';
+  for (const cmd of ['python', 'py', 'python3']) {
+    try {
+      const v = execFileSync(cmd, ['--version'],
+        { encoding: 'utf8', timeout: 10000, windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      if (v) { pyOk = true; pyVer = v; pyDetail = `${v}（${cmd}）`; break; }
+    } catch { /* 试下一个 */ }
+  }
+  add('python', 'Python 3', false, pyOk, pyDetail,
+    pyOk ? null : '只有图形界面需要它。不装也能用命令行。装：https://python.org');
+
+  // 4) pywebview —— 可选（图形界面的依赖）
+  let wvOk = false, wvDetail = '未检测';
+  if (pyOk) {
+    try {
+      // 注意：pywebview 没有 __version__ 属性（实测 6.1 报 AttributeError），
+      // 所以用 importlib.metadata 拿版本，拿不到就退化成"已安装"。
+      const v = execFileSync('python', ['-c',
+        'import importlib.metadata as m; print(m.version("pywebview"))'],
+        { encoding: 'utf8', timeout: 20000, windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      wvOk = !!v;
+      wvDetail = v ? `pywebview ${v}` : '已安装';
+    } catch {
+      // 再退一步：只 import 看能不能用（版本拿不到不代表装没装）
+      try {
+        execFileSync('python', ['-c', 'import webview'],
+          { encoding: 'utf8', timeout: 20000, windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe'] });
+        wvOk = true;
+        wvDetail = '已安装（版本未知）';
+      } catch {
+        wvDetail = '未安装';
+      }
+    }
+  } else {
+    wvDetail = '（需要先装 Python）';
+  }
+  add('pywebview', 'pywebview', false, wvOk, wvDetail,
+    wvOk ? null : '图形界面的依赖。装：pip install pywebview');
+
+  // 5) 项目文件完整性（自己是不是被完整拷来了）
+  const missing = [];
+  for (const [p, label] of [
+    [path.join(ROOT, 'injector', 'noglass.js'), '注入器'],
+    [path.join(ROOT, 'lib', 'probe.js'), '探测模块'],
+    [path.join(ROOT, 'profiles', '_template.json'), 'profile 模板'],
+  ]) {
+    if (!fs.existsSync(p)) missing.push(label);
+  }
+  add('files', '项目文件', true, missing.length === 0,
+    missing.length ? `缺少：${missing.join('、')}` : '完整',
+    missing.length ? '文件不齐 —— 重新完整 clone 或解压一次。' : null);
+
+  // 6) Dark Reader 引擎（可选，深色功能用）
+  const drPath = path.join(ROOT, 'vendor', 'darkreader.js');
+  const drOk = fs.existsSync(drPath);
+  add('darkreader', 'Dark Reader 引擎', false, drOk,
+    drOk ? `已就位（${(fs.statSync(drPath).size / 1024).toFixed(0)} KB）` : '缺失',
+    drOk ? null : '深色模式功能需要它。缺失时 tools/darkreader.js 会自动下载，'
+      + '也可手工放入 vendor/darkreader.js。');
+
+  const requiredFail = rows.filter((r) => r.required && !r.ok);
+  const optionalFail = rows.filter((r) => !r.required && !r.ok);
+
+  if (asJson) {
+    say(JSON.stringify({
+      ok: requiredFail.length === 0,
+      rows,
+      requiredFailed: requiredFail.length,
+      optionalFailed: optionalFail.length,
+    }, null, 2));
+    if (requiredFail.length) process.exitCode = 1;
+    return;
+  }
+
+  say(`${C.b}环境自检${C.x}`);
+  say();
+  for (const r of rows) {
+    const mark = r.ok ? `${C.g}✓${C.x}` : (r.required ? `${C.r}✗${C.x}` : `${C.y}○${C.x}`);
+    const tag = r.required ? '' : dim('（可选）');
+    say(`  ${mark} ${r.label.padEnd(18)} ${r.detail} ${tag}`);
+  }
+  say();
+
+  if (requiredFail.length) {
+    say(`${C.r}必需组件缺失，无法运行：${C.x}`);
+    for (const r of requiredFail) say(`  · ${r.hint}`);
+    say();
+    process.exitCode = 1;
+    return;
+  }
+
+  say(`${C.g}必需组件齐全，可以用。${C.x}`);
+  if (optionalFail.length) {
+    say();
+    say(dim('可选组件缺失（只影响对应功能）：'));
+    for (const r of optionalFail) say(dim(`  · ${r.hint}`));
+  }
+  say();
+  say(dim('下一步：'));
+  say(dim('  node gen.js probe <exe> --deep    探测一个应用'));
+  say(dim('  node gen.js new <name> --exe <exe>  生成 profile'));
+  say(dim('  node gen.js build <name>          生成启动脚本'));
+  if (wvOk) say(dim('  双击 ui/ui.cmd                    打开图形界面'));
+}
+
 // ─────────────────────────── help ───────────────────────────
 
 function usage() {
@@ -1171,6 +1329,7 @@ ${C.b}命令${C.x}
                                    渲染 apps/<name>/ 下的启动器与 README
   ${C.c}list${C.x}                          列出 profiles 与探测状态
   ${C.c}doctor${C.x}                        校验 exe 存在性、端口冲突、fuse 与预设矛盾
+  ${C.c}env${C.x}                           环境自检：Node / Python / pywebview / PowerShell
 
 ${C.b}后台会话${C.x}
   ${C.c}ps${C.x}                            列出运行中的注入会话（含外部启动的）
@@ -1207,6 +1366,7 @@ function main() {
     case 'build': return cmdBuild(args);
     case 'list': case 'ls': return cmdList(args);
     case 'doctor': case 'check': return cmdDoctor(args);
+    case 'env': return cmdEnv(args);
     case 'ps': case 'sessions': return cmdPs(args);
     case 'stop': return cmdStop(args);
     case 'logs': case 'log': return cmdLogs(args);
