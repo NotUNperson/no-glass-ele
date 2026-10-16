@@ -452,6 +452,52 @@ def read_log(session_id, max_bytes=200_000):
         return "", size
 
 
+def read_log_since(session_id, offset=0, max_bytes=200_000):
+    """
+    增量读日志：从 offset 字节处读到文件尾。返回 (文本, 新偏移, 是否重置)。
+
+    为什么需要它（修一个真 bug）：
+      文件型会话（外部启动的注入器，如自启动项拉起的）原先每次都整段返回
+      最后 400 行。前端拿到后只能**整体重写**日志区 —— 而重写会销毁所有
+      DOM 节点，于是用户刚选中的文字每 300ms 被清空一次（实测反馈：
+      "选择内容每隔几秒就重新从头开始"）。顺带每次轮询都全量读文件，
+      日志越长越慢。
+
+    重置语义（第三个返回值）：
+      offset 为 0、或文件比 offset 短（被截断/轮转过）时，返回尾部快照
+      并要求前端**整体重渲染**（reset=True）。其余情况只返回新增部分。
+
+    注意 max_bytes 截断：只有在"要读的尾巴超过 max_bytes"时才会丢掉开头，
+    那时也必须让前端重置，否则它会把半截内容当成增量追加。
+    """
+    p = LOG_DIR / f"{session_id}.log"
+    try:
+        size = p.stat().st_size
+    except Exception:                                    # noqa: BLE001
+        return "", 0, True                               # 没有文件：让前端显示"暂无日志"
+
+    # 文件变小 = 被截断/轮转，或前端游标来自上一个文件 → 重新给尾部快照
+    truncated = offset <= 0 or offset > size
+    if truncated:
+        start = max(0, size - max_bytes)
+        try:
+            with open(p, "rb") as f:
+                f.seek(start)
+                data = f.read()
+            return data.decode("utf-8", errors="replace"), size, True
+        except Exception:                                # noqa: BLE001
+            return "", size, True
+
+    # 增量：只读 offset 之后的新内容
+    try:
+        with open(p, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+        return data.decode("utf-8", errors="replace"), size, False
+    except Exception:                                    # noqa: BLE001
+        return "", offset, False
+
+
 def log_path(session_id):
     return str(LOG_DIR / f"{session_id}.log")
 

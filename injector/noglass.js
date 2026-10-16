@@ -333,6 +333,9 @@ function resolveConfig(opts) {
   if (cfg.isolate && !cfg.dataDir) {
     const slug = String(cfg.name).replace(/[^A-Za-z0-9._-]/g, '-');
     cfg.dataDir = path.join(os.tmpdir(), `noglass-${slug}-${process.pid}`);
+    // 标记"这个目录是本工具自己造的" —— 退出时才有权删它。
+    // 用户显式传 --data-dir / 用 profile 的 dataDirEnv 时**不删**（那是他的目录）。
+    cfg.dataDirOwned = true;
   }
   return cfg;
 }
@@ -366,7 +369,8 @@ noglass —— 给 Electron 应用注入「去毛玻璃」样式（通用版）
                     需要应用未被 nodeCliInspect fuse 加固，否则会跳过
   --watch           常驻运行；刷新/新窗口自动重新注入（推荐）
   --list            列出可注入页面后退出
-  --isolate         独立数据目录启动，不影响现有实例（含 --launch，便于测试）
+  --isolate         用独立数据目录启动：本次产生的数据不写进你平时用的那份
+                    （含 --launch。不是"多开一个实例"——本工具不做多实例）
   --port <n>        CDP 端口（默认取 profile，否则 ${DEFAULT_PORT}）
   --inspect-port <n> 主进程调试端口，配合 --native（默认 port+1）
   --exe <path>      目标应用 exe 路径（默认取 profile，否则自动探测）
@@ -448,63 +452,28 @@ const psCount = (processName) => {
 };
 
 /**
- * 端口上是否已有活的 CDP 端点。与主流程用的是同一个探测方式，
- * 所以"判定被占用"与"复用"两处结论一致。
- */
-async function portHasCdp(port) {
-  const v = await fetchJson(`http://127.0.0.1:${port}/json/version`, 800);
-  return !!(v && v.webSocketDebuggerUrl);
-}
-
-/**
- * 为**隔离实例**另选一个 CDP 端口。
+ * 删掉本工具为隔离启动自建的临时数据目录（%TEMP%\noglass-<名>-<pid>）。
  *
- * 为什么隔离实例必须换端口（这是个真 bug，不是优化）：
- *   下面的主流程一旦在 cfg.port 上发现活的 CDP，就**直接复用**（不启动新进程）
- *   —— 对「接管已运行的实例」是对的，但对隔离实例是错的：
- *   隔离的本意是另起一个进程，复用会让注入连到原来那个窗口，
- *   用户以为在操作隔离实例，其实操作的是原实例（静默说谎）。
+ * 为什么要有这一步：以前退出时什么都不做，于是每用一次隔离就在 %TEMP% 里
+ * 留一份（实测用户机器上躺着一个 1.9MB 的残留），用久了会累积。
  *
- * 选端口规则（确定性，无随机）：
- *   · 从当前端口+1 向上扫（贴着原端口，便于辨认；尊重 --port 显式指定）
- *   · 跳过候选与候选+1（候选+1 会被当作 --inspect-port）上已有 CDP 的
- *   · 跳过原实例的 --inspect 端口（= 当前端口+1）—— 它可能正被原实例占着，
- *     而 Node inspector 也响应 /json/version，探测未必能可靠区分
- *   · 跳过所有 profile 的 defaultPort，以及"某 profile 的 defaultPort+1"
- *     （那是它的 inspect 端口）—— 本机端口挤在 9333-9411、step 10，
- *     随手挑很容易撞上另一个应用的端口
- *   · 跳过本 profile 的 reservedPorts（应用自己占的）
- * 扫不到就返回 null，由调用方明确报错（不静默降级成复用）。
+ * **安全前提（绝不能省）**：只有目标应用的进程已经退出才删。
+ * 注入器退出 ≠ 目标应用退出 —— 停止注入时应用还在跑，而那个目录正是它
+ * 当前的数据目录，删掉会让它立刻出问题（配置丢失、崩溃）。
+ * 所以先查进程数，>0 就保留（宁可留一点垃圾，也不能破坏正在运行的应用）。
+ *
+ * 另外只删**本工具自己造的**目录（cfg.dataDirOwned）：
+ * 用户显式传的 --data-dir 或 profile 指定的目录一律不碰。
  */
-async function pickIsolatePort(cfg) {
-  const base = cfg.port || cfg.profile.defaultPort || DEFAULT_PORT;
-  const reserved = new Set(Array.isArray(cfg.profile.reservedPorts) ? cfg.profile.reservedPorts : []);
-
-  // 其他 profile 的 defaultPort —— 一次性读 profiles/ 下的小 JSON
-  const otherPorts = new Set();
+function cleanupOwnedDataDir(cfg) {
+  if (!cfg || !cfg.dataDirOwned || !cfg.dataDir) return;
   try {
-    const dir = path.join(HERE, '..', 'profiles');
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.json') || f.startsWith('_')) continue;
-      if (f === `${cfg.profileName}.json`) continue;
-      try {
-        const p = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-        if (p.defaultPort != null) otherPorts.add(p.defaultPort);
-      } catch { /* 单个坏了不影响选端口 */ }
+    if (psCount(cfg.processName) > 0) {
+      warn(`隔离数据目录保留（${cfg.name} 仍在运行）：${cfg.dataDir}`);
+      return;
     }
-  } catch { /* profiles 目录不存在等，忽略 */ }
-
-  for (let port = base + 1; port <= base + 200; port++) {
-    if (port > 65535) break;
-    if (port === base + 1) continue;             // 原实例的 --inspect 端口，别占
-    if (reserved.has(port)) continue;
-    if (otherPorts.has(port)) continue;
-    if (otherPorts.has(port + 1)) continue;      // 别人的 inspect 端口
-    if (await portHasCdp(port)) continue;
-    if (await portHasCdp(port + 1)) continue;    // 候选的 inspect 端口也被占
-    return port;
-  }
-  return null;
+    fs.rmSync(cfg.dataDir, { recursive: true, force: true });
+  } catch { /* 删不掉就算了（占用/权限），不值得让退出流程报错 */ }
 }
 
 /**
@@ -942,28 +911,12 @@ async function main() {
     if (cleanedUp) return;
     cleanedUp = true;
     try { registry.close(); } catch { /* 忽略 */ }
+    cleanupOwnedDataDir(cfg);
   };
   process.on('exit', cleanup);
 
   // 1) 端口上是否已有可用的 CDP
   let version = await fetchJson(`http://127.0.0.1:${cfg.port}/json/version`, 1500);
-  if (version && cfg.isolate && cfg.launch) {
-    // 隔离实例要的是**另一个进程**，但端口已被占用 —— 若在这里复用，
-    // 注入会连到原来那个窗口，隔离就白勾了（而且完全静默）。
-    // 所以另选一个端口，然后走正常的「启动」分支。
-    const alt = await pickIsolatePort(cfg);
-    if (alt == null) {
-      throw new Error(
-        `隔离实例需要另一个调试端口，但 ${cfg.port + 1} 起 200 个端口内没找到可用的。` +
-        `请先停止占用端口的会话，或在 profile 里改 defaultPort。`
-      );
-    }
-    log(`端口 ${cfg.port} 上已有调试端点 —— 隔离实例改用 ${alt}（不影响原实例）`);
-    cfg.port = alt;
-    cfg.inspectPort = alt + 1;
-    registry.update({ port: cfg.port, inspectPort: cfg.inspectPort });
-    version = null;
-  }
   if (version) {
     log(`发现已开启调试端口的应用：${version.Browser || 'Electron'}`);
   } else if (cfg.launch) {
@@ -974,11 +927,19 @@ async function main() {
       );
     }
     const running = psCount(cfg.processName);
-    if (running > 0 && !cfg.restart && !cfg.isolate) {
+    if (running > 0 && !cfg.restart) {
+      // 注意：这里**不看 isolate**。
+      //
+      // 曾经让 --isolate 绕过这道检查（想在应用已在运行时另起一个隔离实例），
+      // 但那是错的：同一个 CDP 端口上已经有端点，注入会**直接连到原来那个窗口**
+      // （见上面 1) 的复用逻辑），用户以为在操作隔离实例，其实操作的是原实例 ——
+      // 静默说谎。而真正换端口另起一个实例，又意味着同一应用跑两个实例，
+      // 那会带来标签页/停止按钮/日志归属的一堆歧义，且很多应用有单实例锁
+      // 根本开不起来。所以本工具**不运行同一应用的多个实例**：
+      // 要换启动方式，就先停掉现有的（--restart 或手动退出）。
       warn(`检测到已有 ${running} 个 ${cfg.name} 进程，它们没有开启调试端口。`);
       warn('调试端口只能在启动时设置，因此注入需要「带参数重启」一次。');
-      warn(`请先退出 ${cfg.name} 再重试，或用 --restart 代为重启（会打断当前会话），`);
-      warn('或用 --isolate 跑独立实例。');
+      warn(`请先退出 ${cfg.name} 再重试，或用 --restart 代为重启（会打断当前会话）。`);
       cleanup();
       process.exit(3);
     }
@@ -1061,14 +1022,16 @@ async function main() {
       if (version && version.webSocketDebuggerUrl) break;
       // 应用可能在启动过程中就退出了（崩溃 / 单实例锁冲突）——不必等满超时
       if (appProc && appProc.exitCode !== null) {
-        // 隔离实例最可能是撞了单实例锁：应用在代码里写死了 userData，
+        // 隔离启动最可能是撞了单实例锁：应用在代码里写死了 userData，
         // 而 profile 没提供 isolateEnv 私有开关 —— 这时 --user-data-dir 不生效。
         // 静默失败最难查，所以把出路直接写进错误里。
         if (cfg.isolate && !cfg.isolateEnv) {
           throw new Error(
-            `隔离实例在调试端口就绪前已退出（退出码 ${appProc.exitCode}）—— 很可能撞了单实例锁。` +
-            `该应用覆盖了 userData，但 profile 没填 isolateEnv（私有隔离开关）。` +
-            `两条出路：① 先完全退出该应用再启动；② 找到它的多开开关填进 profile 的 isolateEnv。`
+            `应用在调试端口就绪前已退出（退出码 ${appProc.exitCode}）—— 很可能撞了单实例锁。` +
+            `该应用覆盖了 userData，但 profile 没填 isolateEnv（私有隔离开关），` +
+            `所以隔离用的临时数据目录不生效。` +
+            `两条出路：① 先完全退出该应用，再以隔离方式启动；` +
+            `② 找到它自己的"允许多开"开关填进 profile 的 isolateEnv。`
           );
         }
         throw new Error(`应用在调试端口就绪前已退出（退出码 ${appProc.exitCode}）。`);

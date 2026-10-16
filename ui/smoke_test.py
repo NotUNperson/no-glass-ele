@@ -252,6 +252,77 @@ def run():
                   task_d.get("taskTabNoSessionLeak") is True, True, str(task_d))
             check("任务缓冲切走后保留", task_d.get("taskBufKept") is True, True, str(task_d))
 
+            # 15b-2) 文件型会话的日志必须**增量追加**，不能整体重写。
+            #
+            # 这条直接对应用户报告的现象：「日志窗口尝试选择内容，结果每隔几秒
+            # 就重新从头开始选择了」—— 因为整体 innerHTML 重写会销毁所有 DOM
+            # 节点，选中随之丢失。断言方式：记住日志区第一个子节点，跑两轮
+            # 轮询后它必须还是**同一个节点**（重写会造出新节点，=== 就不成立）。
+            win.evaluate_js("""
+              (() => {
+                window.__smokeLogNodes = null;
+                const save = { ready: STATE.ready, active: STATE.activeSession,
+                               sessions: STATE.sessions, buffers: STATE.logBuffers };
+                STATE.ready = false;        // 冻结真实轮询，我们手动驱动
+
+                // 伪造一个"文件型"会话（没有 localId → 走 session_id 分支）
+                STATE.sessions = [{ key: 'file:1', id: 'fakesess', profile: 'F',
+                                    running: true, localId: null, pid: 4242 }];
+                STATE.activeSession = 'file:1';
+                STATE.logBuffers = { 'file:1': { lines: ['第一行'], cursor: 10, scrollTop: null, atBottom: true } };
+                document.getElementById('log').innerHTML =
+                  '<span class="">第一行</span>';
+
+                const realApi = window.pywebview.api;
+                let round = 0;
+                const fake = Object.create(realApi);
+                fake.get_session_log = () => {
+                  round++;
+                  if (round === 1) {
+                    // 第二轮：增量（reset=false）—— 只多一行
+                    return Promise.resolve({ ok: true, live: false, reset: false,
+                                             cursor: 20, lines: ['第二行'] });
+                  }
+                  return Promise.resolve({ ok: true, live: false, reset: false,
+                                           cursor: 20, lines: [] });
+                };
+                window.pywebview.api = fake;
+
+                (async () => {
+                  const box = document.getElementById('log');
+                  const firstBefore = box.firstChild;
+                  await pollSessionLog();                 // 第 1 轮：追加"第二行"
+                  const firstAfterAppend = box.firstChild;
+                  const text1 = box.textContent;
+                  await pollSessionLog();                 // 第 2 轮：无新增
+                  const firstAfterIdle = box.firstChild;
+                  window.pywebview.api = realApi;
+                  STATE.ready = save.ready; STATE.activeSession = save.active;
+                  STATE.sessions = save.sessions; STATE.logBuffers = save.buffers;
+                  window.__smokeLogNodes = JSON.stringify({
+                    sameNodeAfterAppend: firstBefore === firstAfterAppend,
+                    sameNodeAfterIdle: firstBefore === firstAfterIdle,
+                    appended: text1.includes('第二行') && text1.includes('第一行'),
+                  });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(40):
+                if win.evaluate_js("window.__smokeLogNodes"):
+                    break
+                time.sleep(0.1)
+            try:
+                import json as _json_ln
+                ln_d = _json_ln.loads(win.evaluate_js("window.__smokeLogNodes") or "{}")
+            except Exception:
+                ln_d = {}
+            check("增量追加不重建节点（选中不被清空）",
+                  ln_d.get("sameNodeAfterAppend") is True, True, str(ln_d))
+            check("无新增时也不重建节点",
+                  ln_d.get("sameNodeAfterIdle") is True, True, str(ln_d))
+            check("增量内容正确追加", ln_d.get("appended") is True, True, str(ln_d))
+
             # 15c) 过期响应不污染当前视图：
             # 模拟"请求发出后用户切走了" —— 过期响应应只充实缓冲、不动 DOM。
             #
@@ -425,10 +496,11 @@ def run():
                   stop2_d.get("stoppedA") is True and stop2_d.get("stoppedB") is False,
                   True, str(stop2_d) or "未拿到结果")
 
-            # 15f) 启动按钮 vs「隔离实例」复选框（原 bug 的核心）
+            # 15f) 启动按钮：单会话语义（隔离复选框**不影响**禁用状态）
             #
-            # 规则：同 profile 只允许一个"同种类"会话 —— 有普通会话在跑时
-            # 勾上隔离应该能启动（隔离的本意就是不影响正在运行的那个）。
+            # 规则：该应用已有注入会话在跑 → 禁用启动，与「隔离数据」勾选无关。
+            # 隔离是启动方式（用独立数据目录），不是多开一个实例 ——
+            # 早期版本曾让勾隔离就放行，那实际上是在鼓励多实例，已改回。
             # 同步函数，直接调用后读按钮状态即可，不用等 Promise。
             btn = win.evaluate_js("""
               (() => {
@@ -441,32 +513,27 @@ def run():
                 STATE.sessions = [{ key: 'sess:A', profile: 'A', running: true, isolate: false }];
 
                 iso.checked = false; syncLaunchButtons();
-                const plainBlocked = btnL.disabled;          // 普通实例在跑 + 不勾 -> 禁用
-                const tipPlain = btnL.title;
+                const blockedWhenPlain = btnL.disabled;
+                const tip = btnL.title;
 
                 iso.checked = true; syncLaunchButtons();
-                const isolateAllowed = !btnL.disabled;       // 普通实例在跑 + 勾隔离 -> 放行 ★
+                const stillBlockedWhenIsolate = btnL.disabled;   // ★ 勾隔离不该放行
 
+                // 没有会话时两种情况都应放行
+                STATE.sessions = [];
                 iso.checked = false; syncLaunchButtons();
-                const backToBlocked = btnL.disabled;
-
-                // 反过来：隔离实例在跑
-                STATE.sessions = [{ key: 'sess:A2', profile: 'A', running: true, isolate: true }];
-                iso.checked = false; syncLaunchButtons();
-                const plainAllowed = !btnL.disabled;         // 隔离在跑 + 不勾 -> 放行
+                const freeWhenNoSession = !btnL.disabled;
                 iso.checked = true; syncLaunchButtons();
-                const isolateBlocked = btnL.disabled;        // 隔离在跑 + 勾 -> 禁用
-                const tipIsolate = btnL.title;
+                const freeWhenNoSessionIsolate = !btnL.disabled;
 
                 // 恢复现场
                 iso.checked = false;
                 STATE.current = save.cur; STATE.sessions = save.sess; STATE.ready = save.ready;
                 syncLaunchButtons();
                 return JSON.stringify({
-                  plainBlocked, isolateAllowed, backToBlocked,
-                  plainAllowed, isolateBlocked,
-                  hasTipPlain: /隔离/.test(tipPlain),
-                  hasTipIsolate: /隔离/.test(tipIsolate),
+                  blockedWhenPlain, stillBlockedWhenIsolate,
+                  freeWhenNoSession, freeWhenNoSessionIsolate,
+                  hasReason: /已有注入会话/.test(tip),
                 });
               })()
             """)
@@ -475,13 +542,19 @@ def run():
                 bd = _json5.loads(btn) if btn else {}
             except Exception:
                 bd = {}
-            check("普通会话在跑时不勾隔离→禁用", bd.get("plainBlocked") is True, True, str(bd))
-            check("普通会话在跑时勾隔离→放行（原 bug）", bd.get("isolateAllowed") is True, True, str(bd))
-            check("取消勾选隔离→回到禁用", bd.get("backToBlocked") is True, True, str(bd))
-            check("隔离会话在跑时不勾隔离→放行", bd.get("plainAllowed") is True, True, str(bd))
-            check("隔离会话在跑时再勾隔离→禁用", bd.get("isolateBlocked") is True, True, str(bd))
-            check("禁用时给出原因（提示含「隔离」）",
-                  bd.get("hasTipPlain") is True and bd.get("hasTipIsolate") is True, True, str(bd))
+            check("有会话在跑→禁用启动", bd.get("blockedWhenPlain") is True, True, str(bd))
+            check("勾「隔离数据」不改变禁用状态（单会话语义）",
+                  bd.get("stillBlockedWhenIsolate") is True, True, str(bd))
+            check("无会话→放行", bd.get("freeWhenNoSession") is True, True, str(bd))
+            check("无会话且勾隔离→仍放行", bd.get("freeWhenNoSessionIsolate") is True, True, str(bd))
+            check("禁用时给出原因", bd.get("hasReason") is True, True, str(bd))
+            # 复选框文案必须是"数据隔离"语义，不能是"多开实例"
+            iso_label = win.evaluate_js(
+                "document.querySelector('label.check input#optIsolate')"
+                " ? document.querySelector('label.check input#optIsolate').parentElement.textContent : ''"
+            ) or ""
+            check("复选框文案是数据隔离语义",
+                  ("隔离数据" in iso_label) and ("不影响正在运行" not in iso_label), True, iso_label[:60])
 
             # 16) 自定义 CSS 编辑器存在且可写
             win.evaluate_js(

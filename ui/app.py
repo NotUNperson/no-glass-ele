@@ -70,6 +70,9 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # 过期才真跑，其余时候读缓存（会话列表仍实时刷新，因为它读磁盘、很廉价）。
 OVERVIEW_TTL_SEC = 5.0
 _overview_lock = threading.Lock()
+# 单独一把锁用来**串行化计算**：保证同一时刻只有一个人在跑 node。
+# 与 _overview_lock 分开是为了让「读缓存」与「让缓存失效」永远不必等 4 秒的计算。
+_overview_compute_lock = threading.Lock()
 _overview_cache = {"at": 0.0, "data": None}
 
 # ── 进程列表缓存（新建向导用）──
@@ -240,14 +243,12 @@ class TaskRunner:
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": f"读取 profile 失败：{e}"}
 
-        # 同一个 profile 的**同一种**会话只允许一个。
+        # 同一个 profile 只允许一个注入会话。
         #
-        # 为什么按 isolate 分种类：隔离的语义就是"不影响正在运行的实例" ——
-        # 所以「普通会话在跑 + 勾了隔离」是合法组合，必须放行（早期版本一律
-        # 拒绝，等于把隔离这条路堵死了）。反之「隔离在跑 + 又不勾隔离」也该
-        # 放行（那是要接管/新起普通实例）。但"同一种"再起第二个就是抢同一个
-        # 端口了，必须拒绝。
-        want_isolate = bool(isolate)
+        # 为什么不按 isolate 分种类放行：隔离是**启动方式**（本次启动用独立
+        # 数据目录），不是"多开一个实例"。允许两个会带来一堆歧义 ——
+        # 标签页多一个、停止按钮该停哪个、日志归属谁；而且很多应用有单实例锁
+        # 根本开不起来。想换启动方式就先停掉现有的。
         if not detached:
             with self._lock:
                 for sid, s in self._sessions.items():
@@ -255,28 +256,17 @@ class TaskRunner:
                         continue
                     if not (s.get("proc") and s["proc"].poll() is None):
                         continue
-                    if bool(s.get("isolate")) != want_isolate:
-                        continue
-                    if want_isolate:
-                        return {"ok": False,
-                                "error": f"{profile_name} 已经有一个**隔离实例**在跑"
-                                         f"（会话 {sid}）。先停掉它，或取消勾选隔离以"
-                                         f"另起一个普通实例。"}
                     return {"ok": False,
                             "error": f"{profile_name} 已经在运行中（会话 {sid}）。"
-                                     f"想在不影响它的前提下再起一个，请勾选「隔离实例」。"}
+                                     f"想换启动方式（例如改用隔离数据）请先停止它。"}
         else:
             # 无窗口模式也要防重复：查注册表 + 进程表
             try:
                 for r in sessions.list_all():
-                    if r.get("profile") != profile_name or not r.get("alive"):
-                        continue
-                    if bool(r.get("isolate")) != want_isolate:
-                        continue
-                    kind = "隔离实例" if want_isolate else "实例"
-                    return {"ok": False,
-                            "error": f"{profile_name} 已经有一个{kind}在运行中"
-                                     f"（pid {r.get('pid')}）。"}
+                    if r.get("profile") == profile_name and r.get("alive"):
+                        return {"ok": False,
+                                "error": f"{profile_name} 已经在运行中"
+                                         f"（pid {r.get('pid')}）。"}
             except Exception:                            # noqa: BLE001
                 pass
 
@@ -688,61 +678,86 @@ class Api:
         profile 列表 + 校验结果 + 会话列表。
 
         profile/doctor 数据来自 `gen.js --json`，每次调用要起两个 node 进程
-        （实测合计约 1.7 秒）。所以结果带 TTL 缓存 —— 前端高频刷新时读缓存，
-        只有缓存过期才真的跑 node。会话列表另走 sessions 模块（它自带缓存）。
+        （实测合计约 4 秒，doctor 内部还要起 3 个 PowerShell 读自启动项）。
+        所以结果带 TTL 缓存 —— 前端高频刷新时读缓存，只有缓存过期才真的跑 node。
+        会话列表另走 sessions 模块（它自带缓存）。
 
         force=True 用于「用户点了刷新」这类明确要求最新数据的场景。
+
+        ⚠️ 昂贵计算必须**在锁内**（这里踩过一个真坑）：
+        早期版本只在判断/写缓存时加锁，跑 node 的那 4 秒在锁外 —— 于是并发的
+        N 个调用者**各跑一份**。实测 8 个并发 → 同时存在 9 个 PowerShell
+        （每个 doctor 起 3 个）。启动 UI 时 init/向导/刷新按钮/updateTaskUI
+        本来就容易叠在一起，开机后 PowerShell 冷启动又特别慢，窗口一拉长就
+        叠出几十个进程 —— 用户实测见到 70+。
+
+        现在整段计算在锁内，后到的调用者会等第一个算完；
+        它们醒来时看到的是**比自己进入函数还新的**缓存，直接复用，不再各跑一份。
         """
         global _overview_cache
-        now = time.time()
+        entered = time.time()
 
-        with _overview_lock:
-            fresh = (now - _overview_cache["at"]) < OVERVIEW_TTL_SEC
-            if fresh and not force:
+        # 用独立的锁**串行化计算**，而不是让所有调用者去抢缓存锁。
+        #
+        # 为什么分开两把锁：计算要跑 4 秒。若把计算放在 _overview_lock 里，
+        # save_profile 的「让缓存失效」也得排队等这 4 秒 —— 用户会觉得保存卡住。
+        # 分开之后：_overview_lock 只保护字典读写（微秒级），
+        # _compute_lock 只保证「同一时刻只有一个人在跑 node」。
+        with _overview_compute_lock:
+            # 拿到计算权后重新看缓存：可能刚才那个计算者已经算好了。
+            # 判据是「缓存比我还新」—— 我进函数时它还没有，说明是别人替我算的。
+            with _overview_lock:
                 cached = _overview_cache["data"]
-                if cached:
-                    # 会话列表是实时的（读磁盘注册表，廉价），单独刷新
-                    out = dict(cached)
-                    try:
-                        out["sessions"] = self.list_sessions().get("sessions", [])
-                    except Exception:                    # noqa: BLE001
-                        out["sessions"] = []
-                    try:
-                        out["task"] = RUNNER.status()
-                    except Exception:                    # noqa: BLE001
-                        pass
-                    return out
+                cache_at = _overview_cache["at"]
+                now = time.time()
+                reuse = bool(cached) and (
+                    cache_at >= entered                      # 别人在我等待期间算好了
+                    or ((now - cache_at) < OVERVIEW_TTL_SEC and not force)
+                )
+            if reuse:
+                # 会话列表是实时的（读磁盘注册表，廉价），单独刷新
+                out = dict(cached)
+                try:
+                    out["sessions"] = self.list_sessions().get("sessions", [])
+                except Exception:                        # noqa: BLE001
+                    out["sessions"] = []
+                try:
+                    out["task"] = RUNNER.status()
+                except Exception:                        # noqa: BLE001
+                    pass
+                return out
 
-        try:
-            listing = run_node_json(["list", "--json"])
-        except Exception as e:                           # noqa: BLE001
-            return {"ok": False, "error": str(e)}
-        try:
-            doctor = run_node_json(["doctor", "--json"])
-        except Exception as e:                           # noqa: BLE001
-            doctor = {"ok": False, "profiles": [], "problemCount": 0, "error": str(e)}
+            # 真的需要算 —— 此刻只有我一个人在算
+            try:
+                listing = run_node_json(["list", "--json"], timeout=60)
+            except Exception as e:                       # noqa: BLE001
+                return {"ok": False, "error": str(e)}
+            try:
+                doctor = run_node_json(["doctor", "--json"], timeout=60)
+            except Exception as e:                       # noqa: BLE001
+                doctor = {"ok": False, "profiles": [], "problemCount": 0, "error": str(e)}
 
-        issues = {p["name"]: p.get("issues", []) for p in doctor.get("profiles", [])}
-        for prof in listing.get("profiles", []):
-            prof["issues"] = issues.get(prof["name"], [])
+            issues = {p["name"]: p.get("issues", []) for p in doctor.get("profiles", [])}
+            for prof in listing.get("profiles", []):
+                prof["issues"] = issues.get(prof["name"], [])
 
-        try:
-            sess = self.list_sessions().get("sessions", [])
-        except Exception:                                # noqa: BLE001
-            sess = []
+            try:
+                sess = self.list_sessions().get("sessions", [])
+            except Exception:                            # noqa: BLE001
+                sess = []
 
-        out = {
-            "ok": True,
-            "profiles": listing.get("profiles", []),
-            "doctorOk": doctor.get("ok", False),
-            "problemCount": doctor.get("problemCount", 0),
-            "task": RUNNER.status(),
-            "sessions": sess,
-        }
-        with _overview_lock:
-            _overview_cache["at"] = time.time()
-            _overview_cache["data"] = dict(out)
-        return out
+            out = {
+                "ok": True,
+                "profiles": listing.get("profiles", []),
+                "doctorOk": doctor.get("ok", False),
+                "problemCount": doctor.get("problemCount", 0),
+                "task": RUNNER.status(),
+                "sessions": sess,
+            }
+            with _overview_lock:
+                _overview_cache["at"] = time.time()
+                _overview_cache["data"] = dict(out)
+            return out
 
     # ── profile 读写 ──
     def get_profile(self, name):
@@ -993,8 +1008,13 @@ class Api:
         取某会话的日志。
 
         · 本地会话走内存缓冲（增量、游标）
-        · 外部会话（有登记项）读磁盘日志文件
+        · 外部会话（有登记项）读磁盘日志文件 —— 也是**增量**的（见下）
         · 外部发现的旧版注入器没有日志文件，返回明确提示而不是空白
+
+        为什么文件型会话也要增量：原先每次都整段返回最后 400 行，前端只能
+        整体重写日志区 —— 重写会销毁所有 DOM 节点，用户刚选中的文字每 300ms
+        被清空一次（实测反馈："选择内容每隔几秒就重新从头开始"）。
+        现在按字节游标读新增部分，返回 reset 标记让前端知道何时必须整段重画。
         """
         try:
             if local_id:
@@ -1006,28 +1026,30 @@ class Api:
                 return {"ok": True, "lines": lines, "cursor": new_cursor, "live": True}
 
             if session_id:
-                text, _ = sessions.read_log(session_id)
+                text, new_off, reset = sessions.read_log_since(session_id, int(cursor or 0))
                 lines = text.splitlines()
-                if not lines:
-                    return {"ok": True, "lines": [], "cursor": 0, "live": False,
-                            "path": sessions.log_path(session_id),
+                if reset and not lines:
+                    return {"ok": True, "lines": [], "cursor": new_off, "live": False,
+                            "reset": True, "path": sessions.log_path(session_id),
                             "note": "该会话暂无日志文件内容。"}
-                return {"ok": True, "lines": lines[-400:], "cursor": 0,
-                        "live": False, "path": sessions.log_path(session_id)}
+                return {"ok": True, "lines": lines, "cursor": new_off,
+                        "live": False, "reset": reset,
+                        "path": sessions.log_path(session_id)}
 
             if pid:
                 # 外部发现的旧版注入器：查它有没有登记项
                 try:
                     for r in sessions.list_registered(force=True):
                         if str(r.get("pid")) == str(pid):
-                            text, _ = sessions.read_log(r.get("id"))
-                            lines = text.splitlines()
-                            return {"ok": True, "lines": lines[-400:], "cursor": 0,
-                                    "live": False,
+                            text, new_off, reset = sessions.read_log_since(
+                                r.get("id"), int(cursor or 0))
+                            return {"ok": True, "lines": text.splitlines(),
+                                    "cursor": new_off, "live": False, "reset": reset,
                                     "path": sessions.log_path(r.get("id"))}
                 except Exception:                        # noqa: BLE001
                     pass
                 return {"ok": True, "lines": [], "cursor": 0, "live": False,
+                        "reset": False,
                         "note": "这是外部发现的旧版注入器 —— 它不写 run/logs/，"
                                 "所以没有可读日志。重启该注入器后即可看到日志。"}
 

@@ -623,34 +623,26 @@ async function updateTaskUI() {
 /**
  * 「启动 / 停止」两个按钮的可用状态。
  *
- * 为什么要单独抽出来：禁用条件必须与**后端守卫**是同一套规则
- * （ui/app.py 的 launch_injector：同 profile 的**同一种**会话只允许一个）。
+ * 规则：该应用**已经有注入会话在跑**就禁用启动 —— 与后端守卫是同一套规则
+ * （ui/app.py 的 launch_injector：同 profile 已有会话就拒绝）。
  * 两边不一致就会出现「按钮能点，点了报错」或「按钮灰着，其实能起」。
  *
- * 关键：勾了「隔离实例」时，已有一个普通会话**不算**冲突 ——
- * 隔离的本意就是"不影响正在运行的那个"。这是原 bug 的核心：
- * 早期版本一律 `disabled = !!mine`，把隔离这条路堵死了。
+ * 注意：这里**不看「隔离数据」复选框**。
+ * 隔离是**启动方式**（本次启动用独立数据目录，不写进你平时用的数据），
+ * 不是"多开一个实例"。本工具不运行同一应用的多个实例 —— 那会带来
+ * 标签页/停止按钮/日志归属的一堆歧义，而且很多应用有单实例锁根本开不起来。
+ * 想换启动方式就先停掉现有的（或先退出应用）。
  */
 function syncLaunchButtons() {
   const cur = STATE.current;
-  const wantIsolate = !!($('optIsolate') && $('optIsolate').checked);
   const sess = STATE.sessions || [];
   const mine = sess.find((s) => s.profile === cur && s.running);
-  // 与后端同一套判定：同一种类的会话只允许一个
-  const conflicting = sess.find(
-    (s) => s.profile === cur && s.running && !!s.isolate === wantIsolate
-  );
   $('btnStop').disabled = !mine && !STATE.taskRunning;
-  $('btnLaunch').disabled = !!conflicting;
-  // 灰着的时候给个理由（否则用户只看到点不动，不知道勾隔离就能起）
-  if (conflicting) {
-    const kind = wantIsolate ? '隔离实例' : '实例';
-    $('btnLaunch').title = `「${cur}」已有一个${kind}在运行`
-      + (wantIsolate ? '（先停掉它，或取消勾选隔离以另起一个普通实例）'
-                     : '（勾选「隔离实例」可在不影响它的前提下再起一个）');
-  } else {
-    $('btnLaunch').title = '';
-  }
+  $('btnLaunch').disabled = !!mine;
+  // 灰着的时候给个理由，并说明出路
+  $('btnLaunch').title = mine
+    ? `「${cur}」已有注入会话在运行。想换启动方式（例如改用隔离数据）请先停止它。`
+    : '';
 }
 
 function renderSessionTabs() {
@@ -874,14 +866,23 @@ async function pollSessionLog() {
         buf.lines.splice(0, buf.lines.length - LOG_BUFFER_MAX);
       }
     }
-  } else {
-    // 外部会话：后端每次整段返回（游标恒为 0），所以整体替换而不是追加
-    if (res.lines && res.lines.length) {
-      buf.lines = res.lines.slice(-LOG_BUFFER_MAX);
-    } else if (res.note && !buf.lines.length) {
-      buf.lines = [res.note];
-    }
+  } else if (res.reset) {
+    // 文件型会话：后端要求重置（首读、或文件被截断/轮转）→ 整体替换缓冲
+    buf.lines = (res.lines || []).slice(-LOG_BUFFER_MAX);
+    if (!buf.lines.length && res.note) buf.lines = [res.note];
     buf.cursor = res.cursor || 0;
+  } else {
+    // 文件型会话的**增量**：只追加新行。
+    // 为什么这条分支重要：以前它走的是"整体替换 + 重渲染"，而重渲染会销毁
+    // 日志区所有 DOM 节点 —— 用户刚选中的文字每 300ms 被清空一次（实测反馈：
+    // 选择内容每隔几秒就重新从头开始）。增量追加不碰已有节点，选中得以保留。
+    if (res.lines && res.lines.length) {
+      buf.lines.push(...res.lines);
+      if (buf.lines.length > LOG_BUFFER_MAX) {
+        buf.lines.splice(0, buf.lines.length - LOG_BUFFER_MAX);
+      }
+    }
+    buf.cursor = res.cursor || buf.cursor;
   }
 
   // 只有"回来时看的还是它"才动 DOM —— 过期响应只充实缓冲
@@ -890,14 +891,15 @@ async function pollSessionLog() {
   const box = $('log');
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
 
-  if (res.live) {
-    // 增量追加（比整体重渲染便宜，长日志时不卡）
+  if (res.live || !res.reset) {
+    // 增量追加（比整体重渲染便宜，且不破坏用户的选择）
     if (res.lines && res.lines.length) {
       appendLog(res.lines, atBottom);
     } else if (!buf.lines.length && !box.textContent.trim()) {
       box.innerHTML = '<span class="l-dim">（该会话暂无输出）</span>';
     }
   } else {
+    // 后端要求重置（首读 / 文件被截断）：只能整段重画
     renderLogFromBuffer();
   }
 }
@@ -1330,9 +1332,6 @@ function bindUI() {
   };
   $('btnLaunch').onclick = launchInjector;
   $('btnAdoptArgs').onclick = adoptAppArgs;
-  // 勾/取消「隔离实例」要立刻改变启动按钮的可用状态 ——
-  // 只靠 2 秒轮询的话，用户勾了要等两拍才知道能不能点（原 bug 的体感来源之一）。
-  if ($('optIsolate')) $('optIsolate').onchange = syncLaunchButtons;
   $('btnStop').onclick = stopTask;
   $('btnSave').onclick = saveProfile;
   $('btnBuild').onclick = buildProfile;
