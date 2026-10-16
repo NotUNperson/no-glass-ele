@@ -1,7 +1,11 @@
 'use strict';
 /**
- * 生成三个示例 profile。
+ * 按下面 APPS 里的清单批量重建 profile（覆盖同名文件）。
  * 用法：node tools/make-profiles.js
+ *
+ * ⚠️ APPS 里的 exe 路径是**本机路径**，换机器要先改这里。
+ * 通用的建 profile 方式是 `node gen.js new <name> --exe <path>`；
+ * 这个脚本只是本机的批量重建快捷方式。
  *
  * 为什么要有这个脚本：profile 里的 exe 是 Windows 绝对路径，
  * 在 bash 里用 \\\\ 转义极易被折叠成错路径。交给 Node 处理就没这问题。

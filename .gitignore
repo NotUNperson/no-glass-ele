@@ -10,6 +10,14 @@ run/
 # 如果你希望跟着仓库走（多机同步样式），取消下面这行注释：
 # css/*.custom.css
 
+# 每个应用的 profile：同样是个人配置，且**含本机 exe 绝对路径**
+# （形如 <local-path>
+#
+# _template.json 例外 —— 它是 `gen.js new` 的骨架，必须随仓库走，
+# 否则新 clone 的人建不了第一个 profile。
+profiles/*.json
+!profiles/_template.json
+
 # 生成的启动器产物（apps/<name>/）。
 #
 # 它们是**可再生的**：node gen.js build --all 就能重建。
