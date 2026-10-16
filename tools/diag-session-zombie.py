@@ -56,18 +56,23 @@ def observe(label):
         tag = "  ← 伪造项" if r.get("id") == FAKE_ID else ""
         print(f"  id={r.get('id')}")
         print(f"     pid      : {r.get('pid')}")
-        print(f"     alive    : {r.get('alive')}   ← 只看 PID 是否存在{tag}")
-        print(f"     lastTick : {r.get('lastTick')}   ← 只写不读，没有心跳校验")
-        print(f"     appPid   : {r.get('appPid')}   ← 只写不读")
+        print(f"     alive    : {r.get('alive')}")
+        print(f"     zombie   : {r.get('zombie')}   ← 心跳判定（True = 硬关机残留）{tag}")
+        print(f"     lastTick : {r.get('lastTick')}")
 
-    # 对伪造项发起停止请求，看它会不会真的消失
     if FAKE_FILE.exists():
-        ok, err = sessions.request_stop(FAKE_ID)
-        print(f"\n  对伪造项请求停止：ok={ok} err={err!r}")
-        print("  （它写了 run/sessions/__diag_zombie__.stop，但没有任何注入器会来消费）")
-        time.sleep(1.5)
+        print("\n  ── 对它点「停止」会怎样 ──")
+        print("  （走 cleanup_residual：写 .stop 探活 → 没人消费 → 清残留）")
+        result, msg = sessions.cleanup_residual(FAKE_ID, wait_sec=1.5)
+        print(f"    结果: {result}")
+        print(f"    说明: {msg}")
         still = FAKE_FILE.exists()
-        print(f"  1.5 秒后伪造项还在吗：{still}   ← True 即复现「关不掉」")
+        print(f"    注册项还在吗: {still}   ← False 即已被清理（修复后应如此）")
+        print(f"    伪造 pid ({os.getpid()}) 是否存活: {sessions._pid_alive(os.getpid())}")
+        print("    ↑ 必须是 True —— 证明清理过程**没有**对那个 pid 发任何 kill")
+        return not still
+
+    return True
 
 
 def write_fake():
@@ -91,8 +96,8 @@ def write_fake():
         "emulateColorScheme": None,
         "darkreader": None,
         "darkreaderTheme": None,
-        # 关键：把心跳时间设成很久以前 —— 它明明已经"没有心跳"了，
-        # 但当前逻辑不会因此判它死（因为 lastTick 根本没人读）。
+        # 关键：心跳时间设成很久以前。修复后这应当被识别为 zombie；
+        # 修复前它会被当成"运行中"，且点停止没反应。
         "startedAt": "2020-01-01T00:00:00.000Z",
         "lastTick": "2020-01-01T00:00:00.000Z",
         "appPid": None,
@@ -141,16 +146,18 @@ def main():
     f = write_fake()
     print(f"  已写 {f}")
 
+    ok = False
     try:
-        observe("伪造后")
+        ok = observe("伪造后")
         print("\n【结论】")
-        print("  上面的 alive=True 就是问题所在：该会话的 lastTick 停在 2020 年，")
-        print("  但判定只看'PID 有没有进程'，所以它永远显示运行中、且停止无效。")
-        print("  真实场景里，那个 PID 是开机后被系统复用给别的进程的。")
+        print("  期望：zombie=True（心跳停在 2020 年），且点停止会清掉残留项，")
+        print("        同时那个 pid 指向的进程**依然存活**（证明没误杀）。")
+        print("  修复前的表现：zombie 字段不存在、判定只看 pid，")
+        print("        于是它显示成运行中且停止无效（点多少次都没反应）。")
     finally:
         print("\n清理：")
         clean()
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

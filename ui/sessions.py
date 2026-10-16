@@ -33,6 +33,7 @@ sessions.py —— 注入会话的读取与停止请求（Python 侧）
 结果：UI 常开时不再持续派生进程，CPU 占用可忽略。
 """
 
+import datetime
 import json
 import os
 import threading
@@ -51,6 +52,61 @@ EXTERNAL_TTL_SEC = 8.0
 
 # 单次进程表查询的超时。查询本身很快，给足余量但不无限等。
 PS_TIMEOUT_SEC = 15
+
+# ── 心跳判定的两个阈值（见 _is_zombie）──
+#
+# 为什么需要宽限期：会话刚启动时 lastTick 还没写过（第一次巡检要等一个
+# 周期），此时不能判它是残留。60 秒足够覆盖"启动 → 首次写心跳"的窗口。
+ZOMBIE_GRACE_SEC = 60.0
+
+# 心跳过期阈值。注入器的巡检间隔是 20 秒（事件驱动模式下），
+# 取 4.5 倍 = 90 秒，容忍偶发的系统卡顿/文件写入延迟。
+ZOMBIE_STALE_SEC = 90.0
+
+
+def _parse_ts(s):
+    """解析 ISO 时间戳。失败返回 None（不抛错 —— 字段缺失是常态）。"""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        # 兼容 "2026-10-16T05:16:30.932Z" 与无毫秒的形式
+        t = s.replace("Z", "+00:00")
+        return datetime.datetime.fromisoformat(t)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _is_zombie(meta, now=None):
+    """
+    判断一个注册项是否为「僵尸会话」—— 硬关机（或强杀）留下的残留。
+
+    为什么光看 pid 不够：注入器靠 process.on('exit') 与 SIGINT/SIGTERM 清
+    注册项，但 Windows 关机**不派发信号**、exit 钩子也不跑，于是注册项留在
+    磁盘上。而 pid 存活判断只回答"这个 PID 有没有进程"，不回答"它是不是那个
+    注入器"—— 开机后 PID 被复用，残留项就被显示成「运行中」，且点停止没反应
+    （停止文件没人消费），prune 也清不掉（它不是 alive=False）。
+
+    判据（三条同时成立）：
+      1. pid 存在（否则本来就是 dead，走原有路径）
+      2. 启动已超过宽限期（避开启动竞态）
+      3. lastTick 缺失或已过期（注入器在写心跳，它没写 = 它不在）
+
+    注意：这只是**显示层**的廉价判断。真正的权威判定在 cleanup_residual()
+    —— 那边用 .stop 文件探活，不会误判（见该函数说明）。
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    started = _parse_ts(meta.get("startedAt"))
+    if started is None:
+        return False          # 连启动时间都没有，不猜
+    if (now - started).total_seconds() < ZOMBIE_GRACE_SEC:
+        return False          # 还在宽限期内
+
+    tick = _parse_ts(meta.get("lastTick"))
+    if tick is None:
+        # 从未写过心跳。可能是：watch 模式没开（非 watch 会话不进巡检循环，
+        # 压根不写 lastTick）—— 那种情况下不能判它死。
+        return False
+    return (now - tick).total_seconds() > ZOMBIE_STALE_SEC
 
 
 def ensure_dirs():
@@ -153,6 +209,9 @@ def list_registered(force=False):
         meta["__stopFile"] = str(SESS_DIR / f"{sid}.stop")
         meta["__logFile"] = str(LOG_DIR / f"{sid}.log")
         meta["alive"] = _pid_alive(meta.get("pid"))
+        # 僵尸判定：pid 存在但心跳早停了（硬关机留下的残留）。
+        # 这类项若仍按 alive 显示会变成"关不掉的标签"，所以单独标出来。
+        meta["zombie"] = bool(meta["alive"]) and _is_zombie(meta)
         out.append(meta)
     out.sort(key=lambda m: str(m.get("startedAt") or ""))
     with _reg_lock:
@@ -302,6 +361,55 @@ def request_stop(session_id):
         return False, str(e)
 
 
+def cleanup_residual(session_id, wait_sec=2.0):
+    """
+    处理「点停止但没反应」的残留会话。**绝不对该 pid 发 kill。**
+
+    为什么不能 kill：残留项的 pid 可能**已经被系统复用给无关进程**
+    （这正是僵尸会话的成因）。对它 taskkill 会杀掉无辜进程 —— 实测中
+    那个 pid 甚至可能指向用户自己的应用。
+
+    做法是用 .stop 文件本身探活 —— 它是现成的、零风险的握手：
+      1. 写 run/sessions/<id>.stop
+      2. 等一会儿
+         · 注册项消失 → 注入器还活着，它消费了停止请求并自行退出（正常停止）
+         · 注册项仍在 → 注入器早就不在了，没人消费 → 删掉残留项与 stop 文件
+    两种结果都不需要碰任何进程。
+
+    返回 (结果, 说明)：
+      ("stopped",  ...)   注入器还活着，已优雅停止
+      ("cleaned",  ...)   注入器早已退出，残留项已清理
+      ("missing",  ...)   注册项不存在
+    """
+    sess_file = SESS_DIR / f"{session_id}.json"
+    if not sess_file.exists():
+        return "missing", "该会话的注册项不存在（可能已被清理）。"
+
+    ok, err = request_stop(session_id)
+    if not ok:
+        return "error", f"写入停止请求失败：{err}"
+
+    # 等注入器消费（它的停止轮询是 1 秒一次，给两倍余量）
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        if not sess_file.exists():
+            return "stopped", "已请求停止，注入器已优雅退出。目标应用不受影响。"
+        time.sleep(0.1)
+
+    # 还在 —— 说明没人消费这个停止请求，注入器早死了。清残留。
+    removed = []
+    for p in (sess_file, SESS_DIR / f"{session_id}.stop"):
+        try:
+            p.unlink()
+            removed.append(p.name)
+        except Exception:                                # noqa: BLE001
+            pass
+    if removed:
+        return "cleaned", ("该注入器早已退出（注册项是硬关机留下的残留），已清理："
+                           + "、".join(removed))
+    return "error", "残留项存在但删除失败（可能被占用）。"
+
+
 def force_kill(pid):
     """
     兜底强停。**绝不用 /T。**
@@ -345,19 +453,28 @@ def log_path(session_id):
 
 
 def prune():
-    """清理已退出会话残留的注册项。"""
+    """
+    清理已退出会话残留的注册项。
+
+    清理两类：
+      · alive == False  —— 进程真的没了
+      · zombie == True  —— pid 还在但心跳早停了（硬关机残留）。
+        以前只清第一类，僵尸永远够不到（它不是 alive=False），
+        于是每次硬关机都累积一个「关不掉的标签」。
+    """
     n = 0
     for s in list_registered(force=True):
-        if not s.get("alive"):
-            try:
-                Path(s["__file"]).unlink()
-                n += 1
-            except Exception:                            # noqa: BLE001
-                pass
-            try:
-                Path(s["__stopFile"]).unlink()
-            except Exception:                            # noqa: BLE001
-                pass
+        if s.get("alive") and not s.get("zombie"):
+            continue
+        try:
+            Path(s["__file"]).unlink()
+            n += 1
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            Path(s["__stopFile"]).unlink()
+        except Exception:                                # noqa: BLE001
+            pass
     return n
 
 

@@ -20,7 +20,6 @@ let STATE = {
   current: null,       // 当前选中的 profile 名
   data: null,          // 当前 profile 的完整数据
   dirty: false,
-  logCursor: 0,        // 短任务日志游标
   taskRunning: false,
   sessions: [],        // 运行中的注入会话
   activeSession: null, // 当前查看日志的会话 key（localId 或 id）
@@ -38,6 +37,17 @@ let STATE = {
 // 每个会话在缓冲里保留的最大行数。与后端 LogBuffer 的上限（app.py 的
 // LOG_LIMIT = 4000）对齐 —— 超出后端的部分本来就取不到，前端留更多没意义。
 const LOG_BUFFER_MAX = 4000;
+
+// 「任务」虚拟标签的 key。
+//
+// 为什么需要它：短任务（probe / build / doctor）的输出走的是后端的
+// _task_log 通道，与注入会话的日志是两个来源。以前前端只在
+// STATE.activeSession 为空时才显示任务日志 —— 而只要有会话在跑，
+// activeSession 就非空，于是**任务输出永远看不见**（实测点了「校验全部」，
+// 后端有 10 行输出、前端一个字都不显示）。
+//
+// 改成把任务当成一个常驻的虚拟标签，与真实会话并列，两个通道都能看到。
+const TASK_KEY = '__task__';
 
 function toast(msg, kind = '', ms = 3600) {
   const el = document.createElement('div');
@@ -194,6 +204,13 @@ async function selectProfile(name, keepScroll = false) {
   renderList();
   renderDetail(keepScroll);
   await loadCustomCss();
+
+  // 立刻刷新按钮状态。
+  //
+  // 为什么不靠轮询：按钮的可用性取决于「当前应用有没有在跑的会话」，
+  // 而那只在 updateTaskUI 里更新（2 秒一次轮询驱动）。不在这里补一次的话，
+  // 切换应用后按钮状态会滞后最多 2 秒 —— 看起来像点了没反应。
+  updateTaskUI().catch(() => { /* 忽略：轮询会兜底 */ });
 }
 
 function renderDetail(keepScroll = false) {
@@ -410,11 +427,22 @@ async function saveProfile() {
   await refresh();
 }
 
+/**
+ * 切到「任务」标签 —— 短任务的输出只在那里显示。
+ *
+ * 为什么任务开始时要主动切：否则用户点了「校验全部」却看不到任何反应
+ * （输出在另一个标签里）。这是"点了按钮像没生效"的直接来源。
+ */
+function focusTaskTab() {
+  if (STATE.activeSession !== TASK_KEY) switchSession(TASK_KEY);
+}
+
 async function buildProfile() {
   if (!STATE.current) return;
   const res = unwrap(await api().run_task('build', STATE.current));
   if (!res) return;
   toast('开始生成启动器…', 'ok');
+  focusTaskTab();
 }
 
 async function launchInjector() {
@@ -433,10 +461,30 @@ async function launchInjector() {
     return;
   }
   toast('已启动注入器（--watch 常驻）', 'ok');
-  // 立刻切到这个会话的日志（走唯一入口，保证内容与标题同步）
   await refresh();
   await updateTaskUI();
-  if (res.localId) switchSession(res.localId);
+
+  // 切到新会话的日志标签。
+  //
+  // 为什么要等：注入器刚起来时它还没把自己登记到 run/sessions/，于是
+  // 这一次 updateTaskUI 拉到的列表里没有它。若此刻直接 switchSession，
+  // renderSessionTabs 会发现这个 key 不在列表里而回退到第一个标签 ——
+  // 把刚设好的选择覆盖掉（实测就是这个表现：启动后停在旧标签）。
+  // 所以轮询等它出现，最多约 3 秒。
+  if (res.localId) {
+    const key = res.localId;
+    for (let i = 0; i < 8; i++) {
+      if (STATE.sessions.some((s) => s.key === key)) break;
+      await new Promise((r) => setTimeout(r, 400));
+      await updateTaskUI();
+    }
+    if (STATE.sessions.some((s) => s.key === key)) {
+      switchSession(key);
+    } else {
+      // 没等到（启动慢或失败了）—— 不静默，提示用户去标签里找
+      toast('注入器已启动，但会话标签还没出现（可稍后在右栏查看）', 'warn', 5000);
+    }
+  }
 }
 
 async function stopSession(key) {
@@ -528,18 +576,33 @@ function renderSessionTabs() {
   // 只显示有 key 的（后端保证非空；这里再兜一层，防御脏数据）
   const live = STATE.sessions.filter((s) => s.key);
 
-  // 若当前查看的会话没了，回退到第一个。
+  // 「任务」是常驻虚拟标签，永远可用（它是短任务输出的唯一入口）。
+  const keys = [TASK_KEY, ...live.map((s) => s.key)];
+
+  // 若当前查看的会话没了，回退。
   // 注意：这里**不直接改 STATE.activeSession** —— 切换要连带把 DOM 换成
   // 新会话的缓冲内容，所以统一走 switchSession()，避免出现"标题变了、
   // 内容还是上一个会话的"这种半切换状态。
-  const keys = live.map((s) => s.key);
-  const wanted = keys.includes(STATE.activeSession) ? STATE.activeSession : (keys[0] || null);
+  const wanted = keys.includes(STATE.activeSession)
+    ? STATE.activeSession
+    : (live.length ? live[0].key : TASK_KEY);
   if (wanted !== STATE.activeSession) {
     // 延到本次渲染之后（本函数还会被 switchSession 反过来调用，直接调会递归）
     setTimeout(() => switchSession(wanted, { silent: true }), 0);
   }
 
-  box.innerHTML = live.map((s) => {
+  // 任务标签排在最前面 —— 它是"工具输出"的固定位置，不随会话增减移动。
+  const taskTab = (() => {
+    const cls = ['stab', 'task'];
+    if (STATE.activeSession === TASK_KEY) cls.push('active');
+    if (STATE.taskRunning) cls.push('run'); else cls.push('dead');
+    const spin = STATE.taskRunning ? '运行中' : '空闲';
+    return `<span class="${cls.join(' ')}" data-key="${TASK_KEY}" title="工具输出（probe / build / doctor）· ${spin}">
+      <span class="dot"></span><span class="nm">任务</span>
+    </span>`;
+  })();
+
+  box.innerHTML = taskTab + live.map((s) => {
     const key = s.key;
     const nm = s.displayName || s.profile || '(未知)';
     const cls = ['stab'];
@@ -547,9 +610,16 @@ function renderSessionTabs() {
     if (key === STATE.activeSession) cls.push('active');
     const port = s.port != null ? `<span class="pt">:${s.port}</span>` : '';
     const ext = s.external ? '<span class="ext" title="外部启动的注入器（无实时日志，可看磁盘日志）">外部</span>' : '';
-    const x = s.running ? `<span class="x" data-stop="${esc(key)}" title="停止（不关应用）">✕</span>` : '';
+    // 残留项（硬关机留下的）没有注入器会消费停止请求，所以 ✕ 改成"清理"。
+    let mark = '';
+    if (s.zombie) {
+      mark = '<span class="residual" title="这是硬关机留下的残留注册项：注入器早已退出，点 ✕ 只会清掉这条残留，不会动任何进程">残留</span>';
+    }
+    const x = s.running
+      ? `<span class="x" data-stop="${esc(key)}" title="停止（不关应用）">✕</span>`
+      : (s.zombie ? `<span class="x" data-stop="${esc(key)}" title="清理残留注册项（不会动任何进程）">✕</span>` : '');
     return `<span class="${cls.join(' ')}" data-key="${esc(key)}" title="${esc(nm)}">
-      <span class="dot"></span><span class="nm">${esc(nm)}</span>${port}${ext}${x}
+      <span class="dot"></span><span class="nm">${esc(nm)}</span>${port}${ext}${mark}${x}
     </span>`;
   }).join('');
 
@@ -571,10 +641,14 @@ function renderSessionTabs() {
     };
   });
 
-  const cur = STATE.sessions.find((s) => s.key === STATE.activeSession);
-  $('logTitle').textContent = cur
-    ? `输出 · ${cur.displayName || cur.profile}${cur.external ? '（外部）' : ''}`
-    : '输出';
+  if (STATE.activeSession === TASK_KEY) {
+    $('logTitle').textContent = STATE.taskRunning ? '输出 · 任务（运行中）' : '输出 · 任务';
+  } else {
+    const cur = STATE.sessions.find((s) => s.key === STATE.activeSession);
+    $('logTitle').textContent = cur
+      ? `输出 · ${cur.displayName || cur.profile}${cur.external ? '（外部）' : ''}`
+      : '输出';
+  }
 }
 
 /**
@@ -627,6 +701,10 @@ function renderLogFromBuffer() {
 
   if (!b || !b.lines.length) {
     // 缓冲还没建（刚切过来、首轮还没回来）——给提示而不是空白
+    if (key === TASK_KEY) {
+      box.innerHTML = '<span class="l-dim">（任务暂无输出；点「校验全部」或「重新生成启动器」会产生输出）</span>';
+      return;
+    }
     const sess = STATE.sessions.find((x) => x.key === key);
     box.innerHTML = sess
       ? '<span class="l-dim">（加载中…）</span>'
@@ -668,11 +746,16 @@ function pruneLogBuffers(liveKeys) {
  * 回来时若 activeSession 已经变了，就**只充实那个会话的缓冲、不碰 DOM**。
  * 之前没有这个检查，两个会话的响应会先后落进同一个 DOM 节点，
  * 日志就混在一起了。
+ *
+ * 任务标签（TASK_KEY）走的是另一条后端通道（_task_log），在这里分流。
  */
 async function pollSessionLog() {
   const key = STATE.activeSession;
   if (!key) {
-    // 没有会话时退回短任务日志
+    // 没有任何选中项（理论上不该发生，标签里至少有"任务"）
+    return pollTaskLog();
+  }
+  if (key === TASK_KEY) {
     return pollTaskLog();
   }
   const s = STATE.sessions.find((x) => x.key === key);
@@ -737,12 +820,37 @@ async function pollSessionLog() {
   }
 }
 
-/** 短任务日志（probe / build / doctor）—— 没有会话时显示这个。 */
+/**
+ * 短任务日志（probe / build / doctor）—— 走「任务」虚拟标签。
+ *
+ * 与会话日志同一套缓冲机制（logBuffers[TASK_KEY]），所以：
+ *   · 切走再切回，任务输出完整保留
+ *   · 有过期响应检查（回来时若已切走，只充实缓冲不动 DOM）
+ */
 async function pollTaskLog() {
-  const res = await api().get_logs(STATE.logCursor);
+  const buf = bufferFor(TASK_KEY);
+  const res = await api().get_logs(buf.cursor);
   if (!res || res.ok === false) return;
-  STATE.logCursor = res.cursor;
-  appendLog(res.lines || []);
+
+  buf.cursor = res.cursor;
+  const lines = res.lines || [];
+  if (lines.length) {
+    buf.lines.push(...lines);
+    if (buf.lines.length > LOG_BUFFER_MAX) {
+      buf.lines.splice(0, buf.lines.length - LOG_BUFFER_MAX);
+    }
+  }
+
+  // 只有还停在任务标签时才动 DOM
+  if (STATE.activeSession !== TASK_KEY) return;
+
+  const box = $('log');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  if (lines.length) {
+    appendLog(lines, atBottom);
+  } else if (!buf.lines.length && !box.textContent.trim()) {
+    box.innerHTML = '<span class="l-dim">（任务暂无输出；点「校验全部」或「重新生成启动器」会产生输出）</span>';
+  }
 }
 
 // ─────────────────────────── 日志轮询 ───────────────────────────
@@ -1117,6 +1225,7 @@ async function wizCreate() {
   toast(`已创建 ${name}。正在生成启动器…`, 'ok');
   closeWizard();
   await api().run_task('build', name);
+  focusTaskTab();            // 生成过程有输出，切过去让用户看见
   await refresh();
   await selectProfile(name);
 }
@@ -1129,6 +1238,7 @@ function bindUI() {
   $('btnNew').onclick = openWizard;
   $('btnDoctor').onclick = async () => {
     unwrap(await api().run_task('doctor'));
+    focusTaskTab();          // 输出在任务标签里，切过去才看得见
     setTimeout(refresh, 1500);
   };
   $('btnLaunch').onclick = launchInjector;
@@ -1141,16 +1251,19 @@ function bindUI() {
   };
   $('btnClearLog').onclick = async () => {
     const key = STATE.activeSession;
-    if (key) {
+    if (key === TASK_KEY) {
+      // 任务标签：清前端缓冲 + 让后端把游标推到当前（这样旧行不会重新拉回来）
+      STATE.logBuffers[TASK_KEY] = { lines: [], cursor: 0, scrollTop: null, atBottom: true };
+      const res = await api().clear_logs();
+      if (res && res.ok) STATE.logBuffers[TASK_KEY].cursor = res.cursor;
+      $('log').innerHTML = '<span class="l-dim">（已清空显示；新输出会继续出现）</span>';
+    } else if (key) {
       // 只清当前会话的缓冲（其他会话的历史不该被连带清掉）
       STATE.logBuffers[key] = { lines: [], cursor: 0, scrollTop: null, atBottom: true };
       $('log').innerHTML = '<span class="l-dim">（已清空显示；新输出会继续出现）</span>';
       // 注意：不清后端缓冲 —— 它通过 get_session_log 的游标取增量，
       // 把前端游标归零反而会把旧内容重新拉回来（后端 _seq 只增不减）。
       await pollSessionLog();
-    } else {
-      const res = await api().clear_logs();
-      if (res && res.ok) { STATE.logCursor = res.cursor; $('log').innerHTML = ''; }
     }
   };
   $('btnPrune').onclick = async () => {

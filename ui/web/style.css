@@ -353,6 +353,19 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .stab .x:hover { color: var(--err); background: var(--err-bg); }
 .stab .ext { color: var(--warn); font-size: 10px; }
 
+/* 「任务」虚拟标签：工具输出的固定位置，与会话标签视觉上区分开 */
+.stab.task {
+  border-style: dashed;
+  color: var(--text-2);
+}
+.stab.task.active { border-style: solid; }
+.stab.task.run .dot { background: var(--ok); }
+.stab.task .nm { font-weight: 500; }
+
+/* 残留会话（硬关机留下的注册项）：整条压暗，明确它已经不在运行 */
+.stab .residual { color: var(--text-3); font-size: 10px; }
+.stab.dead .nm { color: var(--text-3); }
+
 .log-head { border-top: 1px solid var(--line-soft); }
 
 /* ── 自定义 CSS 编辑器 ── */

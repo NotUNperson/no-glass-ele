@@ -183,6 +183,61 @@ def run():
             check("切标签不串内容", not iso_d.get("a1HasB") and not iso_d.get("bHasA"), True, str(iso_d))
             check("切回后历史仍在（原 bug）", iso_d.get("aBackKeeps") is True, True, str(iso_d))
 
+            # 15b-2) 任务标签：这是短任务输出（probe / build / doctor）的
+            # 唯一入口。以前有会话在跑时任务输出永远看不见 —— 根因是前端
+            # 用"没有 activeSession"当作看任务日志的条件。
+            task_tab = win.evaluate_js("""
+              (() => {
+                STATE.ready = false;              // 冻结轮询，避免干扰
+                STATE.sessions = [
+                  { key: 'sess:A', profile: 'A', displayName: 'A', running: true, port: 1 },
+                ];
+                STATE.logBuffers = {
+                  'sess:A': { lines: ['会话A的输出'], cursor: 1, scrollTop: null, atBottom: true },
+                  '__task__': { lines: ['任务输出-第一行', '任务输出-第二行'], cursor: 2, scrollTop: null, atBottom: true },
+                };
+                STATE.taskRunning = true;
+                renderSessionTabs();
+
+                const tabs = [...document.querySelectorAll('#sessionTabs .stab')].map(e => e.dataset.key);
+                const hasTaskTab = tabs.includes('__task__');
+                // 任务标签应排在第一位（固定位置，不随会话增减移动）
+                const taskFirst = tabs[0] === '__task__';
+
+                // 切到任务标签 —— 即便有会话在跑，也必须能看到任务输出
+                switchSession('__task__', { silent: true });
+                const taskText = document.getElementById('log').textContent;
+                const titleWhenTask = document.getElementById('logTitle').textContent;
+
+                // 切回会话，任务缓冲不该被清掉
+                switchSession('sess:A', { silent: true });
+                const sessText = document.getElementById('log').textContent;
+                const taskBufKept = (STATE.logBuffers['__task__']?.lines || []).length === 2;
+
+                STATE.ready = window.__smokeReadySave0 === undefined ? true : window.__smokeReadySave0;
+                return JSON.stringify({
+                  hasTaskTab, taskFirst,
+                  taskVisibleWithSession: taskText.includes('任务输出-第一行'),
+                  taskTabNoSessionLeak: !taskText.includes('会话A的输出'),
+                  titleMentionsTask: titleWhenTask.includes('任务'),
+                  sessTextOk: sessText.includes('会话A的输出'),
+                  taskBufKept,
+                });
+              })()
+            """)
+            try:
+                import json as _json_t
+                task_d = _json_t.loads(task_tab) if task_tab else {}
+            except Exception:
+                task_d = {}
+            check("任务标签存在且排第一",
+                  task_d.get("hasTaskTab") and task_d.get("taskFirst"), True, str(task_d))
+            check("有会话时也能看到任务输出（原 bug）",
+                  task_d.get("taskVisibleWithSession") is True, True, str(task_d))
+            check("任务标签不串会话内容",
+                  task_d.get("taskTabNoSessionLeak") is True, True, str(task_d))
+            check("任务缓冲切走后保留", task_d.get("taskBufKept") is True, True, str(task_d))
+
             # 15c) 过期响应不污染当前视图：
             # 模拟"请求发出后用户切走了" —— 过期响应应只充实缓冲、不动 DOM。
             #

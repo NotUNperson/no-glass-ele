@@ -877,6 +877,7 @@ class Api:
                 "pid": pid,
                 "port": (meta or {}).get("port"),
                 "running": s.get("running"),
+                "zombie": bool((meta or {}).get("zombie")),
                 "startedAt": (meta or {}).get("startedAt"),
                 "source": (meta or {}).get("source") or "ui",
                 "external": False,
@@ -905,7 +906,10 @@ class Api:
                 "displayName": r.get("displayName") or r.get("appName") or r.get("profile"),
                 "pid": pid,
                 "port": r.get("port"),
-                "running": bool(r.get("alive")),
+                # zombie 是"pid 还在但心跳早停了"（硬关机残留）—— 它不能算
+                # 运行中，否则 UI 上就是个点不动的标签。
+                "running": bool(r.get("alive")) and not r.get("zombie"),
+                "zombie": bool(r.get("zombie")),
                 "startedAt": r.get("startedAt"),
                 "source": r.get("source") or ("external" if r.get("external") else "cli"),
                 "external": bool(r.get("external")),
@@ -926,39 +930,52 @@ class Api:
     def stop_session(self, local_id=None, session_id=None, pid=None):
         """
         停止一个会话。三种定位方式，按优先级：
-          1. localId —— 本地启动的，有实时日志缓冲
-          2. sessionId —— 注册表登记的，走协作式停止文件
-          3. pid —— 外部发现的旧版注入器，没有登记项，只能按 pid 强停
+          1. localId —— 本 UI 启动的，进程句柄在我们手上
+          2. sessionId —— 注册表登记的，用 .stop 文件探活（见下）
+          3. pid —— 外部发现的注入器，命令行已验证含 noglass.js
 
-        强停**不带 /T**：目标应用虽由注入器 detached 启动，
+        **绝不 taskkill /T**：注入器启动的目标应用虽然 detached，
         但 Windows 进程表里仍记录父子关系，/T 会顺树把应用一起杀掉。
+
+        关于第 2 条为什么用 cleanup_residual 而不是直接写停止文件：
+        直接写文件对**活着的**注入器有效（它 1 秒内消费），但对**已死的**
+        注入器完全无效 —— 没人消费那个文件，注册项永远留着，表现就是
+        "点多少次都停不掉"（硬关机残留）。cleanup_residual 用文件本身
+        探活，两种情况下都能给出确定结果，且不对任何 pid 发 kill
+        （那个 pid 可能已被复用给无关进程）。
         """
         try:
             if local_id:
                 return RUNNER.stop_session(local_id)
 
             if session_id:
-                okr, err = sessions.request_stop(session_id)
-                if not okr:
-                    return {"ok": False, "error": err}
-                return {"ok": True, "graceful": True}
+                result, msg = sessions.cleanup_residual(session_id)
+                if result == "missing":
+                    return {"ok": False, "error": msg}
+                if result == "error":
+                    return {"ok": False, "error": msg}
+                return {"ok": True, "graceful": (result == "stopped"),
+                        "residual": (result == "cleaned"), "message": msg}
 
             if pid:
                 # 外部注入器：先看它是否其实有登记项（可能只是注册表被清了）
                 try:
                     for r in sessions.list_registered(force=True):
                         if str(r.get("pid")) == str(pid):
-                            okr, err = sessions.request_stop(r.get("id"))
-                            if okr:
-                                return {"ok": True, "graceful": True}
+                            result, msg = sessions.cleanup_residual(r.get("id"))
+                            if result in ("stopped", "cleaned"):
+                                return {"ok": True, "graceful": (result == "stopped"),
+                                        "residual": (result == "cleaned"), "message": msg}
                             break
                 except Exception:                        # noqa: BLE001
                     pass
+                # 走到这里说明它没有可用登记项。这个 pid 是**外部发现**来的，
+                # 而外部发现要求命令行含 noglass.js —— 身份已验证，可以强停。
                 okk, err = sessions.force_kill(pid)
                 if not okk:
                     return {"ok": False, "error": err}
                 return {"ok": True, "graceful": False,
-                        "note": "这是外部发现的旧版注入器，已按 pid 结束。目标应用未受影响。"}
+                        "note": "这是外部发现的注入器（命令行已验证），已按 pid 结束。目标应用未受影响。"}
 
             return {"ok": False, "error": "需要 localId / sessionId / pid 之一"}
         except Exception as e:                           # noqa: BLE001

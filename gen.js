@@ -519,6 +519,7 @@ function cmdList(args) {
 function collectSessionData() {
   const all = sessions.listAll();
   const dead = all.filter((s) => s.alive === false);
+  const residual = all.filter((s) => s.zombie === true);
   return {
     sessions: all.map((s) => ({
       id: s.id || null,
@@ -541,11 +542,14 @@ function collectSessionData() {
       darkreader: s.darkreader || null,
       darkreaderTheme: s.darkreaderTheme || null,
       alive: s.alive !== false,
+      // 残留：pid 还在但心跳早停了（硬关机留下的）。不算运行中。
+      zombie: s.zombie === true,
       external: !!s.external,
       logFile: s.__logFile || null,
       commandLine: s.commandLine || null,
     })),
     dead,
+    residual,
     registered: all.filter((s) => !s.external).length,
     external: all.filter((s) => s.external).length,
   };
@@ -555,41 +559,63 @@ function cmdPs(args) {
   const data = collectSessionData();
   if (args.flags.json === true) { say(JSON.stringify(data, null, 2)); return; }
 
-  const live = data.sessions.filter((s) => s.alive);
-  if (!live.length) {
+  // 残留项（pid 还在但心跳早停）不算运行中，单独列出 —— 否则它们看起来
+  // 像活会话，而"停止"对它们无效（停不掉的标签就是这么来的）。
+  const live = data.sessions.filter((s) => s.alive && !s.zombie);
+  const residual = data.sessions.filter((s) => s.zombie);
+
+  if (!live.length && !residual.length) {
     say('当前没有运行中的注入会话。');
     say(dim('  启动一个：node injector/noglass.js --profile profiles/<name>.json --launch --watch'));
     return;
   }
 
-  say(`${C.b}注入会话${C.x} ${dim(`(${live.length} 个运行中 · ${data.registered} 已登记 · ${data.external} 外部发现)`)}`);
-  say();
-  for (const s of live) {
-    const name = s.displayName || s.appName || s.profile || '(未知)';
-    const tags = [];
-    if (s.external) tags.push(`${C.y}外部${C.x}`);
-    else tags.push(`${C.g}已登记${C.x}`);
-    if (s.watch) tags.push('watch');
-    if (s.isolate) tags.push('isolate');
-    if (s.native) tags.push('native');
+  if (live.length) {
+    say(`${C.b}注入会话${C.x} ${dim(`(${live.length} 个运行中 · ${data.registered} 已登记 · ${data.external} 外部发现)`)}`);
+    say();
+    for (const s of live) {
+      const name = s.displayName || s.appName || s.profile || '(未知)';
+      const tags = [];
+      if (s.external) tags.push(`${C.y}外部${C.x}`);
+      else tags.push(`${C.g}已登记${C.x}`);
+      if (s.watch) tags.push('watch');
+      if (s.isolate) tags.push('isolate');
+      if (s.native) tags.push('native');
 
-    say(`  ${C.b}${name}${C.x}  ${dim(tags.join(' '))}`);
-    say(`    pid ${s.pid}  端口 ${s.port == null ? '?' : s.port}  ${s.source ? `来源 ${s.source}` : ''}`);
-    if (s.startedAt) say(dim(`    启动于 ${s.startedAt}`));
-    if (s.pages != null) say(dim(`    页面 ${s.pages}`));
-    if (s.cssExtra) say(dim(`    自定义 CSS ${s.cssExtra}`));
-    if (s.emulateColorScheme) say(dim(`    配色模拟 ${s.emulateColorScheme}`));
-    if (s.darkreader) {
-      const eng = (s.darkreaderTheme && s.darkreaderTheme.engine) || 'dynamicTheme';
-      say(dim(`    Dark Reader ${s.darkreader}（引擎 ${eng}）`));
+      say(`  ${C.b}${name}${C.x}  ${dim(tags.join(' '))}`);
+      say(`    pid ${s.pid}  端口 ${s.port == null ? '?' : s.port}  ${s.source ? `来源 ${s.source}` : ''}`);
+      if (s.startedAt) say(dim(`    启动于 ${s.startedAt}`));
+      if (s.pages != null) say(dim(`    页面 ${s.pages}`));
+      if (s.cssExtra) say(dim(`    自定义 CSS ${s.cssExtra}`));
+      if (s.emulateColorScheme) say(dim(`    配色模拟 ${s.emulateColorScheme}`));
+      if (s.darkreader) {
+        const eng = (s.darkreaderTheme && s.darkreaderTheme.engine) || 'dynamicTheme';
+        say(dim(`    Dark Reader ${s.darkreader}（引擎 ${eng}）`));
+      }
+      if (s.id) say(dim(`    id ${s.id}`));
+      else say(dim(`    无 id —— 这是旧版本启动的注入器，无法用 stop 优雅停止`));
+      say();
     }
-    if (s.id) say(dim(`    id ${s.id}`));
-    else say(dim(`    无 id —— 这是旧版本启动的注入器，无法用 stop 优雅停止`));
+  }
+
+  if (residual.length) {
+    say(`${C.y}${residual.length} 个残留会话${C.x} ${dim('（pid 还在但心跳已停 —— 通常是硬关机留下的；对它们「停止」只会清理残留项）')}`);
+    say();
+    for (const s of residual) {
+      const name = s.displayName || s.appName || s.profile || '(未知)';
+      say(`  ${C.y}${name}${C.x}  ${dim(`pid ${s.pid}`)}`);
+      if (s.id) say(dim(`    id ${s.id}`));
+      if (s.lastTick) say(dim(`    最后心跳 ${s.lastTick}`));
+    }
+    say();
+    say(dim(`  清理：${C.c}node gen.js prune${C.x}`));
     say();
   }
 
   if (data.dead.length) {
-    say(`${C.y}${data.dead.length} 个注册项对应的进程已不存在${C.x}（运行 ${C.c}node gen.js ps --prune${C.x} 清理）`);
+    // 注意：真正能清的是独立的 `prune` 子命令。以前这里写的是
+    // "ps --prune"，而 cmdPs 根本不处理那个 flag —— 照着敲什么都不会发生。
+    say(`${C.y}${data.dead.length} 个注册项对应的进程已不存在${C.x}（运行 ${C.c}node gen.js prune${C.x} 清理）`);
     say();
   }
 }
