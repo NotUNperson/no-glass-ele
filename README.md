@@ -61,6 +61,18 @@ node gen.js env      # 任何时候都能用它自检环境
 > 付出 86MB 和一套构建流程，不划算。UI 侧还得再打一个 PyInstaller 包。
 > 而且 PowerShell 无法打包（好在系统自带）。所以选择「零依赖源码 + 自检脚本」。
 
+### 只想用命令行？
+
+**不用装 Python** —— 命令行的所有功能只需要 Node + Windows 自带的 PowerShell。
+
+- 快速上手 → 下面「快速开始」一节
+- 完整对照（含「不想装 Python 时开机自启怎么办」的三种办法、常见问题、
+  与图形界面的能力对照）→ **[CLI.md](CLI.md)**
+
+> 图形界面（`ui/ui.cmd`）是可选的，它才需要 Python 3 + pywebview。
+> 唯一需要绕一下的是「开机自启」：`gen.js autostart` 依赖 pythonw，
+> 纯 CLI 可用任务计划程序替代（`CLI.md` 第六节有步骤）。
+
 ---
 
 ## 快速开始
