@@ -3,7 +3,7 @@
 """
 diag-session-zombie.py —— 复现「硬关机后的僵尸会话标签」
 
-背景（详见 docs/TODO-未修问题.md 第 4 条）
+背景（对应 README「后台会话管理 → 残留会话」一节）
 ────────────────────────────────────────
 硬关机时 Windows 不向进程派发信号，注入器的 cleanup() 不会跑，于是
 run/sessions/<profile>-<pid>.json 残留在磁盘上。而存活判断只看
