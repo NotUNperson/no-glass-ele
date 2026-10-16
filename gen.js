@@ -1263,6 +1263,30 @@ function cmdEnv(args) {
     missing.length ? `缺少：${missing.join('、')}` : '完整',
     missing.length ? '文件不齐 —— 重新完整 clone 或解压一次。' : null);
 
+  // 5b) 模块能否真正加载（`node --check` 查不出的那类错）
+  //
+  // 为什么单独检这一项：`node --check` 只验语法，**不验标识符是否存在**。
+  // 实测踩过：删掉一个函数却漏了 module.exports 里的引用 —— 语法完全合法，
+  // --check 通过、doctor 全绿，但注入器一启动就 ReferenceError 崩掉。
+  // 唯一可靠的静态手段是**真正 require 一次**（模块顶层会立刻执行到
+  // module.exports 那行，未定义的引用当场抛错）。
+  const modErrs = [];
+  for (const rel of [
+    'injector/noglass.js', 'lib/probe.js', 'lib/render.js',
+    'lib/sessions.js', 'lib/autostart.js',
+  ]) {
+    const abs = path.join(ROOT, rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      require(abs);
+    } catch (e) {
+      modErrs.push(`${rel}: ${String(e.message).split('\n')[0]}`);
+    }
+  }
+  add('modules', '模块可加载', true, modErrs.length === 0,
+    modErrs.length ? modErrs.join('；') : '全部可 require',
+    modErrs.length ? '模块里有未定义的引用（语法检查查不出的那类）—— 见上面报错。' : null);
+
   // 6) Dark Reader 引擎（可选，深色功能用）
   const drPath = path.join(ROOT, 'vendor', 'darkreader.js');
   const drOk = fs.existsSync(drPath);

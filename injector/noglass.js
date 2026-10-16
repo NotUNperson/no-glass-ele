@@ -1311,7 +1311,6 @@ module.exports = {
   composeCss,
   buildInjectScript,
   buildVerifyScript,
-  pickIsolatePort,
   SessionRegistry,
   RUN_DIR,
   SESS_DIR,
