@@ -99,6 +99,20 @@
           停止只会结束注入器 —— 目标应用是用 detached 方式启动的，
           <strong>不会被关掉</strong>。
         </p>
+
+        <!-- 应用自己的启动参数（探测到才显示）-->
+        <div id="appArgsCard" class="hidden"
+             style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line-soft)">
+          <div class="dim tiny" style="margin-bottom:4px">
+            应用<strong>自己</strong>的启动命令行里带了参数 —— 不加它，注入器启动时应用会弹窗
+          </div>
+          <div id="appArgsSrc" class="dim tiny" style="font-family:var(--mono);margin-bottom:6px"></div>
+          <div class="row">
+            <button class="btn small" id="btnAdoptArgs">填入上方参数框</button>
+            <span class="dim tiny" id="appArgsStatus"></span>
+          </div>
+        </div>
+
         <div class="presets" id="dPresets"></div>
       </div>
 

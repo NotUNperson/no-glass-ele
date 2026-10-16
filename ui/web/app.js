@@ -21,6 +21,7 @@ let STATE = {
   data: null,          // 当前 profile 的完整数据
   dirty: false,
   taskRunning: false,
+  appAutostartArgs: [],   // 应用自己自启动命令行里的私有参数（探测得到）
   sessions: [],        // 运行中的注入会话
   activeSession: null, // 当前查看日志的会话 key（localId 或 id）
   // 每会话一份日志缓冲：key -> { lines, cursor }
@@ -228,7 +229,15 @@ function renderDetail(keepScroll = false) {
 
   // 徽章
   const badges = [];
-  if (d.electron) badges.push(`<span class="badge">Electron ${esc(d.electron)}</span>`);
+  // 运行时徽章放最前 —— 它决定"怎么开调试端口"，是最基础的信息
+  const rt = p.runtime || d.runtime || 'electron';
+  if (rt === 'tauri') {
+    badges.push(`<span class="badge">Tauri${d.tauri && d.tauri.version ? ' ' + esc(d.tauri.version) : ''}</span>`);
+  } else if (rt === 'electron') {
+    if (d.electron) badges.push(`<span class="badge">Electron ${esc(d.electron)}</span>`);
+  } else {
+    badges.push('<span class="badge warn">运行时未识别</span>');
+  }
   badges.push(`<span class="badge ${d.canUseNative === false ? 'warn' : 'ok'}">native ${d.canUseNative === false ? '不可用' : '可用'}</span>`);
   if (d.hasPageGlass === true) badges.push('<span class="badge ok">页面玻璃 ✓</span>');
   else if (d.hasPageGlass === false) badges.push('<span class="badge">未发现玻璃</span>');
@@ -240,7 +249,9 @@ function renderDetail(keepScroll = false) {
   $('dBadges').innerHTML = badges.join('');
 
   // 事实
+  const rtName = rt === 'tauri' ? 'Tauri / WebView2' : (rt === 'electron' ? 'Electron' : '未识别');
   const facts = [
+    ['运行时', rtName, rt === 'unknown' ? 'no' : 'yes'],
     ['exe', p.exe ? (meta.exeExists ? '存在' : '不存在') : '未设置', p.exe ? (meta.exeExists ? 'yes' : 'no') : 'unk'],
     ['进程名', p.processName || '—', ''],
     ['CDP 端口', p.defaultPort != null ? p.defaultPort : '—', ''],
@@ -248,7 +259,7 @@ function renderDetail(keepScroll = false) {
     ['窗口层玻璃', yn(d.windowLayerGlass), d.windowLayerGlass === true ? 'yes' : 'unk'],
     ['单实例锁', yn(d.singleInstance), d.singleInstance === true ? 'yes' : 'unk'],
     ['userData 被覆盖', yn(d.userDataOverride), d.userDataOverride === true ? 'yes' : 'unk'],
-    ['--native', d.canUseNative === false ? '不可用' : '可用', d.canUseNative === false ? 'no' : 'yes'],
+    ['--native', d.canUseNative === false ? (rt === 'tauri' ? '不适用（Tauri）' : '不可用') : '可用', d.canUseNative === false ? 'no' : 'yes'],
     ['探测日期', d.probedAt || '—', ''],
   ];
   $('dFacts').innerHTML = facts.map(([k, v, cls]) => `
@@ -286,8 +297,48 @@ function renderDetail(keepScroll = false) {
 
   renderForm(p);
   loadDarkreader();
+  loadAppAutostart();
 
   if (keepScroll) $('.pane-detail').scrollTop = scrollTop;
+}
+
+/**
+ * 显示「应用自己的启动参数」并支持一键填入。
+ *
+ * 为什么需要：应用自己启动时带 `--hidden` 这类后台标志，我们启动时没带
+ * → 本该静默到托盘的应用会弹窗。这个卡片把探测到的参数摆出来，
+ * 一键填进上方的 appArgs 输入框（再点启动就生效）。
+ */
+async function loadAppAutostart() {
+  const card = $('appArgsCard');
+  if (!card) return;
+  card.classList.add('hidden');
+  $('appArgsStatus').textContent = '';
+  if (!STATE.current) return;
+
+  const res = await api().get_app_autostart(STATE.current);
+  if (!res || res.ok === false || !res.args || !res.args.length) return;
+
+  STATE.appAutostartArgs = res.args;
+  $('appArgsSrc').textContent = res.hits.map((h) => `${h.where}: ${h.commandLine}`).join('  |  ');
+  card.classList.remove('hidden');
+
+  // 已经在 appArgs 里了就不提示
+  const cur = ($('optAppArgs').value || '').trim();
+  if (res.args.every((a) => cur.includes(a))) {
+    $('appArgsStatus').textContent = '已填入';
+  }
+}
+
+/** 把探测到的应用私有参数填进启动参数框。 */
+function adoptAppArgs() {
+  const args = STATE.appAutostartArgs || [];
+  if (!args.length) return;
+  const cur = ($('optAppArgs').value || '').trim();
+  const merged = [...new Set([...cur.split(/\s+/).filter(Boolean), ...args])];
+  $('optAppArgs').value = merged.join(' ');
+  $('appArgsStatus').textContent = '已填入（点「启动」生效）';
+  toast(`已填入 ${args.join(' ')} —— 这样注入器启动时应用不会弹窗`, 'ok', 5000);
 }
 
 // ─────────────────────────── 表单 ───────────────────────────
@@ -1242,6 +1293,7 @@ function bindUI() {
     setTimeout(refresh, 1500);
   };
   $('btnLaunch').onclick = launchInjector;
+  $('btnAdoptArgs').onclick = adoptAppArgs;
   $('btnStop').onclick = stopTask;
   $('btnSave').onclick = saveProfile;
   $('btnBuild').onclick = buildProfile;

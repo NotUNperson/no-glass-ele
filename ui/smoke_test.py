@@ -55,7 +55,21 @@ def run():
     win = webview.create_window("smoke", url, js_api=api, width=1000, height=700)
 
     def driver():
-        time.sleep(6)  # 等页面加载 + app.js 初始化
+        # 等页面加载 + app.js 初始化。
+        #
+        # 不用固定 sleep：首屏要等 get_overview 跑完（它内部会调 node 的
+        # list + doctor，本机实测约 4 秒）。固定 6 秒在机器忙时会不够，
+        # 于是"profile 列表已渲染"偶发失败 —— 那是测试的时序问题，
+        # 不是产品缺陷。这里改成轮询真实条件（最多 25 秒）。
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                if win.evaluate_js("document.querySelectorAll('#profileList .item').length") > 0:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.4)
+        time.sleep(0.5)   # 让渲染收尾
         try:
             # 1) 页面标题（证明 HTML 被解析）
             title = win.evaluate_js("document.title")
@@ -327,6 +341,12 @@ def run():
                 STATE.taskRunning = false;
                 STATE.sessions = [{ key: 'sess:B', profile: 'B', running: true, localId: 'b#1' }];
 
+                // 把 stopSession 内部会间接调到的接口也挡住 ——
+                // 否则 updateTaskUI 会去调真实的 get_overview（约 4 秒），
+                // 而测试的等待窗口只有 3 秒 → 断言拿不到结果。
+                fake.get_task_status = () => Promise.resolve({ ok: true, task: {} });
+                fake.get_overview = () => Promise.resolve({ ok: true, sessions: STATE.sessions });
+
                 (async () => {
                   await stopTask();
                   window.pywebview.api = realApi;
@@ -339,7 +359,7 @@ def run():
                 return true;
               })()
             """)
-            for _ in range(30):
+            for _ in range(60):
                 if win.evaluate_js("window.__smokeStop"):
                     break
                 time.sleep(0.1)
@@ -374,6 +394,10 @@ def run():
                   { key: 'sess:B', profile: 'B', running: true, localId: 'b#1' },
                 ];
 
+                // 同上：挡住 updateTaskUI 会调到的真实接口，保证测试隔离且快
+                fake.get_task_status = () => Promise.resolve({ ok: true, task: {} });
+                fake.get_overview = () => Promise.resolve({ ok: true, sessions: STATE.sessions });
+
                 (async () => {
                   await stopTask();
                   window.pywebview.api = realApi;
@@ -387,7 +411,7 @@ def run():
                 return true;
               })()
             """)
-            for _ in range(30):
+            for _ in range(60):
                 if win.evaluate_js("window.__smokeStop2"):
                     break
                 time.sleep(0.1)

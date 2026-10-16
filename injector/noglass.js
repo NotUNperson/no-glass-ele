@@ -209,6 +209,8 @@ function parseArgs(argv) {
     darkreader: null,
     // Dark Reader 的主题参数（引擎、亮度、对比度…），见 resolveConfig。
     darkreaderTheme: null,
+    // 运行时覆盖（electron / tauri）。一般不用手填 —— probe 会写进 profile。
+    runtime: null,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i], next = () => argv[++i];
@@ -238,6 +240,7 @@ function parseArgs(argv) {
         break;
       }
       case '--source': o.source = next(); break;
+      case '--runtime': o.runtime = next(); break;
       case '-q': case '--quiet': o.quiet = true; break;
       case '-h': case '--help': printHelp(); process.exit(0); break;
       default:
@@ -293,6 +296,13 @@ function resolveConfig(opts) {
     // Dark Reader 的引擎与参数。engine 默认锁 dynamicTheme —— 这是效果最好的
     // 那种；filter 类引擎会把彩色图标/标签一起反掉（"颜色丢失"的来源）。
     darkreaderTheme: opts.darkreaderTheme || prof.darkreaderTheme || null,
+    // 运行时：决定"怎么开调试端口"。Electron 用命令行开关，
+    // Tauri/WebView2 用环境变量 —— 两者完全不同，传错端口不会开。
+    // 优先显式配置，其次看探测结果，最后按 Electron 兜底。
+    runtime: opts.runtime
+      || prof.runtime
+      || (prof.detected && prof.detected.runtime)
+      || 'electron',
     source: opts.source || 'cli',
     profileName: profName,
   };
@@ -381,6 +391,11 @@ noglass —— 给 Electron 应用注入「去毛玻璃」样式（通用版）
                     Dark Reader 的引擎（默认 dynamicTheme，效果最好）：
                     dynamicTheme / staticTheme / cssFilter / svgFilter
                     后两者是整页反色，会把彩色图标和标签一起反掉。
+  --runtime <electron|tauri>
+                    目标应用的运行时。决定"怎么开调试端口"：
+                    electron 用命令行 --remote-debugging-port；
+                    tauri/WebView2 用环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS。
+                    一般不用手填 —— probe 会探测并写进 profile。
   --app-arg=<flag>  传给**目标应用**的额外参数（可重复）。
                     用于 Chromium 渲染开关，如 --disable-lcd-text（强制灰度抗锯齿）、
                     --font-render-hinting=none。
@@ -897,8 +912,28 @@ async function main() {
       await sleep(2500);
     }
 
-    const args = [`--remote-debugging-port=${cfg.port}`, `--inspect=${cfg.inspectPort}`];
+    const args = [];
     const env = { ...process.env };
+
+    // ── 按运行时决定"怎么开调试端口" ──
+    //
+    // Electron：命令行开关 --remote-debugging-port（Chromium 在启动时读）
+    // Tauri/WebView2：**环境变量** WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+    //   （已实测：设它之后 /json/version 能连上，Browser 是 Edg/147）
+    // 两者机制完全不同，传错了端口不会开。
+    const isTauri = cfg.runtime === 'tauri';
+    if (isTauri) {
+      const dbg = `--remote-debugging-port=${cfg.port}`;
+      // 这个变量可能已存在（用户或别的工具设的），追加而不是覆盖
+      const prev = env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
+      env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = prev ? `${prev} ${dbg}` : dbg;
+      log(`Tauri/WebView2 启动方式：环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="${dbg}"`);
+      log('  （Tauri 没有主进程 JS，不传 --inspect）');
+    } else {
+      args.push(`--remote-debugging-port=${cfg.port}`);
+      args.push(`--inspect=${cfg.inspectPort}`);
+    }
+
     if (cfg.isolate) {
       // 应用若在代码里覆盖了 userData，Electron 的默认目录就不生效，
       // 而单实例锁绑在 userData 上 —— 需要应用私有的开关让它退回默认值。
@@ -908,9 +943,16 @@ async function main() {
       } else if (cfg.profile.detected && cfg.profile.detected.userDataOverride) {
         warn('此应用覆盖了 userData，但 profile 未声明 isolateEnv —— 隔离可能不生效。');
       }
-      args.push(`--user-data-dir=${cfg.dataDir}`);
+      if (isTauri) {
+        // WebView2 的数据目录走它自己的环境变量（实测有效）
+        env.WEBVIEW2_USER_DATA_FOLDER = cfg.dataDir;
+        log(`隔离数据目录（WebView2）：${cfg.dataDir}`);
+      } else {
+        args.push(`--user-data-dir=${cfg.dataDir}`);
+      }
     } else if (cfg.dataDir) {
       if (cfg.dataDirEnv) env[cfg.dataDirEnv] = cfg.dataDir;
+      else if (isTauri) env.WEBVIEW2_USER_DATA_FOLDER = cfg.dataDir;
       else args.push(`--user-data-dir=${cfg.dataDir}`);
     }
 
@@ -1020,6 +1062,18 @@ async function main() {
   // 4) 窗口侧设置（--native）
   async function applyNative() {
     if (!cfg.native) return;
+    // Tauri 的主进程是 Rust，没有 JS 可调 —— fixNativeWindow 走的是
+    // CDP 里 Runtime.evaluate 调 Electron API，对 Tauri 根本无从下手。
+    // 早点说清楚，别让它去连一个不存在的 --inspect 端口再报一堆错。
+    if (cfg.runtime === 'tauri') {
+      if (!nativeLogged) {
+        warn('--native 不适用于 Tauri 应用：主进程是 Rust，没有 JS 可调。');
+        warn('窗口层材质（亚克力/模糊）在 Rust 侧建窗时设定，CDP 够不到。');
+        warn('要关掉它：系统设置 → 辅助功能 → 视觉效果 → 透明效果（对所有应用生效）。');
+        nativeLogged = true;
+      }
+      return;
+    }
     try {
       const r = await fixNativeWindow(cfg);
       if (r.ok && !nativeLogged) {

@@ -1055,6 +1055,44 @@ class Api:
         cur = RUNNER._task_log.clear()                   # noqa: SLF001
         return {"ok": True, "cursor": cur}
 
+    # ── 应用自己的启动参数 ──
+    def get_app_autostart(self, name):
+        """
+        读该 profile 对应应用**自己**的自启动命令行（含私有启动参数）。
+
+        用途：应用自己启动时带 `--hidden` 这类"后台启动"标志，我们启动时
+        没带 → 本该静默到托盘的应用会弹窗。前端拿这个结果提示用户
+        「要不要把这个参数填进 appArgs」。
+
+        实现：调 node 侧（那边已有 lib/autostart.js 的 .lnk + 注册表读取），
+        不为它再写一套 Python 镜像 —— 那正是本项目反复踩的坑
+        （两侧存活判定机制不一致那次）。
+        """
+        try:
+            prof = read_profile(name)
+            exe = prof.get("exe")
+            if not exe:
+                return {"ok": True, "hits": [], "args": []}
+            script = (
+                "const a=require('./lib/autostart');"
+                "const path=require('path');"
+                f"const hits=a.findAppAutostart({json.dumps(exe)}, {json.dumps(prof.get('processName') or '')});"
+                "const args=[...new Set(hits.flatMap(h=>h.args||[]))];"
+                "process.stdout.write(JSON.stringify({hits,args}));"
+            )
+            r = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if r.returncode != 0:
+                return {"ok": False, "error": (r.stderr or "读取失败")[:300], "hits": [], "args": []}
+            data = json.loads(r.stdout or "{}")
+            return {"ok": True, "hits": data.get("hits", []), "args": data.get("args", [])}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e), "hits": [], "args": []}
+
     # ── 自定义 CSS ──
     def get_custom_css(self, name):
         """

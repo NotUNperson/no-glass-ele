@@ -96,7 +96,10 @@ function toDetected(pr) {
   const c = probe.conclusions(pr);
   const d = {
     probedAt: new Date().toISOString().slice(0, 10),
+    // 运行时：决定"怎么开调试端口"（Electron 命令行 / Tauri 环境变量）
+    runtime: pr.runtime || 'unknown',
     electron: pr.electron || null,
+    tauri: pr.tauri || null,
     fuses: pr.fuses
       ? { version: pr.fuses.version, count: pr.fuses.count, table: pr.fuses.table, hardened: pr.fuses.hardened }
       : null,
@@ -110,6 +113,17 @@ function toDetected(pr) {
     prefersColorScheme: c.prefersColorScheme === undefined ? null : c.prefersColorScheme,
   };
   if (pr.deep && pr.deep.markers) d.markers = pr.deep.markers;
+  // Tauri：前端玻璃证据（分栏，不下结论）
+  if (pr.deep && pr.deep.kind === 'tauri') {
+    d.frontend = {
+      scannedDirs: pr.deep.scannedDirs,
+      files: pr.deep.frontendFiles,
+      glassCssHits: pr.deep.glass.cssHits,
+      glassCssFiles: pr.deep.glass.cssFiles.map((f) => f.file),
+      glassJsHits: pr.deep.glass.jsHits,
+      glassJsFiles: pr.deep.glass.jsFiles.map((f) => f.file),
+    };
+  }
   return d;
 }
 
@@ -131,7 +145,7 @@ function cmdProbe(args) {
   const asJson = args.flags.json === true;
   if (!asJson) {
     say(`${C.b}探测${C.x} ${abs}`);
-    if (deep) say(dim('  （--deep：额外扫描 resources/app.asar 找行为标记）'));
+    if (deep) say(dim('  （--deep：Electron 扫 asar 找行为标记；Tauri 扫前端资源找玻璃证据）'));
     say();
   }
 
@@ -146,6 +160,14 @@ function cmdProbe(args) {
 
   const c = probe.conclusions(pr);
 
+  // 应用**自己**的自启动项（含它的启动参数）。
+  // 用途：把 `--hidden` 这类"后台启动"标志建议进 appArgs —— 不补它，
+  // 注入器启动时本该静默到托盘的应用会弹窗（用户实际报过这个问题）。
+  let appAutostartInfo = [];
+  try {
+    appAutostartInfo = autostart.findAppAutostart(abs, path.basename(abs, '.exe'));
+  } catch { /* 读不到不阻塞探测 */ }
+
   // JSON 模式：一次给出全部结论，供 UI 使用
   if (asJson) {
     const suggested = {
@@ -156,19 +178,40 @@ function cmdProbe(args) {
     };
     say(JSON.stringify({
       ok: true, exe: abs, elapsedMs: ms,
-      electron: pr.electron, size: pr.size,
+      runtime: pr.runtime, electron: pr.electron, tauri: pr.tauri, size: pr.size,
       fuses: pr.fuses, conclusions: c, warnings: pr.warnings,
-      deep: pr.deep ? { asar: pr.deep.asar, asarName: pr.deep.asarName, asarSize: pr.deep.asarSize, markers: pr.deep.markers } : null,
+      deep: pr.deep ? {
+        asar: pr.deep.asar, asarName: pr.deep.asarName, asarSize: pr.deep.asarSize,
+        markers: pr.deep.markers,
+        // Tauri：前端玻璃证据（css/js 分栏）
+        kind: pr.deep.kind, glass: pr.deep.glass, frontendFiles: pr.deep.frontendFiles,
+        scannedDirs: pr.deep.scannedDirs,
+      } : null,
       detected: toDetected(pr),
       suggested,
+      appAutostart: appAutostartInfo,
     }, null, 2));
     return;
   }
 
   say(`${C.b}文件${C.x}`);
-  say(`  Electron      ${pr.electron || dim('(未识别)')}`);
+  if (pr.runtime === 'tauri') {
+    say(`  运行时        ${C.g}Tauri${C.x} ${dim('（WebView2 渲染）')}`);
+    if (pr.tauri && pr.tauri.version) {
+      say(`  Tauri 版本    ${pr.tauri.version}${pr.tauri.wryVersion ? dim(`  (wry ${pr.tauri.wryVersion})`) : ''}`);
+    }
+  } else if (pr.runtime === 'electron') {
+    say(`  运行时        ${C.g}Electron${C.x} ${pr.electron ? dim(pr.electron) : dim('(版本未识别)')}`);
+  } else {
+    say(`  运行时        ${C.y}未识别${C.x} ${dim('（既没有 Electron fuse，也没有 Tauri 标记）')}`);
+  }
   say(`  大小          ${(pr.size / 1024 / 1024).toFixed(1)} MB`);
   say();
+
+  if (pr.fuseNote) {
+    say(dim(`  ${pr.fuseNote}`));
+    say();
+  }
 
   if (pr.fuses) {
     say(`${C.b}fuse 表${C.x} ${dim(`(${pr.fuses.count} 项, 版本 ${pr.fuses.version}, 偏移 ${pr.fuses.offset})`)}`);
@@ -184,17 +227,21 @@ function cmdProbe(args) {
       say();
       say(`  ${C.dim}全部为 Electron 默认值，未加固。${C.x}`);
     }
-  } else {
+  } else if (pr.runtime !== 'tauri') {
     say(`${C.y}fuse${C.x}  ${dim('未找到哨兵')}`);
   }
   say();
 
   say(`${C.b}结论${C.x}`);
   say(`  CSS 注入（主战场）  ${C.g}可用${C.x} ${dim('— --remote-debugging-port 不受任何 fuse 影响')}`);
-  say(`  --native            ${c.canUseNative ? C.g + '可用' + C.x : C.r + '不可用' + C.x + dim(c.nativeBlockedBy ? ` — ${c.nativeBlockedBy} 已关闭` : '')}`);
+  if (pr.runtime === 'tauri') {
+    say(`  --native            ${C.dim}不适用${C.x} ${dim('— Tauri 主进程是 Rust，没有 JS 可调')}`);
+  } else {
+    say(`  --native            ${c.canUseNative ? C.g + '可用' + C.x : C.r + '不可用' + C.x + dim(c.nativeBlockedBy ? ` — ${c.nativeBlockedBy} 已关闭` : '')}`);
+  }
   if (c.windowLayerGlass) {
     say(`  窗口层玻璃          ${C.y}有${C.x} ${dim('— ' + c.windowLayerReasons.join('；'))}`);
-  } else if (pr.deep) {
+  } else if (pr.deep && pr.runtime !== 'tauri') {
     say(`  窗口层玻璃          ${C.dim}未发现${C.x}`);
   }
   if (pr.deep && pr.deep.markers) {
@@ -204,6 +251,36 @@ function cmdProbe(args) {
   }
   say();
 
+  // ── Tauri：前端玻璃证据（分栏，不下结论）──
+  if (pr.deep && pr.deep.kind === 'tauri') {
+    const g = pr.deep.glass;
+    say(`${C.b}前端玻璃证据${C.x} ${dim(`（扫了 ${pr.deep.frontendFiles} 个文件，目录：${pr.deep.scannedDirs.join(', ') || '仅 exe'}）`)}`);
+    say();
+    if (g.cssHits) {
+      say(`  ${C.g}.css 文件${C.x} ${dim('（大概率是真样式）')}  ${g.cssHits} 处`);
+      for (const f of g.cssFiles) {
+        say(`    ${f.file}  ${dim(`×${f.hits}`)}`);
+        for (const s of f.samples.slice(0, 2)) {
+          say(dim(`      …${s.snippet.slice(0, 110)}…`));
+        }
+      }
+    } else {
+      say(`  ${C.dim}.css 文件  无命中${C.x}`);
+    }
+    say();
+    if (g.jsHits) {
+      say(`  ${C.y}.js / exe${C.x} ${dim('（可能是误报，需看片段）')}  ${g.jsHits} 处`);
+      for (const f of g.jsFiles.slice(0, 5)) {
+        say(`    ${f.file}  ${dim(`×${f.hits}`)}`);
+      }
+      say();
+      say(dim(`  ⚠ ${g.caveat}`));
+    }
+    say();
+    say(dim('  这个扫描刻意不下结论 —— 请按上面的片段自己判断。'));
+    say();
+  }
+
   if (c.notes.length) {
     say(`${C.b}注意${C.x}`);
     for (const n of c.notes) say(`  · ${n}`);
@@ -212,6 +289,27 @@ function cmdProbe(args) {
   if (pr.warnings.length) {
     say(`${C.b}警告${C.x}`);
     for (const w of pr.warnings) wrn(w);
+    say();
+  }
+
+  // ── 应用自己的自启动参数 ──
+  // 这是「注入器启动时本该静默的应用却弹窗」的直接解法：
+  // 应用自己启动时会带私有标志（如 --hidden），我们启动时没带。
+  if (appAutostartInfo.length) {
+    const argsAll = [...new Set(appAutostartInfo.flatMap((h) => h.args || []))];
+    say(`${C.b}应用自己的启动方式${C.x}`);
+    for (const h of appAutostartInfo) {
+      say(`  ${dim(h.where)}  ${h.name}`);
+      say(`    ${h.commandLine}`);
+    }
+    say();
+    if (argsAll.length) {
+      say(`  ${C.g}发现私有启动参数：${C.x}${C.c}${argsAll.join(' ')}${C.x}`);
+      say(`  ${dim('建议填进 profile 的 appArgs —— 不加它，注入器启动时应用会弹窗（本该静默到托盘）。')}`);
+      say(`  ${dim(`也可以临时试：node injector/noglass.js --profile profiles/<name>.json --launch --watch --app-arg=${argsAll[0]}`)}`);
+    } else {
+      say(dim('  （命令行里没有私有参数，注入器启动时行为应与它自己启动一致）'));
+    }
     say();
   }
 
@@ -264,6 +362,7 @@ function cmdNew(args) {
     processName: path.basename(abs, '.exe'),
     styleId: `__noglass_${name.replace(/[^A-Za-z0-9_]/g, '_')}__`,
     defaultPort: port,
+    runtime: pr.runtime,          // electron / tauri —— 决定怎么开调试端口
     detected: toDetected(pr),
   };
 
@@ -274,6 +373,22 @@ function cmdNew(args) {
       '此应用覆盖了 userData 路径（见 detected.userDataOverride）。若需要 `--isolate`，' +
       '必须在 profile 的 isolateEnv 里填上该应用的私有开关，否则隔离不生效。';
   }
+  // 应用自己的自启动参数 → 建议补进 appArgs（否则静默启动的应用会弹窗）
+  try {
+    const appHits = autostart.findAppAutostart(abs, path.basename(abs, '.exe'));
+    const privateArgs = [...new Set(appHits.flatMap((h) => h.args || []))];
+    if (privateArgs.length) {
+      prof.appArgs = privateArgs;
+      prof.notes = prof.notes || {};
+      const lines = [
+        `探测到应用**自己**的自启动命令行里带了参数：\`${privateArgs.join(' ')}\``,
+        `已预填进 appArgs —— 不加它，注入器启动时应用会弹窗（本该静默到托盘）。`,
+        `来源：`,
+        ...appHits.map((h) => `  · ${h.where} → ${h.commandLine}`),
+      ];
+      prof.notes.extra = prof.notes.extra ? prof.notes.extra + '\n\n' + lines.join('\n') : lines.join('\n');
+    }
+  } catch { /* 探测失败不阻塞 */ }
   if (!c.canUseNative) {
     prof.notes = prof.notes || {};
     prof.notes.extra = (prof.notes.extra ? prof.notes.extra + '\n\n' : '') +
@@ -824,6 +939,62 @@ function collectDoctorData() {
   const profiles = [];
   let problemCount = 0;
 
+  // ── 自启动信息只读一次 ──
+  //
+  // 踩过的坑：最初把 findAppAutostart 直接放进下面的 per-profile 循环，
+  // 于是每个 profile 都要起两次 PowerShell（读 HKCU/HKLM Run 键 + 读启动
+  // 文件夹的 .lnk）。7 个 profile → doctor 从 2 秒变成 29 秒，UI 的
+  // get_overview 也跟着卡（它内部会调 doctor）。
+  //
+  // 现在预读一次、按 exe 建索引，循环里只做内存匹配。
+  // 这与 ui/sessions.py 文件头记的那条教训是同一个：昂贵的查询不能放热路径。
+  const autostartIndex = [];
+  try {
+    for (const hive of ['HKCU', 'HKLM']) {
+      for (const item of autostart.readRunKey(hive)) {
+        autostartIndex.push({
+          where: `${hive}\\...\\Run`,
+          name: item.name,
+          commandLine: item.value,
+          args: autostart.appPrivateArgs(extractArgsFromCommand(item.value)),
+        });
+      }
+    }
+    for (const sc of autostart.readStartupShortcuts()) {
+      if (sc.file.startsWith('no-glass · ')) continue;   // 本工具自己的不算
+      autostartIndex.push({
+        where: '启动文件夹',
+        name: sc.file,
+        target: sc.target,
+        commandLine: `${sc.target} ${sc.args}`.trim(),
+        args: autostart.appPrivateArgs(sc.args),
+      });
+    }
+  } catch { /* 读不到就当没有 */ }
+
+  /** 从一条命令行里剥出参数部分。 */
+  function extractArgsFromCommand(cmd) {
+    const v = String(cmd || '').trim();
+    if (!v) return '';
+    if (v.startsWith('"')) return v.slice(v.indexOf('"', 1) + 1).trim();
+    const m = v.match(/^\S+\s+(.*)$/);
+    return m ? m[1].trim() : '';
+  }
+
+  /** 在预读的索引里找某个 exe 自己的自启动项（纯内存，无外部调用）。 */
+  function lookupAutostart(exePath, processName) {
+    const base = processName || (exePath ? path.basename(exePath, '.exe') : null);
+    if (!base) return [];
+    const baseLower = base.toLowerCase();
+    const exeLower = exePath ? String(exePath).toLowerCase().replace(/\//g, '\\') : null;
+    return autostartIndex.filter((it) => {
+      const hay = `${it.name} ${it.commandLine} ${it.target || ''}`.toLowerCase().replace(/\//g, '\\');
+      if (hay.includes(baseLower)) return true;
+      if (exeLower && hay.includes(exeLower)) return true;
+      return false;
+    });
+  }
+
   for (const n of names) {
     let p;
     try { p = loadProfile(n); }
@@ -850,15 +1021,26 @@ function collectDoctorData() {
       if (port >= lo && port <= hi) issues.push(`defaultPort ${port} 落在自身 reservedPorts 范围 ${lo}-${hi} 内`);
     }
 
-    // fuse 与预设矛盾
+    // fuse 与预设矛盾（Tauri 没有 fuse，跳过）
+    const runtime = p.runtime || d.runtime || 'electron';
+    const isTauri = runtime === 'tauri';
     const fuses = d.fuses && d.fuses.table;
     const inspectOk = !fuses || fuses.EnableNodeCliInspectArguments === 'on';
-    if (!inspectOk && p.native && p.native.enabled === true) {
+    if (!isTauri && !inspectOk && p.native && p.native.enabled === true) {
       issues.push('fuse 禁用了 --inspect，但 profile 里 native.enabled=true（--native 必然失败）');
     }
+    // Tauri 上 --native 本来就不可能成功，开了就是配错了
+    if (isTauri && p.native && p.native.enabled === true) {
+      issues.push('Tauri 应用不支持 --native（主进程是 Rust，没有 JS 可调），请把 native.enabled 设为 false');
+    }
 
-    // 隔离声明与 userData 覆盖矛盾
-    if (d.userDataOverride === true && !p.isolateEnv) {
+    // runtime 值域
+    if (p.runtime != null && !['electron', 'tauri', 'unknown'].includes(p.runtime)) {
+      issues.push(`runtime 值非法："${p.runtime}"（只能是 electron / tauri / unknown）`);
+    }
+
+    // 隔离声明与 userData 覆盖矛盾（Tauri 走 WEBVIEW2_USER_DATA_FOLDER，不适用这条）
+    if (!isTauri && d.userDataOverride === true && !p.isolateEnv) {
       issues.push('detected.userDataOverride=true，但未声明 isolateEnv → --isolate 不会生效（不会生成 start-isolated.cmd）');
     }
 
@@ -867,7 +1049,29 @@ function collectDoctorData() {
       const age = (Date.now() - new Date(d.probedAt).getTime()) / 86400000;
       if (age > 180) issues.push(`探测结果已 ${Math.round(age)} 天，应用可能已更新，建议重跑 probe`);
     }
-    if (!d.fuses) issues.push('未探测到 fuse 表（可能是非 Electron 应用或裁剪构建）');
+    // 只有 Electron 才该有 fuse 表；Tauri 没有是正常的，不该报问题
+    if (!isTauri && !d.fuses) {
+      issues.push('未探测到 fuse 表（可能是非 Electron 应用或裁剪构建）');
+    }
+
+    // ── 后台启动标志缺失 ──
+    // 应用自己启动时带私有标志（如 Todo清单 的 --hidden），而我们启动时
+    // 没带 → 本该静默到托盘的应用会弹窗。这里对照应用自己的自启动命令行，
+    // 发现"它有、我们没配"就提醒。
+    if (p.exe && fs.existsSync(p.exe)) {
+      try {
+        const hits = lookupAutostart(p.exe, p.processName);
+        const priv = [...new Set(hits.flatMap((h) => h.args || []))];
+        const have = new Set(p.appArgs || []);
+        const missing = priv.filter((a) => !have.has(a));
+        if (missing.length) {
+          issues.push(
+            `应用自己的自启动命令行带参数 ${missing.join(' ')}，但 profile 的 appArgs 里没有 → ` +
+            `注入器启动时应用会弹窗（本该静默）。来源：${hits[0].where} ${hits[0].commandLine}`
+          );
+        }
+      } catch { /* 读不到不报错 */ }
+    }
 
     // ── Dark Reader 字段校验 ──
     // 这是 profile 里唯一有明确值域约束的字段组，之前没有校验：
