@@ -29,6 +29,52 @@
 
 ---
 
+## 目录
+
+**上手**
+
+- [安装](#安装) —— 需要什么、为什么不做成单个 exe
+- [快速开始](#快速开始) —— 四条命令跑通一个应用
+- [图形界面（可选）](#图形界面可选) —— 界面能做什么、四道护栏、性能设计
+
+**日常使用**
+
+- [命令](#命令) —— 全部 CLI 命令速查
+- [后台会话管理](#后台会话管理) —— 停止语义、自动收尾、**开机自启**
+- [自定义样式与深色模式](#自定义样式与深色模式) —— 从模拟到 Dark Reader 到手写
+
+**进阶**
+
+- [传给应用的启动参数](#传给应用的启动参数) —— Chromium 渲染开关
+- [生成的启动器预设](#生成的启动器预设) —— 四个 `.cmd` 分别在什么时候生成
+- [隔离是「数据隔离」，不是多开](#隔离是数据隔离不是多开)
+- [Tauri / WebView2 应用](#tauri--webview2-应用) —— 启动方式与 Electron 不同
+- [应用自己的启动参数](#应用自己的启动参数为什么注入器启动会弹窗) —— 为什么注入器启动会弹窗
+
+**参考**
+
+- [profile 字段](#profile-字段) —— 每个字段是什么意思
+- [注入内核参数](#注入内核参数)
+- [目录结构](#目录结构) —— 哪些内容不进版本库，为什么
+- [界面为什么不重新实现判断逻辑](#界面为什么不重新实现判断逻辑)
+- [共享内核 vs 自包含](#共享内核-vs-自包含)
+- [评估：这个应用能不能迁到 Rust + WebView](#评估这个应用能不能迁到-rust--webview)
+
+**设计说明**
+
+- [设计约束](#设计约束) —— 只读探测、绝不遍历文件系统
+- [为什么 fuse 拦不住这个工具](#为什么-fuse-拦不住这个工具)
+- [已知的坑](#已知的坑) —— asar 陷阱、`.cmd` 编码、单实例锁
+- [限制](#限制) —— 做不到什么，以及为什么
+- [为什么不用映像劫持](#为什么不用映像劫持)
+- [卸载](#卸载)
+- [依赖](#依赖)
+
+> 只想用命令行、不装 Python？见 **[CLI.md](CLI.md)** —— 含「不想装 Python 时
+> 开机自启怎么办」的三种办法与常见问题。
+
+---
+
 ## 安装
 
 ```bash
@@ -217,9 +263,14 @@ node gen.js doctor
 | `stop <id\|profile\|pid>` | 请求停止（优雅退出，**不关目标应用**）；`--force` 可强停外部注入器 |
 | `logs <id\|profile\|pid> [-n N]` | 查看某会话的日志 |
 | `prune [--logs]` | 清理残留注册项（进程已退出的 + 硬关机留下的僵尸项）。默认保留会话日志便于排障，`--logs` 一并删除 |
-| `autostart on\|off\|list [name]` | 管理开机自启动项（见下）|
+| `autostart on\|off <name>` | 让某个应用参与 / 不参与开机自启 |
+| `autostart list` | 看谁启用了、中转器在不在 |
+| `autostart run [--dry-run]` | 手动跑一次中转器（调试用）|
+| `autostart log [-n N]` | 看中转器日志 |
+| `autostart config [--set k=v]` | 看 / 改延迟与运行器设置 |
+| `autostart cleanup` | 删除中转器快捷方式（等价于直接删启动文件夹里那个 `.lnk`）|
 
-加 `--json` 可让 `probe` / `list` / `doctor` / `ps` 输出 JSON（供 UI 调用；人类可读输出不变）。
+加 `--json` 可让 `probe` / `list` / `doctor` / `ps` / `prune` 输出 JSON（供 UI 调用；人类可读输出不变）。
 
 ---
 
@@ -680,14 +731,16 @@ node tools/build-dark-css.js <profile名>
 | `tools/nav.js <port> <路由>` | 切视图（客户端跳转，不重载不登出）|
 | `tools/inspect-page.js <port>` | 读页面计算样式概览 |
 | `tools/verify-selectors.js <port>` | 用隐藏元素验证选择器命中 |
-| `tools/darkreader.js <port> <mode>` | 借 Dark Reader 引擎上深色（见上节）|
+| `tools/darkreader.js <port> <mode>` | 借 Dark Reader 引擎上深色（见 [自定义样式与深色模式](#自定义样式与深色模式)）|
 | `tools/assess-portability.js <asar>` | 评估迁到 Rust + WebView 的可行度 |
 
 > 上表里读 asar 的脚本都需要知道目标路径。给法有三种，优先级从高到低：
 > 命令行参数、`NOGLASS_ASAR` 环境变量、`local/tools-config.json` 的 `asar` 字段。
 > 三者都没有时会报错并说明怎么配（不会静默失败）。
 
-### 传给应用的启动参数
+---
+
+## 传给应用的启动参数
 
 有些效果靠 Chromium 的启动开关，例如强制灰度抗锯齿（配合 MacType）：
 
@@ -705,7 +758,7 @@ node injector/noglass.js --profile profiles/myapp.json --launch --watch \
 这些参数传给**目标应用**（Chromium 只在启动时读），不是给注入器的。
 未知的 `--xxx` 参数会自动当作应用参数处理，不会再让注入器崩掉。
 
-### 生成的启动器预设
+## 生成的启动器预设
 
 | 文件 | 参数 | 何时生成 |
 |---|---|---|
@@ -723,9 +776,9 @@ node injector/noglass.js --profile profiles/myapp.json --launch --watch \
 start.cmd --port 9500
 ```
 
-每个启动器第一件事是 `chcp 65001`（切到 UTF-8 代码页）—— 见下文「`.cmd` 编码坑」。
+每个启动器第一件事是 `chcp 65001`（切到 UTF-8 代码页）—— 见 [`.cmd` 编码坑](#cmd-编码坑)。
 
-### 隔离是「数据隔离」，不是多开
+## 隔离是「数据隔离」，不是多开
 
 `--isolate` 让本次启动使用**独立的数据目录**：产生的数据不写进你平时用的那一份。
 它适合"想试一下效果，但不想弄脏真实数据"的场景。
@@ -879,7 +932,7 @@ git bash 下对大目录做递归遍历在 Windows 上极耗 CPU（每个 stat �
 
 - exe 用**分块流式扫描**（8MB 一块），命中哨兵即停 —— 打包版 exe 常有 300MB+，不整个读进内存。
 - 只读**被点名的那个文件**。唯一的目录读取是 `readdirSync` 单个父目录：
-  - `resources/` 下有多个 asar 时挑最大的那个（见下文「asar 陷阱」）；
+  - `resources/` 下有多个 asar 时挑最大的那个（见 [asar 陷阱](#asar-陷阱)）；
   - `exeGlob` 版本化安装路径（如 `app-*\App.exe`）取最高版本。
 - **不递归、不扫盘、不依赖 Everything**。
 
@@ -1007,7 +1060,9 @@ no-glass-ele/
 所以 clone 下来后 `profiles/` 里只有 `_template.json`，`local/` 不存在 —— 这是**预期状态**。
 建第一个 profile：`node gen.js new myapp --exe "D:\path\to\App.exe"`。
 
-### 界面为什么不重新实现判断逻辑
+---
+
+## 界面为什么不重新实现判断逻辑
 
 profile 的状态（是否生成、是否过期、有什么问题）全部来自 `node gen.js --json`。
 
@@ -1017,7 +1072,7 @@ profile 的状态（是否生成、是否过期、有什么问题）全部来自
 同理，`gen.js list --json` 与终端上的 `gen.js list` 共用同一个数据采集函数，
 保证界面看到的与终端看到的一致。
 
-### 共享内核 vs 自包含
+## 共享内核 vs 自包含
 
 默认：`apps/<name>/start.cmd` 调用根目录的 `injector/noglass.js`，
 把 profile 路径传进去。**修 bug 只改内核一处，所有应用同时受益。**
@@ -1050,7 +1105,7 @@ node gen.js build myapp --bundle
 | `urlFilter` | 只注入匹配此正则的页面，放过第三方网页 |
 | `cssExtra` | 追加的 CSS 片段（默认自动找 `css/<name>.custom.css`）|
 | `emulateColorScheme` | `dark` / `light`，改「页面以为系统处于什么模式」|
-| `darkreader` | `auto` / `dark` / `light` / `off`，借 Dark Reader 上深色（见上一节）|
+| `darkreader` | `auto` / `dark` / `light` / `off`，借 Dark Reader 上深色（见 [自定义样式与深色模式](#自定义样式与深色模式)）|
 | `darkreaderTheme.engine` | 引擎选择，默认 `dynamicTheme`（效果最好）|
 | `darkreaderTheme.brightness` | 亮度，默认 100 |
 | `darkreaderTheme.contrast` | 对比度，默认 100 |
@@ -1167,7 +1222,7 @@ Electron 的 `--remote-debugging-port` 只能在启动时传入，所以注入�
 注入连不上 —— 这是 `--remote-debugging-port` 只能启动时传入决定的。
 
 想做到"透明地在每次启动时注入参数"，Windows 上只有**映像劫持（IFEO）**一条路。
-本工具**刻意不做**，理由见下节。
+本工具**刻意不做**，理由见 [为什么不用映像劫持](#为什么不用映像劫持)。
 
 ---
 

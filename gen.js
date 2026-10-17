@@ -1048,6 +1048,18 @@ function cmdAutostart(args) {
     return;
   }
 
+  // ── cleanup（删除中转器快捷方式）──
+  //
+  // 必须放在 `if (!name)` 之前 —— cleanup 不需要 profile 参数。
+  // 踩过：它原先在守卫之后，于是 `node gen.js autostart cleanup` 永远报
+  // "用法: ... cleanup <profile>"，而 README 里写的正是无参数用法。
+  if (action === 'cleanup') {
+    const r = autostart.removeRelayLnk();
+    if (!r.ok) { bad(r.error); process.exit(1); }
+    ok(r.already ? '中转器本来就不存在' : `已删除中转器：${r.lnk}`);
+    return;
+  }
+
   if (!name) {
     bad(`用法: node gen.js autostart ${action} <profile>`);
     process.exit(2);
@@ -1121,16 +1133,8 @@ function cmdAutostart(args) {
       say();
       say(dim('  现在没有任何 profile 启用自启动了。'));
       say(dim('  中转器快捷方式还留着（开机后会起来、发现没东西可启动、然后退出）。'));
-      say(dim('  想删掉它：node gen.js autostart off --cleanup'));
+      say(dim('  想删掉它：node gen.js autostart cleanup'));
     }
-    return;
-  }
-
-  // ── off --cleanup（删除中转器快捷方式）──
-  if (action === 'cleanup') {
-    const r = autostart.removeRelayLnk();
-    if (!r.ok) { bad(r.error); process.exit(1); }
-    ok(r.already ? '中转器本来就不存在' : `已删除中转器：${r.lnk}`);
     return;
   }
 

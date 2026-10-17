@@ -1442,6 +1442,39 @@ def run():
                 _eo = {}
             check("Esc 能关闭设置弹窗", _eo.get("after") is True, True, str(_eo))
 
+            # 43) `autostart cleanup` 不需要 profile 参数
+            #
+            # 真实 bug：它原先排在 `if (!name)` 守卫之后，而 cleanup 本来就不
+            # 需要 profile 名 —— 于是 `node gen.js autostart cleanup` 永远报
+            # "用法: ... cleanup <profile>"，README 里写的正是无参数用法。
+            #
+            # ⚠️ 这个命令会真的删除中转器 .lnk。所以先记下它是否存在，
+            # 测完立即恢复（启用回原来的 profile 列表），不改变用户的配置。
+            _startup = (A.Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+                        / "Start Menu" / "Programs" / "Startup")
+            _relay = _startup / A.RELAY_LNK_NAME
+            _had_relay = _relay.exists()
+            _enabled_before = [n for n, _p in A.scan_enabled_profiles()]
+            try:
+                _cl = subprocess.run(
+                    ["node", str(A.GEN_JS), "autostart", "cleanup"],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=60,
+                    creationflags=A.CREATE_NO_WINDOW)
+                check("autostart cleanup 不需要 profile 参数",
+                      _cl.returncode != 2, True,
+                      f"exit={_cl.returncode} "
+                      f"{((_cl.stdout or '') + (_cl.stderr or ''))[:160]}")
+            finally:
+                # 恢复中转器：只要原来有、现在没了，就按原启用列表重建
+                if _had_relay and not _relay.exists():
+                    for _n in _enabled_before:
+                        subprocess.run(
+                            ["node", str(A.GEN_JS), "autostart", "on", _n],
+                            cwd=str(A.ROOT), capture_output=True, timeout=120,
+                            creationflags=A.CREATE_NO_WINDOW)
+                    check("测试后中转器已恢复", _relay.exists(), True, str(_relay))
+
             # 42) 注入器拒绝同一 profile 的第二个会话
             #
             # 真实 bug：UI 有防重复，但双击 start.cmd 两次就绕过去了 ——
