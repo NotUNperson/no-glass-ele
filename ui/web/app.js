@@ -22,6 +22,10 @@ let STATE = {
   dirty: false,
   taskRunning: false,
   appAutostartArgs: [],   // 应用自己自启动命令行里的私有参数（探测得到）
+  // 全部 profile 的"应用自启动项"，一次查完（name -> {hits,args}）。
+  // 切换 profile 时从这里读，不再每次起 node + PowerShell。
+  appAutostartAll: null,
+  appAutostartAllPromise: null,   // 并发去重：同一时刻只发一个请求
   sessions: [],        // 运行中的注入会话
   activeSession: null, // 当前查看日志的会话 key（localId 或 id）
   // 每会话一份日志缓冲：key -> { lines, cursor }
@@ -168,6 +172,15 @@ async function refresh(force = false) {
   const res = unwrap(await api().get_overview(force));
   if (!res) return;
   STATE.profiles = res.profiles || [];
+  // profile 集合可能变了（新建/删除）→ 让「应用自启动项」缓存失效。
+  // 但**不清空当前值**：先继续用旧的，下次 loadAppAutostart 时再后台刷新，
+  // 避免每次点刷新都重新付那 1.5 秒。
+  const names = STATE.profiles.map((p) => p.name).sort().join(',');
+  if (STATE.appAutostartAllNames !== names) {
+    STATE.appAutostartAllNames = names;
+    STATE.appAutostartAll = null;
+    STATE.appAutostartAllPromise = null;
+  }
   renderList();
 
   const db = $('taskBadge');
@@ -340,17 +353,49 @@ async function loadAppAutostart() {
   $('appArgsStatus').textContent = '';
   if (!STATE.current) return;
 
-  const res = await api().get_app_autostart(STATE.current);
-  if (!res || res.ok === false || !res.args || !res.args.length) return;
+  // 从**批量结果**里取，不再为每个 profile 单独起一次 node + PowerShell。
+  //
+  // 为什么（踩过）：单次查询约 1.5 秒，而每次切换 profile 都会调它 ——
+  // 快速点 10 下就是 16 秒 + 10 个 PowerShell，用户表现为"切换列表卡顿"。
+  // 现在全部 profile 一次查完（PowerShell 只起 1 次），切换时纯内存读取。
+  const res = await ensureAppAutostartAll();
+  if (!res) return;
+  const mine = res[STATE.current];
+  if (!mine || !mine.args || !mine.args.length) return;
 
-  STATE.appAutostartArgs = res.args;
-  $('appArgsSrc').textContent = res.hits.map((h) => `${h.where}: ${h.commandLine}`).join('  |  ');
+  STATE.appAutostartArgs = mine.args;
+  $('appArgsSrc').textContent = (mine.hits || [])
+    .map((h) => `${h.where}: ${h.commandLine}`).join('  |  ');
   card.classList.remove('hidden');
 
   // 已经在 appArgs 里了就不提示
   const cur = ($('optAppArgs').value || '').trim();
-  if (res.args.every((a) => cur.includes(a))) {
+  if (mine.args.every((a) => cur.includes(a))) {
     $('appArgsStatus').textContent = '已填入';
+  }
+}
+
+/**
+ * 取「全部 profile 的应用自启动项」——带前端缓存，同一轮里只请求一次。
+ *
+ * 后端也有 30 秒 TTL（权威兜底），这里缓存的是**本次会话**的结果，
+ * 避免切换 profile 时反复走 Python → node。
+ */
+async function ensureAppAutostartAll(force = false) {
+  if (!force && STATE.appAutostartAll) return STATE.appAutostartAll;
+  if (!force && STATE.appAutostartAllPromise) return STATE.appAutostartAllPromise;
+
+  const p = (async () => {
+    const res = await api().get_app_autostart_all();
+    if (!res || res.ok === false) return null;
+    STATE.appAutostartAll = res.items || {};
+    return STATE.appAutostartAll;
+  })();
+  STATE.appAutostartAllPromise = p;
+  try {
+    return await p;
+  } finally {
+    STATE.appAutostartAllPromise = null;
   }
 }
 

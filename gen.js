@@ -846,7 +846,8 @@ function cmdAutostart(args) {
 
   // ── list ──
   if (action === 'list' || action === undefined) {
-    const st = autostart.listManaged();
+    // 需要中转器的 target/args 详情 → 显式要求（会起一次 PowerShell）
+    const st = autostart.listManaged({ withRelayDetail: true });
     if (args.flags.json === true) { say(JSON.stringify({ ok: true, ...st }, null, 2)); return; }
 
     say(`${C.b}开机自启动${C.x}`);
@@ -1094,23 +1095,39 @@ function collectDoctorData() {
     const st = autostart.listManaged();
     relayExists = !!(st.relay && st.relay.exists);
   } catch { /* 忽略 */ }
+  // pythonw 只在**有 profile 启用自启动时**才需要 —— 没启用就不查，
+  // 省掉一次进程启动（doctor 在热路径上，UI 的 get_overview 会调它）。
+  //
+  // 注意：此处 `profiles` 数组还没填充（循环在下面），所以直接看 names +
+  // 读 profile 文件。只读几个小 JSON，毫秒级。
   let pythonwOk = true;
+  let anyAutostartEnabled = false;
   try {
-    const cfg = require('./lib/settings').read();
-    if (cfg.pythonw === '') {
-      pythonwOk = false;                 // 用户明确说不用 Python
-    } else if (typeof cfg.pythonw === 'string' && cfg.pythonw) {
-      pythonwOk = fs.existsSync(cfg.pythonw);
-    } else {
-      // 自动模式：只看 where 能不能找到（不起进程实测）
+    for (const n of names) {
       try {
-        const out = execFileSync('where', ['pythonw'], {
-          encoding: 'utf8', timeout: 5000, windowsHide: true,
-        }).trim();
-        pythonwOk = !!out;
-      } catch { pythonwOk = false; }
+        const p = loadProfile(n);
+        if (p.autostart && p.autostart.enabled === true) { anyAutostartEnabled = true; break; }
+      } catch { /* 单个坏了跳过 */ }
     }
   } catch { /* 忽略 */ }
+  if (anyAutostartEnabled) {
+    try {
+      const cfg = require('./lib/settings').read();
+      if (cfg.pythonw === '') {
+        pythonwOk = false;                 // 用户明确说不用 Python
+      } else if (typeof cfg.pythonw === 'string' && cfg.pythonw) {
+        pythonwOk = fs.existsSync(cfg.pythonw);
+      } else {
+        // 自动模式：只看 where 能不能找到（不起进程实测）
+        try {
+          const out = execFileSync('where', ['pythonw'], {
+            encoding: 'utf8', timeout: 5000, windowsHide: true,
+          }).trim();
+          pythonwOk = !!out;
+        } catch { pythonwOk = false; }
+      }
+    } catch { /* 忽略 */ }
+  }
 
   /** 从一条命令行里剥出参数部分。 */
   function extractArgsFromCommand(cmd) {

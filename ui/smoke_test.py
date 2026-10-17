@@ -9,6 +9,7 @@ UI 冒烟测试 —— 真的开一个窗口，验证渲染与 API 桥，然后�
 有硬超时保护，绝不会挂住会话。
 """
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -764,7 +765,96 @@ def run():
                       "document.getElementById('autostartModal').classList.contains('hidden')"),
                   True)
 
-            # 26) 列表徽章：伪造带 autostart 标记的 profile，断言两个徽章都渲染
+            # 27) 切换 profile 不得重复查「应用自启动项」（性能回归守卫）
+            #
+            # 背景（真实 bug）：loadAppAutostart 原先每次切换都调
+            # get_app_autostart → 起一个 node + 一个 PowerShell，实测 1.5 秒/次。
+            # 快速点 10 下 = 16 秒 + 10 个 PowerShell，用户表现为"切换列表卡顿"。
+            # 现在改成批量一次查完 + 前端缓存，切换时纯内存读取。
+            #
+            # 断言方式：统计 get_app_autostart_all 的调用次数 ——
+            # 连续切 5 次同一个/不同 profile，它只该被调用 1 次（首次）。
+            perf = win.evaluate_js("""
+              (() => {
+                const save = { ready: STATE.ready, cur: STATE.current,
+                               all: STATE.appAutostartAll,
+                               promise: STATE.appAutostartAllPromise };
+                STATE.ready = false;
+                STATE.appAutostartAll = null;            // 清缓存，从头计数
+                STATE.appAutostartAllPromise = null;
+
+                const realApi = window.pywebview.api;
+                let calls = 0;
+                const fake = Object.create(realApi);
+                fake.get_app_autostart_all = () => {
+                  calls++;
+                  return Promise.resolve({ ok: true, items: {} });
+                };
+                window.pywebview.api = fake;
+
+                (async () => {
+                  const names = ['A', 'B', 'C', 'A', 'B'];
+                  for (const n of names) {
+                    STATE.current = n;
+                    await loadAppAutostart();
+                  }
+                  window.pywebview.api = realApi;
+                  STATE.ready = save.ready; STATE.current = save.cur;
+                  STATE.appAutostartAll = save.all;
+                  STATE.appAutostartAllPromise = save.promise;
+                  window.__smokePerf = JSON.stringify({ calls, switches: names.length });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(40):
+                if win.evaluate_js("window.__smokePerf"):
+                    break
+                time.sleep(0.1)
+            try:
+                import json as _json_perf
+                pd = _json_perf.loads(win.evaluate_js("window.__smokePerf") or "{}")
+            except Exception:
+                pd = {}
+            check("切换 5 次只查一次应用自启动项（性能回归）",
+                  pd.get("calls") == 1, True, str(pd))
+
+            # 28) 批量 API 应可用且返回 dict
+            aa = api.get_app_autostart_all()
+            check("get_app_autostart_all 可调用", aa.get("ok") is True, True, str(aa)[:120])
+            check("批量结果按 profile 名索引",
+                  isinstance(aa.get("items"), dict), True, str(aa.get("items"))[:120])
+
+            # 29) listManaged 默认不读 .lnk 详情（doctor 少一次 PowerShell）
+            #
+            # 这是 node 侧的行为，用 python 起一次 node 验证 —— 不经过 UI。
+            lm = subprocess.run(
+                ["node", "-e",
+                 "const a=require('./lib/autostart');"
+                 "process.stdout.write(JSON.stringify({"
+                 "  plain: a.listManaged().relay,"
+                 "  detail: a.listManaged({withRelayDetail:true}).relay"
+                 "}));"],
+                cwd=str(A.ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60,
+                creationflags=A.CREATE_NO_WINDOW,
+            )
+            try:
+                import json as _json_lm
+                lmd = _json_lm.loads(lm.stdout or "{}")
+            except Exception:
+                lmd = {}
+            plain = lmd.get("plain") or {}
+            detail = lmd.get("detail") or {}
+            check("listManaged 默认不读详情（target 为 null）",
+                  plain.get("target") is None, True, str(plain)[:120])
+            if detail.get("exists"):
+                check("显式要求时才读详情（target 非 null）",
+                      detail.get("target") is not None, True, str(detail)[:120])
+            else:
+                check("显式要求时才读详情（中转器不存在，跳过）", True, True)
+
+
             badges = win.evaluate_js("""
               (() => {
                 const save = { profiles: STATE.profiles, ready: STATE.ready };

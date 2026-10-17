@@ -90,6 +90,15 @@ _overview_lock = threading.Lock()
 _overview_compute_lock = threading.Lock()
 _overview_cache = {"at": 0.0, "data": None}
 
+# ── 「应用自己的自启动项」缓存 ──
+#
+# 每次查询要起 node + PowerShell，实测单次约 1.6 秒。而前端每次切换 profile
+# 都会查一次 —— 快速切换 10 次就是 16 秒。应用自己的自启动项是低频变化的
+# （用户装/卸应用才变），所以缓存 30 秒。
+APP_AUTOSTART_TTL_SEC = 30.0
+_app_autostart_cache = {}          # name -> { at, data }
+_app_autostart_all_cache = {"at": 0.0, "data": None}   # 批量版（全部 profile）
+
 # ── 进程列表缓存（新建向导用）──
 #
 # list_running_processes 要起一个 PowerShell（约 1-2 秒）。
@@ -1100,6 +1109,65 @@ class Api:
         return {"ok": True, "cursor": cur}
 
     # ── 应用自己的启动参数 ──
+    def get_app_autostart_all(self):
+        """
+        一次查出**全部** profile 对应的"应用自己的自启动项"。
+
+        为什么要有批量版（踩过）：单次查询要起 node + PowerShell，约 1.5 秒。
+        前端每切换一次 profile 就查一次，首次浏览 7 个应用要 10 秒 ——
+        用户表现为"快速切换列表卡顿、派生很多 PowerShell"。
+
+        批量版在**一个 node 进程**里查完全部：PowerShell 只起一次，
+        总耗时约等于单次（实测 7 个 1.4 秒）。
+
+        结果缓存 30 秒（应用自己的自启动项是低频变化的）。
+        """
+        global _app_autostart_all_cache
+        now = time.time()
+        if _app_autostart_all_cache["data"] is not None \
+                and (now - _app_autostart_all_cache["at"]) < APP_AUTOSTART_TTL_SEC:
+            return {"ok": True, "items": _app_autostart_all_cache["data"], "cached": True}
+
+        items = []
+        try:
+            for n in list_profiles_on_disk():
+                try:
+                    prof = read_profile(n)
+                except Exception:                        # noqa: BLE001
+                    continue
+                if not prof.get("exe"):
+                    continue
+                items.append({
+                    "name": n,
+                    "exe": prof.get("exe"),
+                    "processName": prof.get("processName") or "",
+                })
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e), "items": {}}
+
+        if not items:
+            return {"ok": True, "items": {}}
+
+        script = (
+            "const a=require('./lib/autostart');"
+            f"const items={json.dumps(items, ensure_ascii=False)};"
+            "process.stdout.write(JSON.stringify(a.findAppAutostartBatch(items)));"
+        )
+        try:
+            r = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if r.returncode != 0:
+                return {"ok": False, "error": (r.stderr or "读取失败")[:300], "items": {}}
+            data = json.loads(r.stdout or "{}")
+            _app_autostart_all_cache = {"at": now, "data": data}
+            return {"ok": True, "items": data}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e), "items": {}}
+
     def get_app_autostart(self, name):
         """
         读该 profile 对应应用**自己**的自启动命令行（含私有启动参数）。
@@ -1111,12 +1179,28 @@ class Api:
         实现：调 node 侧（那边已有 lib/autostart.js 的 .lnk + 注册表读取），
         不为它再写一套 Python 镜像 —— 那正是本项目反复踩的坑
         （两侧存活判定机制不一致那次）。
+
+        ⚠️ **必须缓存**（踩过）：
+        每次调用要起一个 node，node 里还要起一个 PowerShell 读三处自启动项，
+        实测**单次约 1.6 秒**。而前端每次切换 profile 都会调它 ——
+        快速点 10 下就是 16 秒的串行开销 + 10 个 PowerShell 进程，
+        用户表现为"切换列表卡顿"。
+        应用自己的自启动项是**低频变化**的（用户装/卸应用才变），
+        所以缓存 30 秒完全安全。前端也有一层缓存，这里是权威兜底。
         """
+        global _app_autostart_cache
+        now = time.time()
+        hit = _app_autostart_cache.get(name)
+        if hit and (now - hit["at"]) < APP_AUTOSTART_TTL_SEC:
+            return hit["data"]
+
         try:
             prof = read_profile(name)
             exe = prof.get("exe")
             if not exe:
-                return {"ok": True, "hits": [], "args": []}
+                data = {"ok": True, "hits": [], "args": []}
+                _app_autostart_cache[name] = {"at": now, "data": data}
+                return data
             script = (
                 "const a=require('./lib/autostart');"
                 "const path=require('path');"
@@ -1133,7 +1217,9 @@ class Api:
             if r.returncode != 0:
                 return {"ok": False, "error": (r.stderr or "读取失败")[:300], "hits": [], "args": []}
             data = json.loads(r.stdout or "{}")
-            return {"ok": True, "hits": data.get("hits", []), "args": data.get("args", [])}
+            out = {"ok": True, "hits": data.get("hits", []), "args": data.get("args", [])}
+            _app_autostart_cache[name] = {"at": now, "data": out}
+            return out
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e), "hits": [], "args": []}
 
@@ -1173,7 +1259,7 @@ class Api:
         script = (
             "const a=require('./lib/autostart');"
             "const s=require('./lib/settings');"
-            "process.stdout.write(JSON.stringify({state:a.listManaged(),settings:s.read()}));"
+            "process.stdout.write(JSON.stringify({state:a.listManaged({withRelayDetail:true}),settings:s.read()}));"
         )
         data, err = self._node_json(script)
         if data is None:
