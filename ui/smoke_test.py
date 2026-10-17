@@ -1442,6 +1442,48 @@ def run():
                 _eo = {}
             check("Esc 能关闭设置弹窗", _eo.get("after") is True, True, str(_eo))
 
+            # 44) bundle 产物必须自带许可证
+            #
+            # 真实缺口：`renderBundle` 把 Dark Reader 的代码内联进 noglass.js，
+            # 而 bundle 目录的定位是「整个目录拷走就能跑」—— 原来它不带任何
+            # LICENSE，拷到别处就丢了 MIT 要求的版权声明。
+            _lic_prof = A.PROFILES_DIR / "smokelic.json"
+            _lic_dir = A.ROOT / "apps" / "smokelic-bundle"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                subprocess.run(["node", str(A.GEN_JS), "new", "smokelic", "--exe", _exe],
+                               cwd=str(A.ROOT), capture_output=True, timeout=120,
+                               creationflags=A.CREATE_NO_WINDOW)
+                if _lic_prof.exists():
+                    subprocess.run(["node", str(A.GEN_JS), "build", "smokelic", "--bundle"],
+                                   cwd=str(A.ROOT), capture_output=True, timeout=180,
+                                   creationflags=A.CREATE_NO_WINDOW)
+                    _lf = _lic_dir / "LICENSE"
+                    check("bundle 产物自带 LICENSE", _lf.exists(), True, str(_lf))
+                    if _lf.exists():
+                        _lt = _lf.read_text(encoding="utf-8")
+                        _own = (A.ROOT / "LICENSE").read_text(encoding="utf-8").strip()
+                        _dr = (A.ROOT / "vendor" / "darkreader.LICENSE").read_text(
+                            encoding="utf-8").strip()
+                        # 两份全文都要原样包含（不是只写个名字）
+                        check("bundle LICENSE 含本项目 MIT 全文",
+                              _own in _lt, True, f"len={len(_lt)}")
+                        check("bundle LICENSE 含 Dark Reader MIT 全文",
+                              _dr in _lt, True, f"len={len(_lt)}")
+                else:
+                    check("bundle 产物自带 LICENSE", False, True, "临时 profile 未生成")
+            finally:
+                try:
+                    _lic_prof.unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+                try:
+                    import shutil as _sh4
+                    _sh4.rmtree(_lic_dir, ignore_errors=True)
+                except Exception:                        # noqa: BLE001
+                    pass
+
             # 43) `autostart cleanup` 不需要 profile 参数
             #
             # 真实 bug：它原先排在 `if (!name)` 守卫之后，而 cleanup 本来就不

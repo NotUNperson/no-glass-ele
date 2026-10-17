@@ -496,6 +496,20 @@ function buildOne(name, opts = {}) {
     fs.writeFileSync(f, bundled, 'utf8');
     results.files.push(f);
 
+    // bundle 目录是「整个拷走就能用」的，所以必须自带许可证。
+    //
+    // 为什么必须有：`noglass.js` 里内联了 Dark Reader 的代码
+    // （renderBundle 把 vendor/darkreader.js 拼进去了），而 MIT 要求
+    // 分发时保留版权声明。原来这个目录里没有任何 LICENSE 文件 ——
+    // 拷到别处就丢了声明。
+    const lic = render.renderBundleLicense({
+      projectLicense: path.join(ROOT, 'LICENSE'),
+      drLicense: path.join(ROOT, 'vendor', 'darkreader.LICENSE'),
+    });
+    const lf = path.join(outDir, 'LICENSE');
+    fs.writeFileSync(lf, lic, 'utf8');
+    results.files.push(lf);
+
     for (const p of presets) {
       const cmd = render.renderCmd({
         title: p.title,
