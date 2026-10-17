@@ -749,6 +749,42 @@ def run():
             check("设置能读回", r_set.get("neverWarnStartup") is True, True, str(r_set)[:120])
             api.set_autostart_settings({"neverWarnStartup": False})   # 还原
 
+            # 17) 保存其它设置不得把手选的运行器重置为「自动检测」
+            #
+            # 真实 bug：write_autostart_settings 原先用
+            # `patch.get("pythonw") is None or isinstance(...)` —— patch 里没有
+            # 这个键时 .get() 也返回 None，条件成立，于是每次保存任何设置都会
+            # 把 pythonw 清成 None（= 自动检测）。而重建 .lnk 只在 "pythonw" in patch
+            # 时才发生 → UI 显示"自动"、.lnk 仍指向旧路径，界面与实际不一致。
+            #
+            # 直接测纯函数，不经 Api.set_autostart_settings —— 后者在 patch 含
+            # pythonw 时会真的重建中转器 .lnk，测试不该有那个副作用。
+            import json as _json_s
+            _sfile = A.SETTINGS_FILE
+            _orig = _sfile.read_text(encoding="utf-8") if _sfile.exists() else None
+            try:
+                A.write_autostart_settings({"pythonw": r"C:\fake\pythonw.exe"})
+                A.write_autostart_settings({"neverWarnStartup": True})
+                _after = A.read_autostart_settings()
+                check("保存其它设置不重置 pythonw（回归）",
+                      _after.get("pythonw"), r"C:\fake\pythonw.exe",
+                      str(_after.get("pythonw")))
+
+                # 显式传 None 仍应能清成「自动检测」—— None 是合法值，不能一刀切
+                A.write_autostart_settings({"pythonw": None})
+                _after2 = A.read_autostart_settings()
+                check("显式传 None 仍可切回自动检测",
+                      _after2.get("pythonw") is None, True, str(_after2.get("pythonw")))
+            finally:
+                # 还原原文件（不存在就删掉，别留一份测试产生的设置）
+                if _orig is None:
+                    try:
+                        _sfile.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                else:
+                    _sfile.write_text(_orig, encoding="utf-8", newline="\n")
+
             # 上次失败摘要 API（通常没有文件，只验不崩）
             last = api.get_autostart_last()
             check("get_autostart_last 可调用", last.get("ok") is True, True, str(last)[:100])

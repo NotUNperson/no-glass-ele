@@ -1614,8 +1614,17 @@ def write_autostart_settings(patch):
         for k in ("neverPromptDelete", "neverWarnStartup"):
             if isinstance(patch.get(k), bool):
                 cur[k] = patch[k]
-        if patch.get("pythonw") is None or isinstance(patch.get("pythonw"), str):
-            cur["pythonw"] = patch.get("pythonw")
+        # pythonw 必须用 `in patch` 判断，不能只看值。
+        #
+        # 踩过的坑：原先是 `patch.get("pythonw") is None or isinstance(...)`。
+        # patch 里没有这个键时 `.get()` 也返回 None，条件成立 —— 于是**任何一次
+        # 保存设置都会把手选的运行器重置成"自动检测"**。而 set_autostart_settings
+        # 只在 `"pythonw" in patch` 时才重建中转器 .lnk，结果 UI 显示"自动"、
+        # .lnk 仍指向旧路径，界面与实际不一致且用户无从察觉。
+        #
+        # None 是合法值（= 自动检测），所以不能靠真假区分，只能靠键是否存在。
+        if "pythonw" in patch and (patch["pythonw"] is None or isinstance(patch["pythonw"], str)):
+            cur["pythonw"] = patch["pythonw"]
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = SETTINGS_FILE.with_suffix(".json.tmp")
