@@ -60,6 +60,10 @@ AUTOSTART_LOG = AUTOSTART_LOG_DIR / "autostart.log"
 AUTOSTART_LAST = RUN_DIR / "autostart-last.json"
 SETTINGS_FILE = ROOT / "local" / "autostart.json"
 
+# 中转器快捷方式的文件名。必须与 lib/autostart.js 的 relayLnkPath() 一致 ——
+# 两边指向同一个文件，改一处就要改另一处。
+RELAY_LNK_NAME = "no-glass · autostart.lnk"
+
 # 与 lib/settings.js 的 DEFAULTS 必须一致 —— 两边读写同一份文件。
 # 改字段时两处都要改。
 AUTOSTART_DEFAULTS = {
@@ -1250,35 +1254,75 @@ class Api:
         自启动的完整状态，供 UI 弹窗渲染。
 
         返回：
-          relay    — 中转器 .lnk 是否存在、指向什么
+          relay    — 中转器 .lnk 是否存在（target/args 恒为 null，见下）
           enabled  — 启用了自启动的 profile 列表
           legacy   — 旧式 per-profile .lnk（待清理）
           settings — local/autostart.json 的内容（含默认值）
           profiles — 全部 profile 名（弹窗要列出来，包括未启用的）
+
+        ⚠️ **纯 Python 实现，不起 node 进程**（踩过）：
+        原先这里调 `listManaged({withRelayDetail:true})` —— 为了拿中转器的
+        target/args 去读启动文件夹里**全部** .lnk 的属性，实测 1533-1615 ms。
+        而前端只用 `relay.exists`（判断"中转器在不在"），target/args 一个都没读。
+        用户表现为"刚打开设置，复选框那块要等好几秒才出来"。
+
+        现在：relay 只做一次 existsSync（微秒级）；enabled/legacy 直接读
+        profiles/*.json 与启动文件夹的文件名。全加起来毫秒级。
+
+        target/args 恒为 null —— 需要真实内容时用 `gen.js autostart list`
+        （CLI 场景，一次性，慢一点无所谓）。
         """
-        script = (
-            "const a=require('./lib/autostart');"
-            "const s=require('./lib/settings');"
-            "process.stdout.write(JSON.stringify({state:a.listManaged({withRelayDetail:true}),settings:s.read()}));"
-        )
-        data, err = self._node_json(script)
-        if data is None:
-            return {"ok": False, "error": err or "读取失败"}
+        # 中转器是否存在 —— 与 lib/autostart.js 的 relayLnkPath() 同一个路径
+        relay = {"exists": False, "lnk": None, "target": None, "args": None}
+        startup = None
+        try:
+            startup = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" \
+                / "Start Menu" / "Programs" / "Startup"
+            rl = startup / RELAY_LNK_NAME
+            relay = {"exists": rl.exists(), "lnk": str(rl), "target": None, "args": None}
+        except Exception:                                # noqa: BLE001
+            pass
+
+        # 启用了自启动的 profile（纯读 JSON）
+        enabled = []
+        for name, prof in scan_enabled_profiles():
+            enabled.append({
+                "name": name,
+                "displayName": prof.get("displayName") or name,
+                "appArgs": effective_app_args(prof),
+            })
+
+        # 旧式 per-profile 项（只列文件名，不解析内容）
+        legacy = []
+        try:
+            if startup is not None and startup.exists():
+                for f in startup.iterdir():
+                    if not f.name.startswith("no-glass · ") \
+                            or f.suffix.lower() != ".lnk":
+                        continue
+                    if f.name == RELAY_LNK_NAME:         # 中转器不算旧式
+                        continue
+                    legacy.append({
+                        "profile": f.name[len("no-glass · "):-len(".lnk")],
+                        "lnk": str(f),
+                        "file": f.name,
+                    })
+        except Exception:                                # noqa: BLE001
+            pass
 
         names = []
         try:
-            names = [p.name for p in sorted(PROFILES_DIR.glob("*.json"))
+            names = [p.stem for p in sorted(PROFILES_DIR.glob("*.json"))
                      if not p.name.startswith("_")]
-            names = [n[:-5] for n in names]
         except Exception:                                # noqa: BLE001
             pass
 
         return {
             "ok": True,
-            "relay": data.get("state", {}).get("relay"),
-            "enabled": data.get("state", {}).get("enabled", []),
-            "legacy": data.get("state", {}).get("legacy", []),
-            "settings": data.get("settings", {}),
+            "relay": relay,
+            "enabled": enabled,
+            "legacy": legacy,
+            "settings": read_autostart_settings(),
             "profiles": names,
         }
 

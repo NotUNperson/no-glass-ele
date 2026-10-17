@@ -290,7 +290,13 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card h3 { margin: 0 0 9px; font-size: 12px; color: var(--text-2); font-weight: 600; letter-spacing: .03em; }
 .card .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .card .row:last-child { margin-bottom: 0; }
-.hint { margin: 8px 0 0; color: var(--text-3); font-size: 11px; line-height: 1.6; }
+/* hint 用 --text-2 而不是 --text-3。
+ *
+ * 为什么改：--text-3 在深色下对比度只有 3.83:1、浅色下 3.17:1，
+ * 都低于 WCAG AA 对正文要求的 4.5:1 —— 11px 的小字尤其难读。
+ * --text-2 是 7.05:1（深色）/ 6.18:1（浅色），同样低调但看得清。
+ * --text-3 仍用于占位符这类"本来就不该抢注意力"的地方。 */
+.hint { margin: 8px 0 0; color: var(--text-2); font-size: 11px; line-height: 1.6; }
 .hint strong { color: var(--text-2); }
 
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 7px; }

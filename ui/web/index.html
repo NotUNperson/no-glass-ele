@@ -22,8 +22,8 @@
     <button class="theme-btn" id="btnTheme" title="切换界面主题（跟随系统 / 深色 / 浅色）">主题：跟随系统</button>
     <span class="badge" id="nodeBadge" title="Node 是否可用">node ?</span>
     <span class="badge" id="taskBadge" title="当前任务状态">空闲</span>
-    <button class="btn ghost" id="btnAutostart" title="管理开机自启动">开机自启</button>
-    <button class="btn ghost" id="btnRefresh" title="重新读取 profiles">刷新</button>
+    <button class="btn" id="btnAutostart" title="管理开机自启动">开机自启</button>
+    <button class="btn" id="btnRefresh" title="重新读取 profiles">刷新</button>
   </div>
 </header>
 
@@ -285,8 +285,8 @@
       <div class="wiz-step">
         <label class="lbl">启动文件夹</label>
         <div class="row">
-          <button class="btn ghost small" id="asOpenUser">打开用户启动文件夹</button>
-          <button class="btn ghost small" id="asOpenSystem">打开系统启动文件夹</button>
+          <button class="btn small" id="asOpenUser">打开用户启动文件夹</button>
+          <button class="btn small" id="asOpenSystem">打开系统启动文件夹</button>
         </div>
         <p class="hint">只打开文件夹让你自己看，不在界面里列内容（每次读一遍很费 CPU）。系统级只读 —— 写入需要管理员，本工具不做。</p>
       </div>
@@ -294,7 +294,7 @@
       <div class="wiz-step">
         <label class="lbl">自启动运行器（pythonw）</label>
         <div class="row">
-          <button class="btn ghost small" id="asDetect">检测可用运行器</button>
+          <button class="btn small" id="asDetect">检测可用运行器</button>
           <span class="dim tiny" id="asRunnerState"></span>
         </div>
         <div id="asRunners" class="as-runners hidden"></div>
@@ -323,7 +323,7 @@
     <div class="modal-foot">
       <span class="dim tiny" id="asStatus"></span>
       <div>
-        <button class="btn ghost" id="asClose2">关闭</button>
+        <button class="btn" id="asClose2">关闭</button>
         <button class="btn primary" id="asSave">保存设置</button>
       </div>
     </div>

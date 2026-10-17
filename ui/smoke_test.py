@@ -699,7 +699,9 @@ def run():
                   win.evaluate_js("!!document.getElementById('btnAutostart')"), True)
 
             win.evaluate_js("document.getElementById('btnAutostart').click()")
-            # 打开时要读一次状态（走 node，约 0.3s），轮询等渲染完成
+            # 打开时要读一次状态。这一度是 1.6 秒（起 node + PowerShell 解析
+            # 启动文件夹里全部 .lnk 的属性），用户表现为"复选框那块要等几秒"。
+            # 现在是纯 Python 读 JSON，毫秒级 —— 等 50×0.1s 只是兜底。
             for _ in range(50):
                 if win.evaluate_js(
                         "document.querySelectorAll('#asList .as-item').length > 0"):
@@ -719,6 +721,71 @@ def run():
                   win.evaluate_js("!!document.getElementById('asOpenSystem')"), True)
             check("有运行器检测按钮",
                   win.evaluate_js("!!document.getElementById('asDetect')"), True)
+
+            # 19) 弹窗里的操作按钮必须有可见的底色与边框
+            #
+            # 真实体验问题：这些按钮原本用 `.btn.ghost`，而 ghost 的定义是
+            # `background: transparent; border-color: transparent` —— 在弹窗里
+            # 看起来就是一行纯文字，用户"看不太清那是按钮"。
+            # 新建向导弹窗里同类的「浏览…」用的是实心 `.btn`，两处风格也不一致。
+            #
+            # 断言方式：读计算样式。ghost 的底色是 transparent、边框也透明；
+            # 实心按钮两者都非透明。颜色值可能是 rgb() 或 rgba()，统一按
+            # "含 0 透明度" 判掉。
+            _btn_style = win.evaluate_js("""
+              (() => {
+                const ids = ['asOpenUser', 'asOpenSystem', 'asDetect', 'asClose2'];
+                const out = {};
+                for (const id of ids) {
+                  const e = document.getElementById(id);
+                  if (!e) { out[id] = null; continue; }
+                  const s = getComputedStyle(e);
+                  out[id] = {
+                    bg: s.backgroundColor,
+                    bw: s.borderTopWidth,
+                    bc: s.borderTopColor,
+                    cls: e.className,
+                  };
+                }
+                return JSON.stringify(out);
+              })()
+            """)
+            try:
+                _btns = _json_btn = __import__('json').loads(_btn_style or "{}")
+            except Exception:                            # noqa: BLE001
+                _btns = {}
+
+            def _opaque(color, width="0px"):
+                """颜色是否不透明（非 transparent / 非 rgba(...,0)）。"""
+                c = str(color or "").replace(" ", "").lower()
+                if not c or c == "transparent":
+                    return False
+                if c.startswith("rgba(") and c.rstrip(")").endswith(",0"):
+                    return False
+                return True
+
+            _bad = []
+            for _id in ("asOpenUser", "asOpenSystem", "asDetect", "asClose2"):
+                _b = _btns.get(_id) or {}
+                if not _opaque(_b.get("bg")) or not _opaque(_b.get("bc")):
+                    _bad.append(f"{_id}:bg={_b.get('bg')},bc={_b.get('bc')}")
+            check("弹窗操作按钮有可见底色与边框（ghost 不可读）",
+                  not _bad, True, "; ".join(_bad)[:180])
+
+            # 20) 顶栏的「开机自启」「刷新」也不能是 ghost（同样看不见）
+            _top_cls = win.evaluate_js("""
+              JSON.stringify({
+                auto: document.getElementById('btnAutostart').className,
+                refresh: document.getElementById('btnRefresh').className,
+              })
+            """)
+            try:
+                _tc = __import__('json').loads(_top_cls or "{}")
+            except Exception:                            # noqa: BLE001
+                _tc = {}
+            check("顶栏按钮不是 ghost",
+                  'ghost' not in (_tc.get("auto", "") + " " + _tc.get("refresh", "")),
+                  True, str(_tc))
             check("有初始延迟输入框",
                   win.evaluate_js(
                       "(() => { const e = document.getElementById('asInitial');"
@@ -741,6 +808,46 @@ def run():
             check("返回 settings", isinstance(st_as.get("settings"), dict), True,
                   str(st_as.get("settings"))[:100])
             check("返回 profiles 列表", isinstance(st_as.get("profiles"), list), True)
+
+            # 18) get_autostart_state 必须是纯 Python，不起 node 进程
+            #
+            # 真实体验问题：原先它调 `listManaged({withRelayDetail:true})`，
+            # 为了拿中转器的 target/args 去解析启动文件夹里**全部** .lnk 的属性，
+            # 实测 1533-1615 ms。用户表现为"刚打开设置，复选框那块要等几秒"。
+            # 而前端只用 relay.exists —— target/args 一个都没读。
+            #
+            # 断言方式：把 _node_json 换成计数器，调一次状态接口，必须为 0。
+            _orig_node_json = A.Api._node_json
+            _node_calls = {"n": 0}
+
+            # 注意：_node_json 是 @staticmethod。
+            #
+            # 两个坑（都踩过）：
+            #   1. 包装函数不能声明 self —— staticmethod 调用时不会传实例，
+            #      多一个参数会把 script 挤到 timeout 的位置。
+            #   2. 还原时必须用 staticmethod(...) 包回去。直接赋裸函数会让它
+            #      变成普通方法，之后 self 会被当成 script 传进去。
+            _orig_node_json = A.Api.__dict__['_node_json']
+
+            def _counting_node_json(*a, **kw):
+                _node_calls["n"] += 1
+                return _orig_node_json.__func__(*a, **kw)
+
+            A.Api._node_json = staticmethod(_counting_node_json)
+            try:
+                _t0 = time.time()
+                _fast = api.get_autostart_state()
+                _ms = (time.time() - _t0) * 1000
+            finally:
+                A.Api._node_json = _orig_node_json
+            check("get_autostart_state 不起 node（性能回归）",
+                  _node_calls["n"], 0, f"node 调用 {_node_calls['n']} 次")
+            check("get_autostart_state 是毫秒级",
+                  _ms < 200, True, f"{_ms:.0f} ms")
+            check("纯 Python 版仍返回 enabled/legacy",
+                  isinstance(_fast.get("enabled"), list)
+                  and isinstance(_fast.get("legacy"), list),
+                  True, str({k: _fast.get(k) for k in ('enabled', 'legacy')})[:140])
 
             # 设置往返
             w_set = api.set_autostart_settings({"neverWarnStartup": True})
