@@ -22,6 +22,7 @@
     <button class="theme-btn" id="btnTheme" title="切换界面主题（跟随系统 / 深色 / 浅色）">主题：跟随系统</button>
     <span class="badge" id="nodeBadge" title="Node 是否可用">node ?</span>
     <span class="badge" id="taskBadge" title="当前任务状态">空闲</span>
+    <button class="btn ghost" id="btnAutostart" title="管理开机自启动">开机自启</button>
     <button class="btn ghost" id="btnRefresh" title="重新读取 profiles">刷新</button>
   </div>
 </header>
@@ -257,6 +258,73 @@
       <div>
         <button class="btn ghost" id="wizCancel">取消</button>
         <button class="btn primary" id="wizCreate" disabled>创建 profile</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="autostartModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2>开机自启动</h2>
+      <button class="btn ghost small" id="asClose">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="hint" style="margin-top:0">
+        登录后由<b>一个</b>中转器按顺序拉起下面勾选的应用（带间隔，不会同时挤在开机那一刻）。
+        每个应用照常登记为独立会话，可在右侧标签里单独停止。
+      </p>
+
+      <div class="wiz-step">
+        <label class="lbl">参与自启动的应用</label>
+        <div id="asList" class="as-list"></div>
+        <p class="hint" id="asRelayState"></p>
+      </div>
+
+      <div class="wiz-step">
+        <label class="lbl">启动文件夹</label>
+        <div class="row">
+          <button class="btn ghost small" id="asOpenUser">打开用户启动文件夹</button>
+          <button class="btn ghost small" id="asOpenSystem">打开系统启动文件夹</button>
+        </div>
+        <p class="hint">只打开文件夹让你自己看，不在界面里列内容（每次读一遍很费 CPU）。系统级只读 —— 写入需要管理员，本工具不做。</p>
+      </div>
+
+      <div class="wiz-step">
+        <label class="lbl">自启动运行器（pythonw）</label>
+        <div class="row">
+          <button class="btn ghost small" id="asDetect">检测可用运行器</button>
+          <span class="dim tiny" id="asRunnerState"></span>
+        </div>
+        <div id="asRunners" class="as-runners hidden"></div>
+        <p class="hint">开机自启需要一个 GUI 子系统的 pythonw.exe（不然会留黑窗口）。检测会真的运行一次每个候选，只有能跑起来的才算可用。</p>
+      </div>
+
+      <div class="wiz-step">
+        <label class="lbl">启动节奏</label>
+        <div class="row">
+          <label class="tiny">初始延迟
+            <input class="input tiny-input" id="asInitial" type="number" min="0" max="120" step="1"> 秒
+          </label>
+          <label class="tiny">逐条间隔
+            <input class="input tiny-input" id="asDelay" type="number" min="0" max="120" step="1"> 秒
+          </label>
+        </div>
+        <p class="hint" id="asEstimate"></p>
+      </div>
+
+      <div class="wiz-step">
+        <label class="check"><input type="checkbox" id="asNeverWarn"> 没有应用启用时不要弹警告</label>
+        <label class="check"><input type="checkbox" id="asNeverPrompt"> 关闭最后一项时不要再问我是否删除中转器</label>
+      </div>
+    </div>
+
+    <div class="modal-foot">
+      <span class="dim tiny" id="asStatus"></span>
+      <div>
+        <button class="btn ghost" id="asClose2">关闭</button>
+        <button class="btn primary" id="asSave">保存设置</button>
       </div>
     </div>
   </div>

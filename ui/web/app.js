@@ -141,6 +141,27 @@ async function init() {
 
   await refresh();
   startPolling();
+  checkAutostartLast();
+}
+
+/**
+ * 上次开机自启有失败吗？有就提示一句。
+ *
+ * 只读一个小 JSON（run/autostart-last.json），毫秒级 —— 不违反低负载要求。
+ * 为什么需要：中转器的失败只写日志文件，而用户不会主动去翻那个文件；
+ * 但 UI 是他会打开的，所以在入口提示一下。
+ */
+async function checkAutostartLast() {
+  try {
+    const res = await api().get_autostart_last();
+    const last = res && res.last;
+    if (!last || !last.failed) return;
+    toast(
+      `上次开机自启有 ${last.failed} 个失败（${last.at}）—— 点「开机自启」查看，或 node gen.js autostart log`,
+      'warn',
+      9000
+    );
+  } catch (_) { /* 忽略：提示失败不该影响界面 */ }
 }
 
 async function refresh(force = false) {
@@ -171,6 +192,9 @@ function renderList() {
     const flags = [];
     if (p.stale) flags.push('<span class="stale-dot" title="产物与 profile 不一致，需重新生成">⚠ 待生成</span>');
     if (p.issues && p.issues.length) flags.push('<span class="warn-dot" title="校验有问题">●</span>');
+    // 自启动状态：淡绿 = 已启用；浅黄 = 开机参数与手动参数不同
+    if (p.autostartEnabled) flags.push('<span class="auto-dot" title="已启用开机自启动">自启</span>');
+    if (p.autostartArgsDiffer) flags.push('<span class="args-dot" title="开机启动参数与手动启动参数不同（见 profile 的 autostart.appArgs）">参数不同</span>');
     const native = p.canUseNative === false ? 'native✗' : p.canUseNative === true ? 'native✓' : 'native?';
     const glass = p.hasPageGlass === true ? '玻璃✓' : p.hasPageGlass === false ? '玻璃✗' : '玻璃?';
     return `
@@ -1319,12 +1343,191 @@ async function wizCreate() {
   await selectProfile(name);
 }
 
+// ─────────────────────────── 开机自启动 ───────────────────────────
+
+/**
+ * 打开「开机自启动」弹窗。
+ *
+ * 为什么是全局弹窗而不是详情区卡片：自启动是**全局**设置（一个中转器拉起
+ * 所有启用的应用），而详情区在没选中 profile 时整体隐藏 —— 放里面会看不到。
+ */
+async function openAutostart() {
+  $('autostartModal').classList.remove('hidden');
+  $('asStatus').textContent = '';
+  $('asRunners').classList.add('hidden');
+  await loadAutostartState();
+}
+
+function closeAutostart() {
+  $('autostartModal').classList.add('hidden');
+}
+
+async function loadAutostartState() {
+  const res = unwrap(await api().get_autostart_state(), true);
+  if (!res) {
+    $('asStatus').textContent = '读取自启动状态失败';
+    return;
+  }
+  STATE.autostart = res;
+
+  // ── profile 勾选列表 ──
+  const enabledSet = new Set((res.enabled || []).map((x) => x.name));
+  const legacySet = new Set((res.legacy || []).map((x) => x.profile));
+  const list = $('asList');
+  const names = res.profiles || [];
+  if (!names.length) {
+    list.innerHTML = '<p class="dim tiny">还没有 profile。</p>';
+  } else {
+    list.innerHTML = names.map((n) => {
+      const on = enabledSet.has(n);
+      const legacy = legacySet.has(n) ? '<span class="tag legacy" title="存在旧式启动项">旧</span>' : '';
+      return `
+        <label class="as-item">
+          <input type="checkbox" data-as-name="${esc(n)}" ${on ? 'checked' : ''}>
+          <span class="nm">${esc(n)}</span>
+          ${legacy}
+          <span class="tag${on ? '' : ' hidden'}">已启用</span>
+        </label>`;
+    }).join('');
+  }
+
+  // ── 中转器状态 ──
+  const relay = res.relay || {};
+  $('asRelayState').textContent = relay.exists
+    ? '中转器快捷方式已创建（启用任一应用时自动维护）。'
+    : '中转器快捷方式尚未创建 —— 勾选任一应用后会自动创建。';
+
+  // ── 节奏与开关 ──
+  const st = res.settings || {};
+  $('asInitial').value = Math.round((st.initialDelayMs || 0) / 1000);
+  $('asDelay').value = Math.round((st.delayMs || 0) / 1000);
+  $('asNeverWarn').checked = !!st.neverWarnStartup;
+  $('asNeverPrompt').checked = !!st.neverPromptDelete;
+  $('asRunnerState').textContent = st.pythonw
+    ? `手动指定：${st.pythonw}`
+    : '自动检测';
+
+  updateAutostartEstimate();
+}
+
+/** 显示「预计 N 秒内全部启动」。 */
+function updateAutostartEstimate() {
+  const n = $('asList').querySelectorAll('input[type=checkbox]:checked').length;
+  const initial = Number($('asInitial').value) || 0;
+  const delay = Number($('asDelay').value) || 0;
+  if (!n) {
+    $('asEstimate').textContent = '当前没有勾选任何应用。';
+    return;
+  }
+  const total = initial + delay * Math.max(0, n - 1);
+  $('asEstimate').textContent = `预计 ${total} 秒内全部启动（${n} 个应用，最后一个在第 ${total} 秒）。`;
+}
+
+/** 勾选/取消某个 profile 的自启动（立即生效，不等“保存设置”）。 */
+async function toggleAutostart(name, enabled) {
+  const res = await api().set_autostart(name, enabled);
+  if (!res || res.ok === false) {
+    toast((res && res.error) || '操作失败', 'err', 6000);
+    await loadAutostartState();
+    return;
+  }
+  // 关掉最后一项时，问是否删除中转器
+  if (!enabled && res.shouldPromptDelete) {
+    const st = STATE.autostart && STATE.autostart.settings;
+    if (!(st && st.neverPromptDelete)) {
+      const del = window.confirm(
+        '现在没有任何应用启用自启动了。\n\n'
+        + '要删除中转器快捷方式吗？\n'
+        + '（留着的话，开机它会起来、发现没东西可启动、然后退出）'
+      );
+      if (del) await api().remove_relay_lnk();
+    }
+  }
+  toast(enabled ? `已启用 ${name} 的开机自启动` : `已关闭 ${name} 的开机自启动`, 'ok');
+  await loadAutostartState();
+  await refresh();
+}
+
+/** 检测可用的 pythonw（真跑一次）。 */
+async function detectRunners() {
+  $('asRunnerState').textContent = '检测中…（会真的运行每个候选，约几秒）';
+  const res = await api().detect_pythonw();
+  const box = $('asRunners');
+  box.classList.remove('hidden');
+  if (!res || res.ok === false) {
+    $('asRunnerState').textContent = '检测失败：' + ((res && res.error) || '未知错误');
+    return;
+  }
+  $('asRunnerState').textContent = res.selected
+    ? '当前会使用：' + res.selected
+    : '没有可用运行器';
+  box.innerHTML = (res.items || []).map((it) => `
+    <div class="as-runner ${it.ok ? '' : 'bad'}" data-runner="${esc(it.path)}" data-ok="${it.ok ? '1' : '0'}">
+      <span>${it.ok ? '✓' : '✗'}</span>
+      <span style="flex:1">${esc(it.path)}</span>
+      <span class="ver">${esc(it.version || '不可用')}</span>
+      ${it.selected ? '<span class="pick">当前</span>' : ''}
+    </div>`).join('') || '<p class="dim tiny">没有找到任何候选。</p>';
+}
+
+async function saveAutostartSettings() {
+  const patch = {
+    initialDelayMs: Math.max(0, Math.min(120, Number($('asInitial').value) || 0)) * 1000,
+    delayMs: Math.max(0, Math.min(120, Number($('asDelay').value) || 0)) * 1000,
+    neverWarnStartup: $('asNeverWarn').checked,
+    neverPromptDelete: $('asNeverPrompt').checked,
+  };
+  const res = await api().set_autostart_settings(patch);
+  if (!res || res.ok === false) {
+    toast((res && res.error) || '保存失败', 'err', 6000);
+    return;
+  }
+  if (res.relayWarning) toast('设置已保存，但重建中转器失败：' + res.relayWarning, 'warn', 8000);
+  else toast('自启动设置已保存', 'ok');
+  await loadAutostartState();
+}
+
 // ─────────────────────────── 绑定 ───────────────────────────
 
 function bindUI() {
   $('btnRefresh').onclick = refresh;
   $('btnTheme').onclick = cycleTheme;
   $('btnNew').onclick = openWizard;
+  // 开机自启动弹窗
+  $('btnAutostart').onclick = openAutostart;
+  $('asClose').onclick = closeAutostart;
+  $('asClose2').onclick = closeAutostart;
+  $('asSave').onclick = saveAutostartSettings;
+  $('asDetect').onclick = detectRunners;
+  $('asOpenUser').onclick = () => api().open_startup_folder('user');
+  $('asOpenSystem').onclick = () => api().open_startup_folder('system');
+  // 勾选变化：立即生效 + 更新预计时间
+  $('asList').addEventListener('change', (e) => {
+    const cb = e.target;
+    if (cb && cb.dataset && cb.dataset.asName) {
+      toggleAutostart(cb.dataset.asName, cb.checked);
+    }
+  });
+  // 点运行器行：切到手动指定
+  $('asRunners').addEventListener('click', async (e) => {
+    const row = e.target.closest('.as-runner');
+    if (!row) return;
+    if (row.dataset.ok !== '1') {
+      toast('这个候选实测不可用，不能选它', 'warn');
+      return;
+    }
+    const p = row.dataset.runner;
+    const r = await api().set_autostart_settings({ pythonw: p });
+    if (r && r.ok) {
+      toast('已切换到该运行器，并重建中转器', 'ok');
+      if (r.relayWarning) toast('但重建中转器失败：' + r.relayWarning, 'warn', 8000);
+      await loadAutostartState();
+    } else {
+      toast((r && r.error) || '切换失败', 'err');
+    }
+  });
+  $('asInitial').addEventListener('input', updateAutostartEstimate);
+  $('asDelay').addEventListener('input', updateAutostartEstimate);
   $('btnDoctor').onclick = async () => {
     unwrap(await api().run_task('doctor'));
     focusTaskTab();          // 输出在任务标签里，切过去才看得见

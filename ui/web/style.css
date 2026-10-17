@@ -244,6 +244,35 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .item .warn-dot { color: var(--warn); }
 .item .stale-dot { color: var(--warn); font-size: 11px; }
 
+/* 自启动徽章：
+   · auto-dot  淡绿 —— 已启用开机自启动（正常状态，不抢眼）
+   · args-dot  浅黄 —— 开机参数与手动参数不同（值得注意但不算错误）
+   颜色复用 --ok / --warn，与 badge.ok / badge.warn 同一套语义。 */
+.item .auto-dot { color: var(--ok); font-size: 11px; }
+.item .args-dot { color: var(--warn); font-size: 11px; }
+
+/* ── 自启动弹窗 ── */
+.as-list { display: flex; flex-direction: column; gap: 2px; max-height: 240px; overflow-y: auto; }
+.as-list .as-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 5px; cursor: pointer;
+}
+.as-list .as-item:hover { background: var(--btn-hover); }
+.as-list .as-item .nm { flex: 1; }
+.as-list .as-item .tag { font-size: 11px; color: var(--ok); }
+.as-list .as-item .tag.legacy { color: var(--warn); }
+.as-runners { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+.as-runners .as-runner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; border-radius: 5px; cursor: pointer;
+  font-family: var(--mono); font-size: 11px;
+}
+.as-runners .as-runner:hover { background: var(--btn-hover); }
+.as-runners .as-runner.bad { opacity: .55; cursor: not-allowed; }
+.as-runners .as-runner .ver { color: var(--text-3); }
+.as-runners .as-runner .pick { color: var(--accent); }
+.tiny-input { width: 60px; }
+
 /* ── 详情 ── */
 .pane-detail { overflow-y: auto; }
 .empty { padding: 60px 20px; text-align: center; color: var(--text-2); }

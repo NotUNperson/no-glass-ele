@@ -574,6 +574,10 @@ function collectListData() {
       generated: cmds.length > 0,
       stale,
       probedAt: d.probedAt || null,
+      // 开机自启动状态 —— 供 UI 列表上的两个徽章用。
+      // 都是纯内存计算（autostart 字段就在 p 里），不产生额外开销。
+      autostartEnabled: !!(p.autostart && p.autostart.enabled === true),
+      autostartArgsDiffer: autostart.appArgsDiffer(p),
     };
   });
   return { profiles: rows };
@@ -842,21 +846,105 @@ function cmdAutostart(args) {
 
   // ── list ──
   if (action === 'list' || action === undefined) {
-    const items = autostart.listManaged();
-    if (args.flags.json === true) { say(JSON.stringify({ ok: true, items }, null, 2)); return; }
-    if (!items.length) {
-      say('没有由本工具创建的自启动项。');
-      say(dim('  创建一个：node gen.js autostart on <profile>'));
+    const st = autostart.listManaged();
+    if (args.flags.json === true) { say(JSON.stringify({ ok: true, ...st }, null, 2)); return; }
+
+    say(`${C.b}开机自启动${C.x}`);
+    say();
+    if (st.relay && st.relay.exists) {
+      say(`  ${C.g}中转器已就位${C.x} ${dim('（一个快捷方式拉起全部已启用的应用）')}`);
+      say(dim(`    ${st.relay.lnk}`));
+    } else {
+      say(`  ${C.y}中转器不存在${C.x} ${dim('—— 启用任一 profile 时会自动创建')}`);
+    }
+    say();
+
+    if (st.enabled.length) {
+      say(`  已启用的 profile ${dim(`(${st.enabled.length})`)}`);
+      for (const e of st.enabled) {
+        const a = e.appArgs && e.appArgs.length ? dim(`  appArgs: ${e.appArgs.join(' ')}`) : '';
+        say(`    ${C.b}${e.displayName || e.name}${C.x}${a}`);
+      }
+    } else {
+      say(dim('  （没有 profile 启用自启动）'));
+    }
+
+    if (st.legacy.length) {
+      say();
+      say(`  ${C.y}发现旧式启动项${C.x} ${dim('（每 profile 一个 .lnk，会与新中转器重复启动）')}`);
+      for (const l of st.legacy) say(`    ${l.file}`);
+      say(dim(`    清理：node gen.js autostart on <profile> 会自动删掉对应的旧项`));
+    }
+    say();
+    say(dim('  开启：node gen.js autostart on <profile>'));
+    say(dim('  关闭：node gen.js autostart off <profile>'));
+    return;
+  }
+
+  // ── run（手动跑一次中转器，调试用）──
+  if (action === 'run') {
+    const dry = args.flags['dry-run'] === true || args.flags.dry === true;
+    const argv = ['python', path.join(ROOT, 'ui', 'app.py'), '--autostart-all'];
+    if (dry) argv.push('--dry-run');
+    try {
+      execFileSync(argv[0], argv.slice(1), { stdio: 'inherit', cwd: ROOT });
+    } catch (e) {
+      bad(`运行中转器失败：${e.message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // ── log（看中转器日志）──
+  if (action === 'log') {
+    const p = path.join(ROOT, 'run', 'logs', 'autostart', 'autostart.log');
+    if (!fs.existsSync(p)) {
+      say('（还没有中转器日志 —— 开机自启还没跑过，或从没启用过）');
+      say(dim(`  期望位置：${p}`));
       return;
     }
-    say(`${C.b}本工具创建的自启动项${C.x} ${dim(`(${items.length})`)}`);
+    const n = args.flags.n ? Number(args.flags.n) : 100;
+    const lines = fs.readFileSync(p, 'utf8').split(/\r?\n/);
+    say(`${C.b}中转器日志${C.x} ${dim(`(${p})`)}`);
     say();
-    for (const it of items) {
-      say(`  ${C.b}${it.profile}${C.x}`);
-      say(dim(`    ${it.lnk}`));
+    for (const l of lines.slice(-n)) if (l) say(l);
+    return;
+  }
+
+  // ── config（读写本机设置）──
+  if (action === 'config') {
+    const settings = require('./lib/settings');
+    if (args.flags.json === true) { say(JSON.stringify(settings.read(), null, 2)); return; }
+
+    const setArg = args.flags.set;          // --set key=value（可重复不行，gen.js 解析器限制）
+    if (setArg) {
+      const eq = String(setArg).indexOf('=');
+      if (eq < 0) { bad('格式：--set key=value'); process.exit(2); }
+      const k = String(setArg).slice(0, eq);
+      let v = String(setArg).slice(eq + 1);
+      const patch = {};
+      if (k === 'initialDelayMs' || k === 'delayMs') patch[k] = Number(v);
+      else if (k === 'neverPromptDelete' || k === 'neverWarnStartup') patch[k] = (v === 'true' || v === '1');
+      else if (k === 'pythonw') patch[k] = v === 'auto' ? null : v;
+      else { bad(`未知设置项：${k}`); say(dim('  可用：initialDelayMs / delayMs / neverPromptDelete / neverWarnStartup / pythonw')); process.exit(2); }
+      const r = settings.write(patch);
+      if (!r.ok) { bad(r.error); process.exit(1); }
+      ok(`已保存：${k} = ${JSON.stringify(patch[k])}`);
+      say(dim(`  ${r.path}`));
+      return;
     }
+
+    const cur = settings.read();
+    say(`${C.b}开机自启动设置${C.x} ${dim(`(${settings.FILE})`)}`);
     say();
-    say(dim('  删除：node gen.js autostart off <profile>'));
+    say(`  初始延迟      ${cur.initialDelayMs} ms ${dim('（开机后等多久再启动第一个）')}`);
+    say(`  逐条间隔      ${cur.delayMs} ms ${dim('（给上一个应用留启动缓冲）')}`);
+    say(`  关闭最后一项时不再询问  ${cur.neverPromptDelete}`);
+    say(`  无启用项时不再警告      ${cur.neverWarnStartup}`);
+    say(`  运行器        ${cur.pythonw === null ? '自动检测' : (cur.pythonw || '（明确不用）')}`);
+    say();
+    say(dim('  改：node gen.js autostart config --set delayMs=8000'));
+    say(dim('  运行器自动检测结果：node gen.js env（或 UI 里的「检测」按钮）'));
     return;
   }
 
@@ -879,7 +967,6 @@ function cmdAutostart(args) {
     const r = autostart.enable(name, {
       exe: prof.exe,
       processName: prof.processName,
-      isolate: args.flags.isolate === true,
       ignoreConflicts: args.flags.force === true,
     });
 
@@ -890,7 +977,7 @@ function cmdAutostart(args) {
         say(`    ${C.y}${c.where}${C.x}  ${c.name}  ${dim(`(${c.how})`)}`);
       }
       say();
-      say('这意味着开机后应用会自己启动一次，而我们的注入器也会再启动一次。');
+      say('这意味着开机后应用会自己启动一次，而我们的中转器也会再启动一次。');
       say('两者会撞单实例锁：第二次启动会直接退出，调试端口也就开不起来。');
       say();
       say(`建议二选一：`);
@@ -901,19 +988,27 @@ function cmdAutostart(args) {
       say(`     删除上面列出的那个启动项，然后：`);
       say(`     ${C.c}node gen.js autostart on ${name} --force${C.x}`);
       say();
-      say(dim('  --force 会跳过这个检查，两个自启动项并存。'));
+      say(dim('  --force 会跳过这个检查。'));
       process.exitCode = 1;
       return;
     }
     if (!r.ok) { bad(r.error); process.exit(1); }
 
-    ok(`已创建自启动项：${r.lnk}`);
+    ok(`已启用开机自启动：${name}`);
     say();
-    say(`  指向      ${r.pythonw}`);
-    say(`  参数      ${r.args}`);
+    say(`  中转器    ${r.relay}`);
+    say(`  运行器    ${r.pythonw}`);
+    if (r.removedLegacy && r.removedLegacy.length) {
+      say(`  ${C.y}已删除旧式启动项${C.x} ${dim('（避免与中转器重复启动）')}`);
+      for (const l of r.removedLegacy) say(`    ${l}`);
+    }
     say();
-    say(dim('  下次登录时自动拉起注入（无窗口，后台运行）。'));
-    say(dim('  之后打开 UI 就能在会话列表里看到并管理它。'));
+    say(dim('  下次登录时，中转器会按字母序逐个拉起已启用的应用（带间隔）。'));
+    say();
+    // 用户指定：提示自定义开机参数要改 profile
+    say(`${C.y}需要给开机启动单独设置参数？${C.x}改这个文件：`);
+    say(`  ${C.c}${r.profilePath}${C.x}`);
+    say(dim('  在里面加 "autostart": { "appArgs": ["--hidden"] }（null = 沿用顶层 appArgs）。'));
     return;
   }
 
@@ -921,11 +1016,25 @@ function cmdAutostart(args) {
   if (action === 'off') {
     const r = autostart.disable(name);
     if (!r.ok) { bad(r.error); process.exit(1); }
-    ok(`已删除自启动项：${r.lnk}`);
+    ok(`已关闭开机自启动：${name}`);
+    if (r.shouldPromptDelete) {
+      say();
+      say(dim('  现在没有任何 profile 启用自启动了。'));
+      say(dim('  中转器快捷方式还留着（开机后会起来、发现没东西可启动、然后退出）。'));
+      say(dim('  想删掉它：node gen.js autostart off --cleanup'));
+    }
     return;
   }
 
-  bad(`未知动作：${action}（可用：on / off / list）`);
+  // ── off --cleanup（删除中转器快捷方式）──
+  if (action === 'cleanup') {
+    const r = autostart.removeRelayLnk();
+    if (!r.ok) { bad(r.error); process.exit(1); }
+    ok(r.already ? '中转器本来就不存在' : `已删除中转器：${r.lnk}`);
+    return;
+  }
+
+  bad(`未知动作：${action}（可用：on / off / list / run / log / config / cleanup）`);
   process.exit(2);
 }
 
@@ -973,6 +1082,35 @@ function collectDoctorData() {
       });
     }
   } catch { /* 读不到就当没有 */ }
+
+  // 中转器状态与运行器可用性 —— 也预读一次，循环里纯内存判断。
+  //
+  // relayExists：中转器 .lnk 在不在（readAutostartAll 已缓存，零额外成本）
+  // pythonwOk：**不实测**，只看设置项/where 能否定位到文件。
+  //   doctor 在热路径上（UI 的 get_overview 会调它），实测 -c 要 100ms+ 起进程，
+  //   不能放这里 —— 真正的实测留给 UI 的「检测」按钮和 `gen.js env`。
+  let relayExists = false;
+  try {
+    const st = autostart.listManaged();
+    relayExists = !!(st.relay && st.relay.exists);
+  } catch { /* 忽略 */ }
+  let pythonwOk = true;
+  try {
+    const cfg = require('./lib/settings').read();
+    if (cfg.pythonw === '') {
+      pythonwOk = false;                 // 用户明确说不用 Python
+    } else if (typeof cfg.pythonw === 'string' && cfg.pythonw) {
+      pythonwOk = fs.existsSync(cfg.pythonw);
+    } else {
+      // 自动模式：只看 where 能不能找到（不起进程实测）
+      try {
+        const out = execFileSync('where', ['pythonw'], {
+          encoding: 'utf8', timeout: 5000, windowsHide: true,
+        }).trim();
+        pythonwOk = !!out;
+      } catch { pythonwOk = false; }
+    }
+  } catch { /* 忽略 */ }
 
   /** 从一条命令行里剥出参数部分。 */
   function extractArgsFromCommand(cmd) {
@@ -1073,6 +1211,37 @@ function collectDoctorData() {
           );
         }
       } catch { /* 读不到不报错 */ }
+    }
+
+    // ── 开机自启动（中转器）──
+    //
+    // 全部用**内存里已有**的数据判断，不再起进程/PowerShell：
+    //   · relayState / pythonw 在循环外预读一次（见下面）
+    //   · autostart.appArgs 与 appArgs 的比对是纯内存
+    // 这条纪律来自第 10 条的教训（昂贵查询不能进热路径）。
+    const au = p.autostart || {};
+    const auEnabled = au.enabled === true;
+
+    if (auEnabled && !relayExists) {
+      issues.push(
+        'autostart.enabled 为 true，但中转器快捷方式不存在 → 开机不会启动任何东西。' +
+        ' 重新执行 `node gen.js autostart on ' + n + '` 会重建它。'
+      );
+    }
+    if (autostart.appArgsDiffer(p)) {
+      const eff = autostart.effectiveAppArgs(p);
+      const top = Array.isArray(p.appArgs) ? p.appArgs : [];
+      issues.push(
+        `自启动参数与手动启动参数不同：手动用 [${top.join(' ')}]，开机用 [${eff.join(' ')}]。` +
+        ' 这是有意配置（autostart.appArgs 覆盖顶层 appArgs）时正常；' +
+        ' 若你只是想沿用顶层参数，把 autostart.appArgs 设为 null。'
+      );
+    }
+    if (auEnabled && !pythonwOk) {
+      issues.push(
+        '已启用开机自启动，但找不到可用的 pythonw.exe → 开机时中转器不会被拉起。' +
+        ' 在 UI 的「自启动运行器」里点「检测」，或 `node gen.js autostart config --set pythonw=<路径>`。'
+      );
     }
 
     // ── Dark Reader 字段校验 ──
@@ -1249,6 +1418,19 @@ function cmdEnv(args) {
   }
   add('pywebview', 'pywebview', false, wvOk, wvDetail,
     wvOk ? null : '图形界面的依赖。装：pip install pywebview');
+
+  // 4b) pythonw（开机自启动的运行器，可选）
+  //
+  // 用与 autostart.findPythonw 相同的判据（实测能跑）—— 不实测就会
+  // 把商店版别名误判成不可用（existsSync 对它返回 false，见 lib/autostart.js 注释）。
+  const { execFileSync: _exef } = require('child_process');
+  let pywOk = false, pywDetail = '未找到';
+  try {
+    const pyw = autostart.findPythonw();
+    if (pyw) { pywOk = true; pywDetail = pyw; }
+  } catch { /* 忽略 */ }
+  add('pythonw', 'pythonw（开机自启用）', false, pywOk, pywDetail,
+    pywOk ? null : '开机自启用它才不会闪黑窗口。没装 Python 时可用任务计划程序替代（见 CLI.md 第六节）。');
 
   // 5) 项目文件完整性（自己是不是被完整拷来了）
   const missing = [];

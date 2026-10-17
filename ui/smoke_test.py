@@ -693,6 +693,102 @@ def run():
             check("主题选择已记住", saved in ("dark", "light"), True,
                   f"saved={saved}")
 
+            # 25) 开机自启动弹窗（中转器模式）
+            check("顶栏有「开机自启」按钮",
+                  win.evaluate_js("!!document.getElementById('btnAutostart')"), True)
+
+            win.evaluate_js("document.getElementById('btnAutostart').click()")
+            # 打开时要读一次状态（走 node，约 0.3s），轮询等渲染完成
+            for _ in range(50):
+                if win.evaluate_js(
+                        "document.querySelectorAll('#asList .as-item').length > 0"):
+                    break
+                time.sleep(0.1)
+            check("弹窗可见",
+                  win.evaluate_js(
+                      "!document.getElementById('autostartModal').classList.contains('hidden')"),
+                  True)
+            n_as = win.evaluate_js("document.querySelectorAll('#asList .as-item').length")
+            n_prof = len(A.list_profiles_on_disk())
+            check("弹窗列出了全部 profile", n_as == n_prof, True,
+                  f"as={n_as} profiles={n_prof}")
+            check("有「打开用户启动文件夹」按钮",
+                  win.evaluate_js("!!document.getElementById('asOpenUser')"), True)
+            check("有「打开系统启动文件夹」按钮",
+                  win.evaluate_js("!!document.getElementById('asOpenSystem')"), True)
+            check("有运行器检测按钮",
+                  win.evaluate_js("!!document.getElementById('asDetect')"), True)
+            check("有初始延迟输入框",
+                  win.evaluate_js(
+                      "(() => { const e = document.getElementById('asInitial');"
+                      "return !!e && e.type === 'number'; })()"), True)
+            check("有逐条间隔输入框",
+                  win.evaluate_js("!!document.getElementById('asDelay')"), True)
+
+            # 预计时间文案：改数字后应立即更新
+            win.evaluate_js(
+                "(() => { const e = document.getElementById('asInitial');"
+                "e.value = '3'; e.dispatchEvent(new Event('input')); })()")
+            est = win.evaluate_js("document.getElementById('asEstimate').textContent") or ""
+            check("改延迟后更新预计时间", "预计" in est or "没有勾选" in est, True, est[:60])
+
+            # 状态 API 结构
+            st_as = api.get_autostart_state()
+            check("get_autostart_state 可调用", st_as.get("ok") is True, True, str(st_as)[:120])
+            check("返回 relay 状态", isinstance(st_as.get("relay"), dict), True,
+                  str(st_as.get("relay"))[:100])
+            check("返回 settings", isinstance(st_as.get("settings"), dict), True,
+                  str(st_as.get("settings"))[:100])
+            check("返回 profiles 列表", isinstance(st_as.get("profiles"), list), True)
+
+            # 设置往返
+            w_set = api.set_autostart_settings({"neverWarnStartup": True})
+            check("写自启动设置成功", w_set.get("ok") is True, True, str(w_set)[:120])
+            r_set = api.get_autostart_state().get("settings") or {}
+            check("设置能读回", r_set.get("neverWarnStartup") is True, True, str(r_set)[:120])
+            api.set_autostart_settings({"neverWarnStartup": False})   # 还原
+
+            # 上次失败摘要 API（通常没有文件，只验不崩）
+            last = api.get_autostart_last()
+            check("get_autostart_last 可调用", last.get("ok") is True, True, str(last)[:100])
+
+            # 运行器检测：真跑一次，至少要能跑通（可能一个都没有，那不报错）
+            det = api.detect_pythonw()
+            check("detect_pythonw 可调用", det.get("ok") is True and isinstance(det.get("items"), list),
+                  True, str(det)[:140])
+
+            win.evaluate_js("document.getElementById('asClose').click()")
+            time.sleep(0.3)
+            check("弹窗能关闭",
+                  win.evaluate_js(
+                      "document.getElementById('autostartModal').classList.contains('hidden')"),
+                  True)
+
+            # 26) 列表徽章：伪造带 autostart 标记的 profile，断言两个徽章都渲染
+            badges = win.evaluate_js("""
+              (() => {
+                const save = { profiles: STATE.profiles, ready: STATE.ready };
+                STATE.ready = false;
+                STATE.profiles = [
+                  { name: 'A', displayName: 'A', autostartEnabled: true, autostartArgsDiffer: false },
+                  { name: 'B', displayName: 'B', autostartEnabled: true, autostartArgsDiffer: true },
+                ];
+                renderList();
+                const auto = document.querySelectorAll('#profileList .auto-dot').length;
+                const args = document.querySelectorAll('#profileList .args-dot').length;
+                STATE.profiles = save.profiles; STATE.ready = save.ready;
+                renderList();
+                return JSON.stringify({ auto, args });
+              })()
+            """)
+            try:
+                import json as _json_as
+                bd_as = _json_as.loads(badges) if badges else {}
+            except Exception:
+                bd_as = {}
+            check("已启用自启动→淡绿徽章", bd_as.get("auto") == 2, True, str(bd_as))
+            check("参数不同→浅黄徽章", bd_as.get("args") == 1, True, str(bd_as))
+
         except Exception:
             RESULT["error"] = traceback.format_exc()
         finally:
@@ -711,8 +807,10 @@ def run():
 
 
 if __name__ == "__main__":
-    # 看门狗：测试项目多了以后要留足时间（有若干 sleep 等异步渲染）
-    watchdog = threading.Timer(90, lambda: os._exit(3))
+    # 看门狗：测试项目多了以后要留足时间（有若干 sleep 等异步渲染）。
+    # 自启动测试里 detect_pythonw 要真跑几个候选解释器（每个约 0.2-1s），
+    # 所以给到 150 秒。
+    watchdog = threading.Timer(150, lambda: os._exit(3))
     watchdog.daemon = True
     watchdog.start()
 

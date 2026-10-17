@@ -54,6 +54,21 @@ GEN_JS = ROOT / "gen.js"
 INJECTOR = ROOT / "injector" / "noglass.js"
 PROFILES_DIR = ROOT / "profiles"
 CSS_DIR = ROOT / "css"
+RUN_DIR = ROOT / "run"
+AUTOSTART_LOG_DIR = RUN_DIR / "logs" / "autostart"
+AUTOSTART_LOG = AUTOSTART_LOG_DIR / "autostart.log"
+AUTOSTART_LAST = RUN_DIR / "autostart-last.json"
+SETTINGS_FILE = ROOT / "local" / "autostart.json"
+
+# 与 lib/settings.js 的 DEFAULTS 必须一致 —— 两边读写同一份文件。
+# 改字段时两处都要改。
+AUTOSTART_DEFAULTS = {
+    "initialDelayMs": 8000,
+    "delayMs": 6000,
+    "neverPromptDelete": False,
+    "neverWarnStartup": False,
+    "pythonw": None,
+}
 
 # 隐藏子进程的控制台窗口。
 #
@@ -1122,6 +1137,159 @@ class Api:
         except Exception as e:                           # noqa: BLE001
             return {"ok": False, "error": str(e), "hits": [], "args": []}
 
+    # ── 开机自启动（中转器）──
+    #
+    # 这些都调 node 侧（lib/autostart.js），不在 Python 里重写判断逻辑 ——
+    # 两侧各写一套是本项目反复踩的坑（见 get_app_autostart 的注释）。
+    # 例外：run_autostart_all 必须在 Python 里（它是中转器本体，由 .lnk 直接拉起）。
+
+    @staticmethod
+    def _node_json(script, timeout=60):
+        """跑一段 node -e 并解析 JSON。失败返回 None（调用方给默认值）。"""
+        try:
+            r = subprocess.run(
+                ["node", "-e", script],
+                cwd=str(ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if r.returncode != 0:
+                return None, (r.stderr or "node 执行失败")[:400]
+            return json.loads(r.stdout or "null"), None
+        except Exception as e:                           # noqa: BLE001
+            return None, str(e)
+
+    def get_autostart_state(self):
+        """
+        自启动的完整状态，供 UI 弹窗渲染。
+
+        返回：
+          relay    — 中转器 .lnk 是否存在、指向什么
+          enabled  — 启用了自启动的 profile 列表
+          legacy   — 旧式 per-profile .lnk（待清理）
+          settings — local/autostart.json 的内容（含默认值）
+          profiles — 全部 profile 名（弹窗要列出来，包括未启用的）
+        """
+        script = (
+            "const a=require('./lib/autostart');"
+            "const s=require('./lib/settings');"
+            "process.stdout.write(JSON.stringify({state:a.listManaged(),settings:s.read()}));"
+        )
+        data, err = self._node_json(script)
+        if data is None:
+            return {"ok": False, "error": err or "读取失败"}
+
+        names = []
+        try:
+            names = [p.name for p in sorted(PROFILES_DIR.glob("*.json"))
+                     if not p.name.startswith("_")]
+            names = [n[:-5] for n in names]
+        except Exception:                                # noqa: BLE001
+            pass
+
+        return {
+            "ok": True,
+            "relay": data.get("state", {}).get("relay"),
+            "enabled": data.get("state", {}).get("enabled", []),
+            "legacy": data.get("state", {}).get("legacy", []),
+            "settings": data.get("settings", {}),
+            "profiles": names,
+        }
+
+    def set_autostart(self, name, enabled):
+        """开关一个 profile 的开机自启动。"""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name or "")):
+            return {"ok": False, "error": "profile 名不合法"}
+        try:
+            prof = read_profile(name)
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+        fn = "enable" if enabled else "disable"
+        script = (
+            "const a=require('./lib/autostart');"
+            f"const r=a.{fn}({json.dumps(name)},"
+            f"{{exe:{json.dumps(prof.get('exe') or '')},"
+            f"processName:{json.dumps(prof.get('processName') or '')},"
+            "ignoreConflicts:true}});"
+            "process.stdout.write(JSON.stringify(r));"
+        )
+        data, err = self._node_json(script)
+        if data is None:
+            return {"ok": False, "error": err or "操作失败"}
+        return data
+
+    def detect_pythonw(self):
+        """检测所有候选 pythonw（UI 的「检测」按钮）。真跑一次才算数。"""
+        script = (
+            "const a=require('./lib/autostart');"
+            "process.stdout.write(JSON.stringify(a.detectPythonw()));"
+        )
+        data, err = self._node_json(script, timeout=120)
+        if data is None:
+            return {"ok": False, "error": err or "检测失败", "items": [], "selected": None}
+        return {"ok": True, **data}
+
+    def remove_relay_lnk(self):
+        """删除中转器快捷方式（用户在「关闭最后一项」时选择删除）。"""
+        script = (
+            "const a=require('./lib/autostart');"
+            "process.stdout.write(JSON.stringify(a.removeRelayLnk()));"
+        )
+        data, err = self._node_json(script)
+        if data is None:
+            return {"ok": False, "error": err or "删除失败"}
+        return data
+
+    def set_autostart_settings(self, patch):
+        """写 local/autostart.json（合并式）。"""
+        if not isinstance(patch, dict):
+            return {"ok": False, "error": "参数必须是对象"}
+        r = write_autostart_settings(patch)
+        if r.get("ok"):
+            # 中转器 .lnk 里存的是 pythonw 的绝对路径 —— 改了运行器就得重建，
+            # 否则下次开机还是用旧路径。
+            if "pythonw" in patch:
+                script = (
+                    "const a=require('./lib/autostart');"
+                    "const r=a.ensureRelayLnk();"
+                    "process.stdout.write(JSON.stringify(r));"
+                )
+                data, err = self._node_json(script)
+                if data is not None and not data.get("ok"):
+                    r["relayWarning"] = data.get("error") or err
+        return r
+
+    def get_autostart_last(self):
+        """读上次开机自启的失败摘要（run/autostart-last.json）。"""
+        try:
+            data = json.loads(AUTOSTART_LAST.read_text(encoding="utf-8"))
+            return {"ok": True, "last": data}
+        except Exception:                                # noqa: BLE001
+            return {"ok": True, "last": None}
+
+    def open_startup_folder(self, which="user"):
+        """
+        用文件管理器打开启动文件夹（只读浏览，不列内容）。
+
+        为什么不在 UI 里列启动项：每次打开都读一遍启动文件夹 + 解析 .lnk
+        是真实开销（用户抱怨过 CPU）。给个按钮让用户自己看，零成本。
+        """
+        try:
+            script = (
+                "const a=require('./lib/autostart');"
+                f"process.stdout.write(JSON.stringify({{p:{json.dumps('system' if which == 'system' else 'user')}"
+                "==='system'?a.systemStartupDir():a.startupDir()}));"
+            )
+            data, err = self._node_json(script)
+            if data is None or not data.get("p"):
+                return {"ok": False, "error": err or "取不到启动文件夹路径"}
+            p = data["p"]
+            subprocess.Popen(["explorer.exe", p], creationflags=CREATE_NO_WINDOW)
+            return {"ok": True, "path": p}
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
     # ── 自定义 CSS ──
     def get_custom_css(self, name):
         """
@@ -1308,6 +1476,266 @@ class Api:
 
 # ─────────────────────────── 入口 ───────────────────────────
 
+# ─────────────────────────── 开机自启动（中转器）───────────────────────────
+#
+# 设计要点（与 lib/settings.js、lib/autostart.js 保持同一套契约）：
+#
+#   · **一个**中转器快捷方式（`no-glass · autostart.lnk`）→
+#     `pythonw ui/app.py --autostart-all`
+#   · 中转器扫描 profiles/*.json 里 autostart.enabled 为真的那些，逐条启动、带延迟
+#   · 每个应用照常走自己的 session（登记到 run/sessions/，ps 能看到、能单独停）
+#
+# 为什么不在快捷方式里写参数：参数一旦进了 .lnk 就有转义问题（cmd/PowerShell
+# 对引号的消耗方式不同），而且它是"隐藏状态"（不在任何日常会打开的文件里）。
+# 记在 profile 里则天然可读、可 diff、可注释。
+
+
+def read_autostart_settings():
+    """
+    读 local/autostart.json。文件不存在/损坏时返回默认值（不抛错）。
+
+    与 lib/settings.js 的 read() 规则一致：只取认识的字段、校验类型。
+    """
+    out = dict(AUTOSTART_DEFAULTS)
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        return out
+    if not isinstance(raw, dict):
+        return out
+    v = raw.get("initialDelayMs")
+    if isinstance(v, (int, float)) and v >= 0:
+        out["initialDelayMs"] = min(int(v), 120000)
+    v = raw.get("delayMs")
+    if isinstance(v, (int, float)) and v >= 0:
+        out["delayMs"] = min(int(v), 120000)
+    if isinstance(raw.get("neverPromptDelete"), bool):
+        out["neverPromptDelete"] = raw["neverPromptDelete"]
+    if isinstance(raw.get("neverWarnStartup"), bool):
+        out["neverWarnStartup"] = raw["neverWarnStartup"]
+    if raw.get("pythonw") is None or isinstance(raw.get("pythonw"), str):
+        out["pythonw"] = raw.get("pythonw")
+    return out
+
+
+def write_autostart_settings(patch):
+    """合并式写设置（原子写：先写临时文件再改名）。"""
+    cur = read_autostart_settings()
+    if isinstance(patch, dict):
+        for k in ("initialDelayMs", "delayMs"):
+            if isinstance(patch.get(k), (int, float)):
+                cur[k] = int(patch[k])
+        for k in ("neverPromptDelete", "neverWarnStartup"):
+            if isinstance(patch.get(k), bool):
+                cur[k] = patch[k]
+        if patch.get("pythonw") is None or isinstance(patch.get("pythonw"), str):
+            cur["pythonw"] = patch.get("pythonw")
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8", newline="\n")
+        tmp.replace(SETTINGS_FILE)
+        return {"ok": True, "path": str(SETTINGS_FILE), "settings": cur}
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+def scan_enabled_profiles():
+    """
+    扫描启用了自启动的 profile，按名字母序返回 [(name, profile_dict)]。
+
+    ⚠️ **直接读 profiles/*.json，绝不调 get_overview** ——
+    那个函数内部会跑 `gen.js list` + `gen.js doctor`（约 4 秒 + 多个 PowerShell），
+    正是开机时最不该有的负载。读几个小 JSON 是毫秒级。
+    """
+    out = []
+    if not PROFILES_DIR.exists():
+        return out
+    for f in sorted(PROFILES_DIR.glob("*.json")):
+        if f.name.startswith("_"):
+            continue
+        try:
+            prof = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:                                # noqa: BLE001
+            continue                                     # 单个坏了跳过（由调用方记日志）
+        au = prof.get("autostart") or {}
+        if au.get("enabled") is True:
+            out.append((f.stem, prof))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def effective_app_args(prof):
+    """
+    自启动时实际用的 app 参数（与 lib/autostart.js 的 effectiveAppArgs 一致）：
+      · autostart.appArgs 缺失/null → 回落到顶层 appArgs
+      · []                          → 明确无参数（覆盖顶层）
+      · 非空数组                     → 用它
+    """
+    au = (prof.get("autostart") or {})
+    a = au.get("appArgs", None)
+    if a is None:
+        top = prof.get("appArgs")
+        return list(top) if isinstance(top, list) else []
+    return list(a) if isinstance(a, list) else []
+
+
+class AutostartLog:
+    """中转器的日志。写 run/logs/autostart/autostart.log。"""
+
+    def __init__(self):
+        self.path = AUTOSTART_LOG
+        self._fh = None
+        try:
+            AUTOSTART_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
+        except Exception:                                # noqa: BLE001
+            self._fh = None
+
+    def _line(self, level, msg):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
+        # 统一走 stdout：混用 stderr 会让输出顺序错乱（管道里两个流分别缓冲）。
+        # 级别已经在行内标出来了，不需要靠流来区分。
+        print(line, file=sys.stdout)
+        if self._fh:
+            try:
+                self._fh.write(line + "\n")
+                self._fh.flush()
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def info(self, msg):
+        self._line("INFO", msg)
+
+    def warn(self, msg):
+        self._line("WARN", msg)
+
+    def error(self, msg):
+        self._line("ERROR", msg)
+
+    def close(self):
+        if self._fh:
+            try:
+                self._fh.close()
+            except Exception:                            # noqa: BLE001
+                pass
+
+
+def write_autostart_summary(ok_count, fail_count, failures):
+    """写 run/autostart-last.json —— UI 启动时读一次，用来提示上次失败。"""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ok": ok_count,
+            "failed": fail_count,
+            "failures": failures[:20],
+            "log": str(AUTOSTART_LOG),
+        }
+        AUTOSTART_LAST.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8", newline="\n")
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def run_autostart_all(dry_run=False):
+    """
+    中转器：扫描已启用的 profile，逐条带延迟拉起注入器，然后退出。
+
+    关键约束（都是踩过的坑，别改）：
+
+    1. **逐条 spawn 后立刻返回，不等端口就绪。**
+       注入器等调试端口最长 45 秒；若串行等待，N 个应用会变成几分钟。
+       `launch_injector(detached=True)` 是 Popen 后立即返回，符合要求。
+
+    2. **失败隔离。** 某个 profile 的 exe 不存在 / JSON 坏了 / 注入器秒退 →
+       记日志、继续下一条，绝不中断整个流程。
+
+    3. **除日志外不做任何写操作。** 不改 profile、不删残留、不重建 .lnk。
+       这是"开机自启"不是"维护"，写操作留给人主动触发。
+
+    4. **没有启用项时**：写日志；若未设 neverWarnStartup 则拉起 UI 提示。
+       此时**不等待延迟**（没东西要启动，没必要空等）。
+
+    5. **直接读 profiles/*.json**，不调 get_overview（见 scan_enabled_profiles）。
+    """
+    cfg = read_autostart_settings()
+    log = AutostartLog()
+    started = time.strftime("%Y-%m-%d %H:%M:%S")
+    log.info(f"=== 开机自启动开始（{started}）===")
+
+    entries = scan_enabled_profiles()
+    if not entries:
+        log.warn("没有应用启用自启动（所有 profile 的 autostart.enabled 都是 false）")
+        if not dry_run and not cfg["neverWarnStartup"]:
+            log.info("按设置拉起 UI 提示用户（neverWarnStartup=false）")
+            try:
+                # 无参数 = 打开图形界面（见 main()）
+                subprocess.Popen(
+                    [sys.executable, str(UI_DIR / "app.py")],
+                    cwd=str(ROOT),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+            except Exception as e:                       # noqa: BLE001
+                log.error(f"拉起 UI 失败：{e}")
+        log.info("=== 结束（没有需要启动的应用）===")
+        log.close()
+        if not dry_run:
+            write_autostart_summary(0, 0, [])
+        return 0
+
+    log.info(f"共 {len(entries)} 个应用：{', '.join(n for n, _ in entries)}")
+    if dry_run:
+        for name, prof in entries:
+            args = effective_app_args(prof)
+            log.info(f"  [dry-run] 将启动 {name}（appArgs={args}）")
+        log.info("=== dry-run 结束（未实际启动）===")
+        log.close()
+        return 0
+
+    delay = cfg["delayMs"] / 1000.0
+    initial = cfg["initialDelayMs"] / 1000.0
+    log.info(f"初始延迟 {initial:.1f}s，逐条间隔 {delay:.1f}s")
+    if initial > 0:
+        time.sleep(initial)
+
+    ok_count = 0
+    failures = []
+    for idx, (name, prof) in enumerate(entries):
+        exe = prof.get("exe")
+        if exe and not Path(exe).exists():
+            msg = f"exe 不存在，跳过：{exe}"
+            log.error(f"{name}: {msg}")
+            failures.append({"name": name, "error": msg})
+            continue
+        args = effective_app_args(prof)
+        try:
+            res = RUNNER.launch_injector(name, app_args=args, detached=True)
+        except Exception as e:                           # noqa: BLE001
+            log.error(f"{name}: 启动异常：{e}")
+            failures.append({"name": name, "error": str(e)})
+            continue
+        if res.get("ok"):
+            log.info(f"{name}: 已启动（pid {res.get('pid')}，appArgs={args}）")
+            ok_count += 1
+        else:
+            log.error(f"{name}: 启动失败：{res.get('error')}")
+            failures.append({"name": name, "error": str(res.get("error"))})
+
+        # 最后一条也睡：简单，且不影响结果（进程已 detached）
+        if idx < len(entries) - 1 and delay > 0:
+            time.sleep(delay)
+
+    log.info(f"=== 结束：成功 {ok_count}，失败 {len(failures)} ===")
+    log.close()
+    write_autostart_summary(ok_count, len(failures), failures)
+    return 0 if not failures else 1
+
+
 def run_headless(profiles, isolate=False):
     """
     无窗口模式：拉起指定 profile 的注入器，然后立刻退出。
@@ -1348,7 +1776,8 @@ def run_headless(profiles, isolate=False):
 
 def parse_ui_args(argv):
     """极简参数解析。UI 只有几个开关，不需要 argparse。"""
-    o = {"headless": False, "start": [], "isolate": False, "help": False}
+    o = {"headless": False, "start": [], "isolate": False, "help": False,
+         "autostart_all": False, "dry_run": False}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1358,6 +1787,10 @@ def parse_ui_args(argv):
             o["headless"] = True
         elif a == "--isolate":
             o["isolate"] = True
+        elif a == "--autostart-all":
+            o["autostart_all"] = True
+        elif a == "--dry-run":
+            o["dry_run"] = True
         elif a == "--start":
             i += 1
             if i < len(argv):
@@ -1373,15 +1806,18 @@ def ui_usage():
         "no-glass-ele 管理界面\n"
         "\n"
         "  python app.py                          打开图形界面\n"
+        "  python app.py --autostart-all          开机自启动中转器（扫描已启用的 profile，逐条拉起）\n"
+        "  python app.py --autostart-all --dry-run\n"
+        "                                         只打印会启动哪些，不实际启动\n"
         "  python app.py --headless --start <name>[,<name>...]\n"
-        "                                         无窗口拉起注入器后退出（自启动用）\n"
+        "                                         无窗口拉起指定 profile 的注入器后退出\n"
         "  python app.py --headless --start <name> --isolate\n"
-        "                                         隔离实例启动\n"
+        "                                         隔离实例启动（独立数据目录）\n"
         "\n"
         "配合 pythonw.exe 使用可完全无窗口：\n"
-        "  pythonw app.py --headless --start todo-list\n"
+        "  pythonw app.py --autostart-all\n"
         "\n"
-        "自启动项由 `node gen.js autostart on <name>` 创建，不需要手写这一串。\n"
+        "自启动项由 `node gen.js autostart on <profile>` 创建，不需要手写这一串。\n"
     )
 
 
@@ -1390,6 +1826,11 @@ def main():
     if opts["help"]:
         ui_usage()
         return 0
+
+    # 中转器模式：扫描已启用的 profile，逐条拉起后退出。
+    # 放在 headless 之前判断 —— 它不需要 gen.js，也不该被 gen.js 缺失拦住。
+    if opts["autostart_all"]:
+        return run_autostart_all(dry_run=opts["dry_run"])
 
     if not GEN_JS.exists():
         print(f"找不到 gen.js：{GEN_JS}", file=sys.stderr)

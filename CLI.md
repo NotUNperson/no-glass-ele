@@ -109,52 +109,113 @@ node gen.js doctor
 
 ---
 
-## 六、开机自启动（这一项需要 Python）
+## 六、开机自启动（需要 Python）
 
-**先说清楚**：`gen.js autostart` 会在启动文件夹放一个 `.lnk`，
-它指向 `pythonw.exe "...\ui\app.py" --headless --start <profile>`。
-**所以这条命令需要装 Python**（pywebview 不需要，无窗口模式不加载界面）。
+**先说清楚**：开机自启需要一个 `pythonw.exe`（GUI 子系统程序，不会留黑窗口）。
+所以这一项**需要装 Python**（pywebview 不需要 —— 无窗口模式不加载界面）。
+不装 Python 的话，见本节末尾的三个替代办法。
 
-纯 CLI 用户想要开机自启，有三个办法：
+### 它是怎么工作的
 
-### 办法 1：装 Python（最省事）
+启动文件夹里只有**一个**快捷方式（不是每个应用一个）：
 
-只需要 Python 本身，**不需要** pywebview：
-
-```bash
-node gen.js autostart on myapp      # 创建
-node gen.js autostart list          # 查看
-node gen.js autostart off myapp     # 删除
+```
+no-glass · autostart.lnk  →  pythonw ui/app.py --autostart-all
 ```
 
-为什么绕一层 Python：`node.exe` 是控制台程序，快捷方式直接指向它会留下一个
-常驻黑窗口。`pythonw.exe` 没有控制台，它再用 `CREATE_NO_WINDOW` 起 node，
-全程无窗口。
+登录后它会：扫描 `profiles/*.json` → 找出 `autostart.enabled` 为真的 →
+**按名字母序逐个**拉起（中间有间隔）→ 自己退出。
 
-### 办法 2：自己放一个快捷方式（不需要 Python，但会闪窗口）
+为什么不一次全起来：开机瞬间系统在抢磁盘，同时起多个应用会明显拖慢开机。
+默认初始等 8 秒、逐条间隔 6 秒。
 
-1. 右键 `apps\myapp\start.cmd` → 发送到 → 桌面快捷方式
-2. 把快捷方式拖进启动文件夹：`Win+R` → 输入 `shell:startup` → 回车
-3. 缺点：会短暂闪出一个控制台窗口（`start.cmd` 是控制台脚本）
+### 常用命令
 
-### 办法 3：任务计划程序（不需要 Python，可以完全无窗口）
+```bash
+node gen.js autostart on myapp       # 让 myapp 参与
+node gen.js autostart off myapp      # 不参与
+node gen.js autostart list           # 看谁启用了、中转器在不在
+node gen.js autostart run --dry-run  # 只打印会启动哪些（先确认再真跑）
+node gen.js autostart run            # 手动跑一次（等价于开机时做的事）
+node gen.js autostart log            # 看日志
+node gen.js autostart log -n 300     # 看更多行
+node gen.js autostart config         # 看延迟/运行器设置
+node gen.js autostart cleanup        # 删中转器快捷方式
+```
 
-1. `Win+R` → `taskschd.msc`
-2. 创建基本任务 → 触发器选「当我登录时」
-3. 操作选「启动程序」：
-   - 程序：`node.exe` 的完整路径（`where node` 查）
+### 给开机单独设置参数
+
+想要"开机静默、手动启动显示窗口"，把参数写在 profile 的 `autostart.appArgs`
+里，而不是顶层的 `appArgs`：
+
+```json
+{
+  "appArgs": [],
+  "autostart": {
+    "enabled": true,
+    "appArgs": ["--hidden"]
+  }
+}
+```
+
+| `autostart.appArgs` | 开机时实际收到 |
+|---|---|
+| 缺失 / `null` | 沿用顶层 `appArgs` |
+| `[]` | 明确无参数（覆盖顶层）|
+| `["--hidden"]` | 用它 |
+
+顶层 `appArgs` 仍然**无条件**用于手动启动 —— 所以两者可以不同。
+
+### 改启动节奏
+
+```bash
+node gen.js autostart config --set initialDelayMs=8000   # 初始延迟（毫秒）
+node gen.js autostart config --set delayMs=6000          # 逐条间隔（毫秒）
+```
+
+或者直接编辑 `local/autostart.json`（文件不存在时用默认值）。
+
+### 运行器（pythonw）出问题怎么办
+
+```bash
+node gen.js autostart config --set pythonw=auto              # 自动检测（默认）
+node gen.js autostart config --set pythonw="C:\...\pythonw.exe"  # 手动指定
+node gen.js autostart config --set pythonw=""                # 明确不用
+```
+
+自动模式会 `where pythonw` 拿全部候选、**逐个实测**能不能跑，第一个能跑的胜出。
+界面的「开机自启」弹窗里有「检测」按钮，会列出所有候选和版本。
+
+> **Python 换版本/换位置后**，已存在的 `.lnk` 会指向失效路径，开机时**静默失败**。
+> `node gen.js doctor` 会检查这一点（运行器路径不存在就报），
+> 提示你重新 `autostart on` 或重新检测。
+
+### 三个替代办法（不装 Python）
+
+如果实在不想装 Python：
+
+**办法 1：自己放快捷方式**（会闪窗口）
+
+右键 `apps\myapp\start.cmd` → 发送到桌面快捷方式 → 拖进启动文件夹
+（`Win+R` → `shell:startup`）。缺点：会短暂闪出控制台窗口。
+
+**办法 2：任务计划程序**（可完全无窗口，最接近原效果）
+
+1. `Win+R` → `taskschd.msc` → 创建基本任务
+2. 触发器：当我登录时
+3. 操作：启动程序
+   - 程序：`node.exe` 的完整路径（用 `where node` 查）
    - 参数：`"<仓库路径>\injector\noglass.js" --profile "<仓库路径>\profiles\myapp.json" --launch --watch --source autostart`
    - 起始于：`<仓库路径>`
-4. 在任务属性里勾「不管用户是否登录都要运行」可避免窗口（或用「隐藏」选项）
 
-办法 3 最接近 `gen.js autostart` 的效果，代价是要手填三个路径。
+**办法 3：装 Python 但不装 pywebview**（最省事，推荐）
+
+只要 Python 本体即可，`pip install pywebview` 可以跳过 ——
+无窗口模式不加载界面。然后正常用 `gen.js autostart on`。
 
 > **冲突检测**：如果应用**自己**就有自启动项，开机后它先起来、我们的注入器再启动
-> 会撞单实例锁，注入静默失败。`autostart on` 会检查并中止（用 `--force` 跳过）。
-> 纯 CLI 用手动方式的话，**要自己注意这一点** —— 先在「任务管理器 → 启动」里
-> 禁用应用自己那一项。
-
----
+> 会撞单实例锁，注入静默失败。`autostart on` 会检查并中止（`--force` 跳过）。
+> 纯 CLI 用手动方式的话要自己注意：先在「任务管理器 → 启动」里禁用应用自己那一项。
 
 ## 七、常见问题
 

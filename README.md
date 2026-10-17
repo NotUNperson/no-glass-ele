@@ -258,27 +258,44 @@ node gen.js prune           # 清掉残留注册项（含僵尸项）
 让某个应用的「去玻璃 + 深色」在开机后自动生效，不用手动点启动脚本。
 
 ```bash
-node gen.js autostart on myapp     # 创建启动项
-node gen.js autostart off myapp    # 删除
-node gen.js autostart list         # 查看本工具创建的项
+node gen.js autostart on myapp      # 让 myapp 参与开机自启（自动建/维护中转器）
+node gen.js autostart off myapp     # 不参与
+node gen.js autostart list          # 看谁启用了、中转器在不在
+node gen.js autostart run           # 手动跑一次中转器（调试用，前台输出）
+node gen.js autostart run --dry-run # 只打印会启动哪些，不实际启动
+node gen.js autostart log           # 看中转器日志
+node gen.js autostart config        # 看/改延迟与运行器设置
 ```
 
-> **只能走命令行** —— 界面上没有这个入口（有意为之：自启动是低频操作，
-> 改错了会影响开机体验，用命令行多一层确认）。
+界面上也有入口：顶栏「开机自启」按钮 —— 勾选列表、运行器检测、延迟设置、
+打开启动文件夹都在那里。命令行与界面操作的是同一份配置，可以混用。
 
 #### 它到底做了什么
 
-在**用户启动文件夹**放一个快捷方式：
+**一个**中转器快捷方式（不是每个应用一个）：
 
 ```
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\no-glass · <profile>.lnk
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\no-glass · autostart.lnk
       ↓ 指向
-pythonw.exe  "<项目>/ui/app.py" --headless --start <profile>
-      ↓
+pythonw.exe  "<项目>/ui/app.py" --autostart-all
+      ↓ 扫描 profiles/*.json，按名字母序
+      ↓ 逐条：等一会 → 拉起 → 再等一会 → 下一条
 node.exe  injector/noglass.js --profile ... --launch --watch
       ↓ detached 启动
 <目标应用>.exe  --remote-debugging-port=<port>
 ```
+
+**为什么用一个中转器，而不是每个应用一个 `.lnk`：**
+
+- **状态只有一个来源**：哪些应用参与自启，完全由 `profiles/*.json` 的
+  `autostart.enabled` 决定。不再有"`.lnk` 在不在"和"profile 里怎么写"两份状态打架。
+- **参数没有转义问题**：`Arguments` 字段是固定的 `--autostart-all`，不含任何用户内容。
+  要自定义开机参数就改 profile（JSON，不需要转义）。
+- **开机负载错峰**：以前 N 个应用会同时起来；现在逐条带间隔，不会挤在一起。
+- **失败隔离**：某个应用起不来（exe 被卸载、配置坏了），只记日志，继续下一条。
+
+**为什么延迟是必须的**：开机瞬间系统本身在抢磁盘，同时拉起多个应用会让
+开机体验明显变差。默认初始等 8 秒、逐条间隔 6 秒（`local/autostart.json` 可调）。
 
 **为什么要绕一层 Python，不直接让 .lnk 指向 node.exe：**
 
@@ -291,77 +308,108 @@ node.exe  injector/noglass.js --profile ... --launch --watch
 接 DEVNULL 并脱离父进程）。父进程退出不影响它；它也**不能**接管道——
 读端一关，注入器下次写日志就会 EPIPE 崩溃。
 
-所以：开机 → 快捷方式拉起 pythonw → pythonw 起注入器后立刻退出 →
+所以：开机 → 中转器拉起 pythonw → 它逐个起注入器后立刻退出 →
 注入器常驻并把自己登记到 `run/sessions/` → 打开 UI 就能在会话列表里
-看到并管理它（`gen.js ps` 里来源标记为 `autostart`）。
+看到并管理它们（`gen.js ps` 里来源标记为 `autostart`）。
 
-#### 单实例锁冲突（最重要的一条）
+#### 每个应用自己的开机参数
 
-`autostart on` 会先查三个地方，看这个应用**自己**有没有自启动项：
+如果应用需要"开机静默、手动启动时显示窗口"，把参数写在 profile 的
+`autostart.appArgs` 里，而不是顶层的 `appArgs`：
 
-| 检查范围 | 匹配方式 |
+```json
+{
+  "appArgs": [],
+  "autostart": {
+    "enabled": true,
+    "appArgs": ["--hidden"]
+  }
+}
+```
+
+规则：
+
+| `autostart.appArgs` | 开机时实际收到 |
 |---|---|
-| 用户启动文件夹（`.lnk`）| 文件名含 exe 名 |
-| `HKCU\...\CurrentVersion\Run` | 值里含 exe 名或路径 |
-| `HKLM\...\CurrentVersion\Run` | 同上 |
+| 字段缺失 / `null` | 沿用顶层 `appArgs` |
+| `[]` | **明确无参数**（覆盖掉顶层的） |
+| `["--hidden"]` | 用它 |
 
-（本工具自己创建的项以 `no-glass · ` 开头，会被排除，不算冲突。）
+**顶层 `appArgs` 仍然无条件用于手动启动** —— 所以两者可以不同，这正是它的用处。
 
-**为什么必须查**：如果应用自己就开机启动，那么开机后会有两种情况叠加 ——
-应用自己先起来了，我们的注入器又启动一次，**第二次会撞单实例锁直接退出**，
-调试端口开不起来，注入静默失败（你会以为配置没生效）。
+界面上会在应用列表里显示两个标记：**淡绿「自启」**（已启用）与
+**浅黄「参数不同」**（`autostart.appArgs` 与 `appArgs` 不一致，提醒你这是有意配置）。
 
-发现冲突时命令会**中止并列出**找到的项，让你决定：
+#### 运行器（pythonw）的选择与检测
 
-```
-! 检测到该应用**已经**有自启动项：
+中转器需要一个 `pythonw.exe`。路径存在 `.lnk` 里（快捷方式只能存绝对路径，
+不能存环境变量），所以 Python 换版本/换位置后它会失效 —— 而且是**静默失效**
+（开机时 Windows 找不到程序，什么都不发生）。
 
-    HKCU\Software\Microsoft\Windows\CurrentVersion\Run  <项名>  (值匹配)
-```
-
-**两条路，选一条：**
-
-1. **保留应用自己的自启动**（这时的做法是「手动注入」）。但要注意一个硬限制：
-   应用自己启动时**没有调试端口**，注入器无法接管已运行的实例。
-   所以要么每次手动重启一次应用，要么接受它没有注入效果。
-   （`gen.js ps` 看不到它，因为没登记、也没端口。）
-
-2. **关掉应用自己的自启动，改用本工具代理**（推荐）。删掉那一项，然后：
-
-   ```bash
-   node gen.js autostart on myapp --force
-   ```
-
-   `--force` 跳过冲突检查。此后由本工具负责启动应用——它是**带调试端口**
-   启动的，注入才有效。
-
-#### 其它开关
+处理办法：
 
 ```bash
-node gen.js autostart on <profile> --isolate   # 用独立数据目录启动
+node gen.js autostart config --set pythonw=auto          # 自动（默认）
+node gen.js autostart config --set pythonw="C:\...\pythonw.exe"   # 手动指定
+node gen.js autostart config --set pythonw=""            # 明确不用 Python
 ```
 
-隔离启动意味着每次开机是一个干净实例（不读你平时用的数据）。除非你明确
-需要，一般不要加。
+自动模式下会 `where pythonw` 拿到**全部**候选，逐个**真的跑一次**
+（`pythonw -c "..."`），第一个能跑的胜出。这一步在启用自启动时执行，
+不影响开机速度。
+
+> **一个真实的坑**：不能靠"文件存不存在"或"文件大小"来判断。
+> Microsoft Store 的 `...\WindowsApps\pythonw.exe` 是一个指向受保护目录的符号链接，
+> Node 的 `fs.existsSync()` 对它返回 **false**（底层 stat 报 EACCES）——
+> 但它**完全可执行**。唯一可靠的判据是实测能不能跑。
+
+`doctor` 会检查运行器路径是否还存在（只做 `existsSync`，不实测 ——
+doctor 在热路径上，不能起进程）。界面里的「检测」按钮会做完整实测并列出所有候选。
+
+#### 日志与失败提示
+
+中转器的输出写到 `run/logs/autostart/autostart.log`：
+
+```bash
+node gen.js autostart log          # 看最近 100 行
+node gen.js autostart log -n 300   # 看更多
+```
+
+每次运行结束会写一份摘要 `run/autostart-last.json`（成功几条、失败几条、
+失败原因）。**打开界面时如果有失败会提示一句** —— 因为开机失败是静默的，
+而你不会主动去翻日志文件。
 
 #### 验证它真的生效
 
 ```bash
-node gen.js autostart list      # 确认项已创建
+node gen.js autostart list      # 确认中转器在、以及哪些 profile 启用了
+node gen.js autostart run --dry-run   # 只打印会启动哪些（真跑之前先确认）
 node gen.js ps                  # 重启后应有来源为 autostart 的会话
 ```
 
-想立即测试（不必真重启电脑）：直接跑快捷方式指向的那条命令，或从启动
-文件夹双击那个 `.lnk`。效果等价。
+想立即测试（不必真重启电脑）：
+
+```bash
+node gen.js autostart run       # 等价于开机时中转器做的事
+```
+
+或从启动文件夹双击 `no-glass · autostart.lnk`。效果等价。
+
+> 注意：如果应用**已经在跑**，中转器会记一条「已经在运行中」并跳过
+> —— 这是正确的（同一应用只允许一个注入会话）。测试前先停掉现有会话。
 
 #### 卸载
 
 ```bash
-node gen.js autostart off <profile>     # 删这一项
+node gen.js autostart off <profile>     # 让某个应用不参与
+node gen.js autostart cleanup           # 删掉中转器快捷方式
 ```
 
-或直接删启动文件夹里的 `no-glass · *.lnk` —— 两者等价，不会留注册表残留
-（本工具只写启动文件夹，不写 Run 键）。
+关掉最后一个应用时，界面会问你要不要删中转器；命令行会提示
+`autostart cleanup`。
+
+也可以直接删启动文件夹里的 `no-glass · autostart.lnk` —— 等价，不会留注册表
+残留（本工具只写启动文件夹，**不写 Run 键**；Run 键只在冲突检测时**只读**）。
 
 ---
 
