@@ -879,6 +879,99 @@ def run():
             check("已启用自启动→淡绿徽章", bd_as.get("auto") == 2, True, str(bd_as))
             check("参数不同→浅黄徽章", bd_as.get("args") == 1, True, str(bd_as))
 
+            # 30) 模板的 displayName 必须是 null
+            #
+            # 真实 bug：模板里写的是 "MyApp"，而 gen.js new 用
+            # `tpl.displayName || name` —— 那个字符串是 truthy，所以 || 永远
+            # 走不到右边。结果每个新建 profile 都显示成 MyApp，生成的启动器
+            # 文件头也写 "MyApp no-glass launcher"。用户自己的 profile 都是
+            # make-profiles.js 显式写 displayName 的，所以一直没暴露。
+            import json as _json_tpl
+            tpl_path = A.ROOT / "profiles" / "_template.json"
+            tpl = _json_tpl.loads(tpl_path.read_text(encoding="utf-8"))
+            # 注意 check() 的 expect=None 是「按真值判断」而非「等于 None」，
+            # 所以这里显式比较 is None 再把布尔结果交给 check。
+            check("模板 displayName 为 null（否则 gen.js new 会填成 MyApp）",
+                  tpl.get("displayName") is None, True, str(tpl.get("displayName")))
+
+            # 31) gen.js new 的默认 displayName 应取 exe 文件名
+            tmp_name = "_smoke_dn"
+            tmp_prof = A.PROFILES_DIR / f"{tmp_name}.json"
+            try:
+                newp = subprocess.run(
+                    ["node", str(A.GEN_JS), "new", tmp_name,
+                     "--exe", os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                           "System32", "notepad.exe")],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                    creationflags=A.CREATE_NO_WINDOW,
+                )
+                if tmp_prof.exists():
+                    dnp = _json_tpl.loads(tmp_prof.read_text(encoding="utf-8"))
+                    check("gen.js new 用 exe 文件名作 displayName",
+                          dnp.get("displayName"), "notepad", str(dnp.get("displayName")))
+                else:
+                    check("gen.js new 用 exe 文件名作 displayName",
+                          False, True, (newp.stderr or newp.stdout or "")[:200])
+            finally:
+                try:
+                    tmp_prof.unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+
+            # 32) 状态轮询不得再走 get_overview（CPU 回归守卫）
+            #
+            # 背景（真实 bug）：updateTaskUI 每 2 秒调一次 get_overview，
+            # 而后者一旦过了 5 秒 TTL 就要跑 `gen.js list` + `gen.js doctor`
+            # 两个 node 进程（实测 2023ms，其中 PowerShell 读自启动项占 1.7s）。
+            # 于是 UI 待机时每 5-6 秒来一次 2 秒的满核突发 —— 用户看到的
+            # 「CPU 过山车」。而 overview 里的 profile/doctor 数据对会话标签
+            # 毫无用处，会话列表用 list_sessions 就够了（实测 0.03ms）。
+            #
+            # 断言方式：fake 掉两个 API 并计数，调一次 updateTaskUI，
+            # get_overview 必须为 0、list_sessions 必须 >= 1。
+            win.evaluate_js("""
+              (() => {
+                const save = { ready: STATE.ready, sessions: STATE.sessions,
+                               taskRunning: STATE.taskRunning };
+                STATE.ready = false;          // 冻结后台定时器，避免干扰计数
+                const realApi = window.pywebview.api;
+                let overview = 0, list = 0;
+                const fake = Object.create(realApi);
+                fake.get_task_status = () => Promise.resolve({ ok: true, task: {} });
+                fake.get_overview = () => {
+                  overview++;
+                  return Promise.resolve({ ok: true, sessions: [] });
+                };
+                fake.list_sessions = () => {
+                  list++;
+                  return Promise.resolve({ ok: true, sessions: [] });
+                };
+                window.pywebview.api = fake;
+                (async () => {
+                  await updateTaskUI();
+                  window.pywebview.api = realApi;
+                  STATE.ready = save.ready;
+                  STATE.sessions = save.sessions;
+                  STATE.taskRunning = save.taskRunning;
+                  window.__smokePoll = JSON.stringify({ overview, list });
+                })();
+                return true;
+              })()
+            """)
+            for _ in range(40):
+                if win.evaluate_js("window.__smokePoll"):
+                    break
+                time.sleep(0.1)
+            try:
+                pd2 = _json_tpl.loads(win.evaluate_js("window.__smokePoll") or "{}")
+            except Exception:
+                pd2 = {}
+            check("状态轮询不触发 get_overview（CPU 回归）",
+                  pd2.get("overview"), 0, str(pd2))
+            check("状态轮询改用 list_sessions",
+                  pd2.get("list", 0) >= 1, True, str(pd2))
+
         except Exception:
             RESULT["error"] = traceback.format_exc()
         finally:

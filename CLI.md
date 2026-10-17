@@ -35,7 +35,7 @@ node gen.js build myapp
 ## 二、安装与自检
 
 ```bash
-git clone <仓库> && cd no-glass-ele
+git clone https://github.com/NotUNperson/no-glass-ele && cd no-glass-ele
 node gen.js env          # 环境自检：Node / PowerShell / 项目文件 / 模块
 ```
 

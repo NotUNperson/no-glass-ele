@@ -12,8 +12,8 @@
   ],
 
   "name": "myapp",
-  "displayName": "MyApp",
-  "_displayName_comment": "人工：显示名，出现在日志和 README 里。",
+  "displayName": null,
+  "_displayName_comment": "人工：显示名，出现在日志和 README 里。留 null 则用 exe 的文件名（gen.js new 会自动填）。",
 
   "exe": "D:\\path\\to\\MyApp.exe",
   "_exe_comment": "人工：主程序 exe 绝对路径。",

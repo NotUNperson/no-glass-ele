@@ -359,7 +359,10 @@ function cmdNew(args) {
   const prof = {
     ...tpl,
     name,
-    displayName: tpl.displayName || name,
+    // 默认用 exe 文件名，与 probe / UI 向导的默认显示名一致。
+    // 不能依赖模板里的值：模板的 displayName 是 null（曾经是 "MyApp"，
+    // 那会让每个新建 profile 都显示成 MyApp）。
+    displayName: tpl.displayName || path.basename(abs, '.exe') || name,
     exe: abs,
     processName: path.basename(abs, '.exe'),
     styleId: `__noglass_${name.replace(/[^A-Za-z0-9_]/g, '_')}__`,

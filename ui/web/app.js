@@ -658,11 +658,16 @@ async function updateTaskUI() {
   const st = (res && res.ok && res.task) || {};
   STATE.taskRunning = !!st.taskRunning;
 
-  // 会话列表走 get_overview —— 它带 5 秒 TTL 缓存，且内部会实时刷新
-  // 会话部分（读磁盘注册表，很廉价）。这样高频轮询不会反复跑 node。
+  // 会话列表走 list_sessions —— 纯内存 + 磁盘注册表读取，实测 0.03ms。
+  //
+  // 为什么不走 get_overview（踩过）：那个接口虽然带 5 秒 TTL，但一旦过期
+  // 就要跑 `gen.js list` + `gen.js doctor` 两个 node 进程（实测 2023ms，
+  // 其中 PowerShell 读自启动项占 1.7 秒）。而本函数每 2 秒调一次，
+  // 于是 UI 待机时每 5-6 秒就来一次 2 秒的满核突发 —— 用户看到的
+  // 「CPU 过山车」。overview 里的 profile/doctor 数据对会话标签毫无用处。
   let sess = [];
   try {
-    const sr = await api().get_overview();
+    const sr = await api().list_sessions();
     if (sr && sr.ok) sess = sr.sessions || [];
   } catch (_) { /* 忽略 */ }
   STATE.sessions = sess;
