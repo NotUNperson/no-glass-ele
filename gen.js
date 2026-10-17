@@ -68,6 +68,29 @@ function parse(argv) {
 
 // ─────────────────────────── profiles IO ───────────────────────────
 
+/**
+ * profile 名的合法字符集。
+ *
+ * 为什么必须有这条校验（实测踩过）：CLI 原先完全不查名字，
+ * `node gen.js new ../../evil --exe ...` 会把 JSON 写到 profiles/ **之外**
+ * （实测生成了 D:\Projects-Working-DIR\evil.json）。UI 侧一直有这个正则
+ * （ui/app.py:584），CLI 是那个例外。
+ *
+ * 字符集与 ui/app.py 的正则保持一致 —— 两边读写同一批文件，
+ * 允许的名字集合必须相同，否则 UI 建的文件 CLI 读不了、反之亦然。
+ */
+const NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+function assertProfileName(name, where = 'profile 名') {
+  if (typeof name !== 'string' || !NAME_RE.test(name)) {
+    throw new Error(
+      `${where}不合法：${JSON.stringify(name)}。` +
+        '只允许字母、数字、点、下划线、连字符，长度 1-64。' +
+        '（不允许路径分隔符 —— 那会把文件写到 profiles/ 之外。）'
+    );
+  }
+}
+
 function listProfiles() {
   if (!fs.existsSync(PROFILES_DIR)) return [];
   return fs
@@ -78,12 +101,14 @@ function listProfiles() {
 }
 
 function loadProfile(name) {
+  assertProfileName(name);
   const p = path.join(PROFILES_DIR, `${name}.json`);
   if (!fs.existsSync(p)) throw new Error(`profile 不存在: ${p}`);
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
 function saveProfile(name, obj) {
+  assertProfileName(name);
   fs.mkdirSync(PROFILES_DIR, { recursive: true });
   const p = path.join(PROFILES_DIR, `${name}.json`);
   fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n', 'utf8');
@@ -335,9 +360,32 @@ function cmdNew(args) {
   const name = args._[0];
   const exe = args.flags.exe;
   if (!name || !exe) {
-    bad('用法: node gen.js new <name> --exe <path> [--deep] [--port <n>]');
+    bad('用法: node gen.js new <name> --exe <path> [--deep] [--port <n>] [--force]');
     process.exit(2);
   }
+  try {
+    assertProfileName(name, 'profile 名');
+  } catch (e) {
+    bad(e.message);
+    process.exit(2);
+  }
+
+  // 同名 profile 默认**拒绝**（实测踩过：静默覆盖会丢手填字段）。
+  //
+  // 原先 new 直接写文件，重新 new 一次（比如 exe 换了路径）会把
+  // isolateEnv / notes / darkreader / autostart / urlFilter 全部冲掉，
+  // 而且没有任何提示 —— 用户以为只是"更新一下 exe"。
+  const targetFile = path.join(PROFILES_DIR, `${name}.json`);
+  const overwriting = fs.existsSync(targetFile);
+  if (overwriting && args.flags.force !== true) {
+    bad(`profile 已存在：${targetFile}`);
+    say(`  ${C.y}重新生成会覆盖手填字段${C.x}（isolateEnv / notes / darkreader / autostart / urlFilter…）。`);
+    say(`  · 只想更新探测结果：${C.c}node gen.js probe <exe> --deep${C.x} 后手动改 detected`);
+    say(`  · 确实要重新生成：${C.c}node gen.js new ${name} --exe "${exe}" --force${C.x}`);
+    say(`    （会先备份成 ${name}.json.bak）`);
+    process.exit(2);
+  }
+
   const abs = path.resolve(exe);
   if (!fs.existsSync(abs)) { bad(`exe 不存在: ${abs}`); process.exit(2); }
 
@@ -399,6 +447,17 @@ function cmdNew(args) {
     prof.notes.extra = (prof.notes.extra ? prof.notes.extra + '\n\n' : '') +
       '此应用的 `--inspect` 被 fuse 禁用，`--native` 不可用。窗口层玻璃请去系统设置关闭：' +
       '设置 → 辅助功能 → 视觉效果 → 透明效果。';
+  }
+
+  // 覆盖前先备份：--force 是"我知道会丢字段"，但不该连后悔的机会都没有。
+  if (overwriting) {
+    try {
+      fs.copyFileSync(targetFile, `${targetFile}.bak`);
+      say(dim(`  已备份原 profile → ${path.basename(targetFile)}.bak`));
+    } catch (e) {
+      bad(`备份失败，已中止：${e.message}`);
+      process.exit(1);
+    }
   }
 
   const p = saveProfile(name, prof);
@@ -491,6 +550,25 @@ function buildOne(name, opts = {}) {
     }
   }
 
+  // 清掉**本次没生成**的旧预设（踩过）。
+  //
+  // 场景：应用重新 probe 后 fuse 加固了 → planPresets 不再产出
+  // start-native.cmd，但上一次 build 留下的那个文件还在。于是：
+  //   · collectListData 用 readdirSync 列 .cmd 当作 presets → UI 继续显示"可用"
+  //   · 用户双击它 → 必然失败
+  // 只删预设白名单里的文件，不碰用户自己放进来的东西。
+  for (const f of all) {
+    if (made.includes(f)) continue;
+    const stale = path.join(outDir, f);
+    try {
+      if (fs.existsSync(stale)) {
+        fs.unlinkSync(stale);
+        results.removed = results.removed || [];
+        results.removed.push(stale);
+      }
+    } catch { /* 删不掉不影响生成结果 */ }
+  }
+
   // README
   const md = render.renderAppReadme(prof, CSS_FILE, presets, { fingerprint: fp });
   const mf = path.join(outDir, 'README.md');
@@ -541,6 +619,15 @@ function collectListData() {
     const appDir = path.join(APPS_DIR, n);
     let cmds = [];
     try { cmds = fs.readdirSync(appDir).filter((f) => f.endsWith('.cmd')); } catch { /* none */ }
+
+    // 只把**本工具会生成的**预设算作"可用"（踩过）。
+    //
+    // 原先直接 readdirSync 全部 .cmd：用户自己放一个 helper.cmd 进去，
+    // UI 就把它当成可用的启动器显示出来；反过来 doctor 遍历时碰到一个
+    // 没有 profile-fingerprint 的 .cmd，会判 stale 并 break —— 即使生成的
+    // 那几个都是新的。两边都只该看 planPresets 的产物。
+    const knownPresets = render.planPresets(p).map((x) => x.file);
+    cmds = cmds.filter((f) => knownPresets.includes(f));
 
     // 产物是否与当前 profile 一致（复用 doctor 的指纹判断）
     let stale = null;
@@ -835,10 +922,19 @@ function cmdLogs(args) {
 }
 
 function cmdPrune(args) {
-  const n = sessions.prune();
-  if (args.flags.json === true) { say(JSON.stringify({ ok: true, removed: n })); return; }
-  if (n) ok(`已清理 ${n} 个孤儿注册项。`);
+  const withLogs = args.flags.logs === true;
+  const r = sessions.prune({ logs: withLogs });
+  if (args.flags.json === true) {
+    say(JSON.stringify({ ok: true, removed: r.removed ?? r, logsRemoved: r.logsRemoved ?? 0 }));
+    return;
+  }
+  if (r.removed ?? r) ok(`已清理 ${r.removed ?? r} 个孤儿注册项。`);
   else say('没有需要清理的注册项。');
+  if (withLogs) {
+    say(r.logsRemoved ? `同时删除 ${r.logsRemoved} 份会话日志。` : '没有对应的日志文件。');
+  } else {
+    say(dim('（会话日志默认保留，便于排障。加 --logs 一并删除。）'));
+  }
 }
 
 // ─────────────────────────── autostart ───────────────────────────
@@ -1046,13 +1142,23 @@ function cmdAutostart(args) {
 
 /**
  * 采集 doctor 需要的结构化数据（文本与 --json 共用）。
- * 返回 { ok, profiles: [{ name, issues: [] }], problemCount }
+ *
+ * 返回 { ok, profiles: [{ name, issues: [], warnings: [] }], problemCount }
+ *
+ * issues 与 warnings 的区别：
+ *   · issues   —— 真的有问题（exe 不存在、端口冲突、产物过期…）→ 影响 ok 与退出码
+ *   · warnings —— 值得知道但不一定是错（例如"自启动参数与手动参数不同"，
+ *                 那是用户有意配的）→ 只显示，不影响退出码
+ *
+ * 为什么要分开：一个明确说明自己"可能正常"的提示，不该让
+ * `node gen.js doctor` 非零退出 —— 那会让 CI 永远红。
  */
 function collectDoctorData() {
   const names = listProfiles();
   const ports = new Map();
   const profiles = [];
   let problemCount = 0;
+  let warningCount = 0;
 
   // ── 自启动信息只读一次 ──
   //
@@ -1162,6 +1268,7 @@ function collectDoctorData() {
 
     const d = p.detected || {};
     const issues = [];
+    const warnings = [];
 
     // exe 存在性
     if (!p.exe) issues.push('未设置 exe 路径');
@@ -1251,7 +1358,13 @@ function collectDoctorData() {
     if (autostart.appArgsDiffer(p)) {
       const eff = autostart.effectiveAppArgs(p);
       const top = Array.isArray(p.appArgs) ? p.appArgs : [];
-      issues.push(
+      // 这条进 warnings 而不是 issues（修过一个设计缺陷）。
+      //
+      // 原先它 push 进 issues → 计入 problemCount → doctor exit 1。
+      // 但这条消息自己写着"有意配置时正常" —— 一个明确说明自己可能正常的
+      // 情况却让整个校验命令失败，是自相矛盾的。而且它会污染 CI：
+      // 任何用了 autostart.appArgs 的 profile 都会让 `node gen.js doctor` 非零退出。
+      warnings.push(
         `自启动参数与手动启动参数不同：手动用 [${top.join(' ')}]，开机用 [${eff.join(' ')}]。` +
         ' 这是有意配置（autostart.appArgs 覆盖顶层 appArgs）时正常；' +
         ' 若你只是想沿用顶层参数，把 autostart.appArgs 设为 null。'
@@ -1300,11 +1413,16 @@ function collectDoctorData() {
     else {
       const presets = render.planPresets(p);
       const wantFp = render.fingerprint(p, presets.map((x) => x.file).join(','));
+      // 只看**本工具会生成的**产物（踩过）：原先遍历目录里全部 .cmd/README，
+      // 用户随手放一个不带 profile-fingerprint 的 .cmd 进去，就会判 stale
+      // 并 break —— 即使生成的那几个都是最新的。
+      const knownFiles = [...presets.map((x) => x.file), 'README.md'];
       let found = false, stale = false;
       try {
-        for (const f of fs.readdirSync(appDir)) {
-          if (!f.endsWith('.cmd') && f !== 'README.md') continue;
-          const txt = fs.readFileSync(path.join(appDir, f), 'utf8');
+        for (const f of knownFiles) {
+          const full = path.join(appDir, f);
+          if (!fs.existsSync(full)) continue;
+          const txt = fs.readFileSync(full, 'utf8');
           const m = txt.match(/profile-fingerprint: `?([0-9a-f]{12})`?/);
           if (!m) { stale = true; break; }
           if (m[1] === wantFp) { found = true; break; }
@@ -1315,10 +1433,11 @@ function collectDoctorData() {
     }
 
     problemCount += issues.length;
-    profiles.push({ name: n, issues });
+    warningCount += warnings.length;
+    profiles.push({ name: n, issues, warnings });
   }
 
-  return { ok: problemCount === 0, profiles, problemCount };
+  return { ok: problemCount === 0, profiles, problemCount, warningCount };
 }
 
 function cmdDoctor(args) {
@@ -1335,9 +1454,15 @@ function cmdDoctor(args) {
   say();
 
   for (const r of data.profiles) {
-    if (!r.issues.length) { say(`  ${C.g}${r.name}${C.x} ${dim('无问题')}`); continue; }
+    const ws = r.warnings || [];
+    if (!r.issues.length && !ws.length) {
+      say(`  ${C.g}${r.name}${C.x} ${dim('无问题')}`);
+      continue;
+    }
     say(`  ${C.y}${r.name}${C.x}`);
     for (const i of r.issues) say(`    ${C.y}!${C.x} ${i}`);
+    // 警告用不同标记，且不计入退出码 —— 见 collectDoctorData 的说明
+    for (const w of ws) say(`    ${dim('·')} ${dim(w)}`);
   }
 
   say();
@@ -1346,6 +1471,9 @@ function cmdDoctor(args) {
     process.exitCode = 1;
   } else {
     ok('全部通过。');
+  }
+  if (data.warningCount) {
+    say(dim(`另有 ${data.warningCount} 条提示（不影响退出码）。`));
   }
 }
 
@@ -1397,25 +1525,31 @@ function cmdEnv(args) {
     psOk ? null : 'Windows 自带的 Windows PowerShell 5.1 即可，通常不需要额外安装。');
 
   // 3) Python —— 可选（只有图形界面需要）
-  let pyOk = false, pyDetail = '未找到', pyVer = '';
+  //
+  // 记住命中的命令名：下面检查 pywebview 时必须用同一个解释器。
+  // 原先那里写死了 'python' —— 只有 `py` 的机器会误报「pywebview 未安装」，
+  // 而上面明明显示 Python 可用（实测的机器上有 python，所以一直没暴露）。
+  let pyOk = false, pyDetail = '未找到', pyVer = '', pyCmd = null;
   for (const cmd of ['python', 'py', 'python3']) {
     try {
       const v = execFileSync(cmd, ['--version'],
         { encoding: 'utf8', timeout: 10000, windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-      if (v) { pyOk = true; pyVer = v; pyDetail = `${v}（${cmd}）`; break; }
+      if (v) { pyOk = true; pyVer = v; pyCmd = cmd; pyDetail = `${v}（${cmd}）`; break; }
     } catch { /* 试下一个 */ }
   }
   add('python', 'Python 3', false, pyOk, pyDetail,
     pyOk ? null : '只有图形界面需要它。不装也能用命令行。装：https://python.org');
 
   // 4) pywebview —— 可选（图形界面的依赖）
+  //
+  // 必须用上面命中的同一个解释器（pyCmd），不能写死 'python'。
   let wvOk = false, wvDetail = '未检测';
-  if (pyOk) {
+  if (pyOk && pyCmd) {
     try {
       // 注意：pywebview 没有 __version__ 属性（实测 6.1 报 AttributeError），
       // 所以用 importlib.metadata 拿版本，拿不到就退化成"已安装"。
-      const v = execFileSync('python', ['-c',
+      const v = execFileSync(pyCmd, ['-c',
         'import importlib.metadata as m; print(m.version("pywebview"))'],
         { encoding: 'utf8', timeout: 20000, windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -1424,7 +1558,7 @@ function cmdEnv(args) {
     } catch {
       // 再退一步：只 import 看能不能用（版本拿不到不代表装没装）
       try {
-        execFileSync('python', ['-c', 'import webview'],
+        execFileSync(pyCmd, ['-c', 'import webview'],
           { encoding: 'utf8', timeout: 20000, windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe'] });
         wvOk = true;
@@ -1562,12 +1696,13 @@ ${C.b}后台会话${C.x}
   ${C.c}stop${C.x} <id|profile|pid>         请求停止（优雅退出，**不关目标应用**）
                              加 --force 可强停「外部发现」的旧版注入器
   ${C.c}logs${C.x} <id|profile|pid> [-n N]  查看某会话的日志
-  ${C.c}prune${C.x}                         清理已退出会话残留的注册项
+  ${C.c}prune${C.x} [--logs]                 清理已退出会话残留的注册项（--logs 一并删日志）
 
 ${C.b}选项${C.x}
   --deep      深层探测：额外扫描 resources/*.asar 找行为标记
   --bundle    生成自包含版本（配置与样式内联，目录可单独拷走）
   --port <n>  new 时指定默认端口
+  --force     new 时覆盖同名 profile（会先备份成 .bak）
   --json      probe / list / doctor / ps 输出 JSON（供 UI 调用，人类可读输出不变）
 
 ${C.b}说明${C.x}

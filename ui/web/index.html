@@ -37,7 +37,7 @@
     </div>
     <div class="list" id="profileList"></div>
     <div class="pane-foot">
-      <button class="btn ghost small" id="btnDoctor">校验全部</button>
+      <button class="btn small" id="btnDoctor">校验全部</button>
     </div>
   </aside>
 
@@ -176,7 +176,7 @@
                   placeholder="/* 例：&#10;body, .app { background: #1e1e1e !important; color: #ddd !important; }&#10;*/"></textarea>
         <div class="row" style="margin-top:8px">
           <button class="btn primary" id="btnSaveCss">保存并重新注入</button>
-          <button class="btn ghost" id="btnReloadCss">重新读取</button>
+          <button class="btn" id="btnReloadCss">重新读取</button>
           <span class="dim tiny" id="cssStatus"></span>
         </div>
       </div>
@@ -187,7 +187,7 @@
         <div class="form" id="dForm"></div>
         <div class="row">
           <button class="btn primary" id="btnSave">保存</button>
-          <button class="btn ghost" id="btnRevert">撤销修改</button>
+          <button class="btn" id="btnRevert">撤销修改</button>
           <button class="btn" id="btnBuild">重新生成启动器</button>
         </div>
         <p class="hint">保存后需点「重新生成启动器」，产物才会更新（校验会检查这一点）。</p>
@@ -201,7 +201,7 @@
     <div class="pane-head">
       <h2>会话</h2>
       <div class="pane-head-actions">
-        <button class="btn ghost small" id="btnPrune" title="清理已退出/残留的会话注册项（不会动任何进程）">清理</button>
+        <button class="btn small" id="btnPrune" title="清理已退出/残留的会话注册项（不会动任何进程）">清理</button>
       </div>
     </div>
     <div class="session-tabs" id="sessionTabs"></div>
@@ -209,7 +209,7 @@
       <h2 id="logTitle">输出</h2>
       <div class="pane-head-actions">
         <label class="check tiny"><input type="checkbox" id="optFollow" checked> 跟随</label>
-        <button class="btn ghost small" id="btnClearLog">清空</button>
+        <button class="btn small" id="btnClearLog">清空</button>
       </div>
     </div>
     <pre class="log" id="log"></pre>
@@ -233,7 +233,7 @@
           <button class="btn" id="wizBrowse">浏览…</button>
         </div>
         <div class="row">
-          <button class="btn ghost small" id="wizFromRunning">从运行中的应用里挑</button>
+          <button class="btn small" id="wizFromRunning">从运行中的应用里挑</button>
         </div>
         <div class="running-list hidden" id="wizRunning"></div>
       </div>
@@ -256,7 +256,7 @@
     <div class="modal-foot">
       <span class="dim tiny" id="wizStatus"></span>
       <div>
-        <button class="btn ghost" id="wizCancel">取消</button>
+        <button class="btn" id="wizCancel">取消</button>
         <button class="btn primary" id="wizCreate" disabled>创建 profile</button>
       </div>
     </div>

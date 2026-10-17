@@ -1115,6 +1115,393 @@ def run():
             check("状态轮询改用 list_sessions",
                   pd2.get("list", 0) >= 1, True, str(pd2))
 
+            # ── 33-38) 核心逻辑的回归守卫（node 侧）──
+            #
+            # 这些都是实测确认过的 bug，用子进程跑 node 验证，不经过 UI。
+            # 统一放在这里，避免和 UI 断言混在一起。
+
+            def _node_json_snippet(code, timeout=120):
+                """跑一段 node -e，返回 (解析后的 JSON, 原始输出, 退出码)。"""
+                r = subprocess.run(
+                    ["node", "-e", code],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=timeout,
+                    creationflags=A.CREATE_NO_WINDOW,
+                )
+                try:
+                    return _json_tpl.loads(r.stdout or "null"), r.stdout, r.returncode
+                except Exception:                        # noqa: BLE001
+                    return None, (r.stdout or "") + (r.stderr or ""), r.returncode
+
+            # 33) 指纹必须覆盖 runtime / prefersColorScheme / markers
+            #
+            # 真实 bug：这三个都影响产物（planPresets 决定是否生成
+            # start-native.cmd；README 的「行为特征」「深色建议」也读它们），
+            # 但原先不在 fingerprint 里 → 改了再 build，产物变了，
+            # doctor 比对指纹仍说"最新"。
+            fp_data, fp_raw, _ = _node_json_snippet("""
+              const r = require('./lib/render');
+              const base = {
+                name:'x', displayName:'X', exe:'C:/a.exe', processName:'a',
+                styleId:'s', defaultPort:9333, reservedPorts:[], appArgs:[],
+                native:{}, notes:{}, runtime:'electron',
+                detected:{ electron:'30', fuses:null, canUseNative:true,
+                  windowLayerGlass:false, hasPageGlass:true, singleInstance:false,
+                  userDataOverride:null, prefersColorScheme:false, markers:[] },
+              };
+              const a = r.fingerprint(base, 'start.cmd');
+              const diff = (p) => r.fingerprint(p, 'start.cmd') !== a;
+              process.stdout.write(JSON.stringify({
+                runtime: diff({...base, runtime:'tauri'}),
+                detectedRuntime: diff({...base, detected:{...base.detected, runtime:'tauri'}}),
+                prefersColorScheme: diff({...base, detected:{...base.detected, prefersColorScheme:true}}),
+                markers: diff({...base, detected:{...base.detected, markers:['x']}}),
+                probedAtOnly: diff({...base, detected:{...base.detected, probedAt:'2020-01-01'}}),
+              }));
+            """)
+            fp_data = fp_data or {}
+            check("指纹覆盖 runtime", fp_data.get("runtime") is True, True, fp_raw[:160])
+            check("指纹覆盖 detected.runtime", fp_data.get("detectedRuntime") is True, True, fp_raw[:160])
+            check("指纹覆盖 prefersColorScheme", fp_data.get("prefersColorScheme") is True, True, fp_raw[:160])
+            check("指纹覆盖 markers", fp_data.get("markers") is True, True, fp_raw[:160])
+            # 反向：不该进指纹的字段（probedAt）不应让产物"过期"
+            check("指纹不包含 probedAt（避免无谓过期）",
+                  fp_data.get("probedAtOnly") is False, True, fp_raw[:160])
+
+            # 34) CLI profile 名必须校验（防路径穿越）
+            #
+            # 实测过：`node gen.js new ../../evil --exe ...` 会把 JSON 写到
+            # profiles/ 之外（真的生成了 D:\Projects-Working-DIR\evil.json）。
+            trav = subprocess.run(
+                ["node", str(A.GEN_JS), "new", "../../_smoke_evil",
+                 "--exe", os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                       "System32", "notepad.exe")],
+                cwd=str(A.ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
+                creationflags=A.CREATE_NO_WINDOW,
+            )
+            outside = (A.ROOT.parent / "_smoke_evil.json")
+            check("CLI 拒绝路径穿越的 profile 名",
+                  trav.returncode == 2, True, f"exit={trav.returncode}")
+            check("路径穿越未写出 profiles/ 之外",
+                  outside.exists(), False, str(outside))
+            try:
+                outside.unlink()
+            except Exception:                            # noqa: BLE001
+                pass
+
+            # 35) new 遇到同名 profile 默认拒绝，--force 才覆盖并备份
+            _dup = A.PROFILES_DIR / "_smoke_dup.json"
+            _dup_bak = A.PROFILES_DIR / "_smoke_dup.json.bak"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                subprocess.run(["node", str(A.GEN_JS), "new", "_smoke_dup", "--exe", _exe],
+                               cwd=str(A.ROOT), capture_output=True, timeout=120,
+                               creationflags=A.CREATE_NO_WINDOW)
+                # 手填一个字段，模拟用户的定制
+                if _dup.exists():
+                    _j = _json_tpl.loads(_dup.read_text(encoding="utf-8"))
+                    _j["notes"] = {"extra": "SMOKE-SENTINEL"}
+                    _dup.write_text(_json_tpl.dumps(_j, ensure_ascii=False, indent=2),
+                                    encoding="utf-8")
+                _again = subprocess.run(
+                    ["node", str(A.GEN_JS), "new", "_smoke_dup", "--exe", _exe],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                    creationflags=A.CREATE_NO_WINDOW)
+                check("new 遇到同名 profile 默认拒绝",
+                      _again.returncode == 2, True, f"exit={_again.returncode}")
+                _kept = _json_tpl.loads(_dup.read_text(encoding="utf-8"))
+                check("被拒绝时手填字段未被覆盖",
+                      (_kept.get("notes") or {}).get("extra"), "SMOKE-SENTINEL",
+                      str(_kept.get("notes")))
+
+                _forced = subprocess.run(
+                    ["node", str(A.GEN_JS), "new", "_smoke_dup", "--exe", _exe, "--force"],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                    creationflags=A.CREATE_NO_WINDOW)
+                check("--force 能覆盖", _forced.returncode == 0, True,
+                      f"exit={_forced.returncode} {( _forced.stderr or '')[:120]}")
+                check("--force 覆盖前会备份 .bak", _dup_bak.exists(), True, str(_dup_bak))
+            finally:
+                for _p in (_dup, _dup_bak):
+                    try:
+                        _p.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+
+            # 36) 隔离目录：processName 缺失且没有 appPid 时不得删
+            #
+            # 真实 bug：cleanupOwnedDataDir 原先只靠 psCount(processName)，
+            # 而 psCount 在 processName 为空时直接返回 0 → 注入器一退出就删掉
+            # 应用**正在使用**的数据目录。
+            # 这里用假的 cfg 直接调函数，验证它不会真删。
+            _iso = A.ROOT / "run" / "_smoke_iso_dir"
+            _iso.mkdir(parents=True, exist_ok=True)
+            (_iso / "keep.txt").write_text("sentinel", encoding="utf-8")
+            iso_ret, iso_raw, _ = _node_json_snippet("""
+              const fs = require('fs');
+              const path = require('path');
+              const src = fs.readFileSync('injector/noglass.js', 'utf8');
+              // 从源码里抠出 cleanupOwnedDataDir + pidAlive + psCount，单独求值
+              const grab = (re) => { const m = src.match(re); if (!m) throw new Error('not found'); return m[0]; };
+              const psCount = grab(/const psCount = \\(processName\\) => \\{[\\s\\S]*?\\n\\};/);
+              const pidAlive = grab(/function pidAlive\\(pid\\) \\{[\\s\\S]*?\\n\\}/);
+              const cleanup = grab(/function cleanupOwnedDataDir\\(cfg\\) \\{[\\s\\S]*?\\n\\}/);
+              const warns = [];
+              const warn = (m) => warns.push(m);
+              const fsMod = fs;
+              const evalFn = new Function('fs', 'warn', psCount + '\\n' + pidAlive + '\\n' + cleanup + '\\nreturn cleanupOwnedDataDir;');
+              const fn = evalFn(fsMod, warn);
+              const dir = path.join('run', '_smoke_iso_dir');
+              // 关键用例：没有 processName、没有 appPid
+              fn({ dataDirOwned: true, dataDir: dir, processName: null, name: 'X' });
+              process.stdout.write(JSON.stringify({
+                survived: fs.existsSync(path.join(dir, 'keep.txt')),
+                warned: warns.length > 0,
+              }));
+            """)
+            iso_ret = iso_ret or {}
+            check("隔离目录：无 processName 时保留（不误删）",
+                  iso_ret.get("survived") is True, True, str(iso_ret) + iso_raw[:120])
+            check("隔离目录：保留时给出警告",
+                  iso_ret.get("warned") is True, True, str(iso_ret))
+            try:
+                import shutil as _sh
+                _sh.rmtree(_iso, ignore_errors=True)
+            except Exception:                            # noqa: BLE001
+                pass
+
+            # 37) build 会清掉本次未生成的旧预设
+            #
+            # 真实场景：应用重新 probe 后 fuse 加固 → 不再生成 start-native.cmd，
+            # 但旧文件还留着 → UI 继续显示"可用"，双击必然失败。
+            _bp = A.PROFILES_DIR / "_smoke_build.json"
+            _bdir = A.ROOT / "apps" / "_smoke_build"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                subprocess.run(["node", str(A.GEN_JS), "new", "_smoke_build", "--exe", _exe],
+                               cwd=str(A.ROOT), capture_output=True, timeout=120,
+                               creationflags=A.CREATE_NO_WINDOW)
+                if _bp.exists():
+                    subprocess.run(["node", str(A.GEN_JS), "build", "_smoke_build"],
+                                   cwd=str(A.ROOT), capture_output=True, timeout=120,
+                                   creationflags=A.CREATE_NO_WINDOW)
+                    # 塞一个"上次遗留"的预设进去，再 build 一次
+                    _bdir.mkdir(parents=True, exist_ok=True)
+                    _stale = _bdir / "start-native.cmd"
+                    _stale.write_text("rem stale\r\n", encoding="utf-8")
+                    subprocess.run(["node", str(A.GEN_JS), "build", "_smoke_build"],
+                                   cwd=str(A.ROOT), capture_output=True, timeout=120,
+                                   creationflags=A.CREATE_NO_WINDOW)
+                    _made = {p.name for p in _bdir.glob("*.cmd")}
+                    _want = {p["file"] for p in __import__('json').loads(
+                        subprocess.run(
+                            ["node", "-e",
+                             "const r=require('./lib/render');"
+                             "const p=require('./profiles/_smoke_build.json');"
+                             "process.stdout.write(JSON.stringify(r.planPresets(p)));"],
+                            cwd=str(A.ROOT), capture_output=True, text=True,
+                            encoding="utf-8", timeout=60,
+                            creationflags=A.CREATE_NO_WINDOW).stdout or "[]")}
+                    check("build 只留下本次生成的预设",
+                          _made, _want, f"made={sorted(_made)} want={sorted(_want)}")
+            finally:
+                for _p in (_bp,):
+                    try:
+                        _p.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                try:
+                    import shutil as _sh2
+                    _sh2.rmtree(_bdir, ignore_errors=True)
+                except Exception:                        # noqa: BLE001
+                    pass
+
+            # 39) doctor 的「自启动参数不同」是 warning，不该让退出码变非零
+            #
+            # 真实缺陷：这条消息自己写着"有意配置时正常"，却 push 进 issues
+            # → problemCount → `node gen.js doctor` exit 1。任何用了
+            # autostart.appArgs 的 profile 都会让 CI 永远红。
+            _warn_prof = A.PROFILES_DIR / "smokewarn.json"
+            _warn_apps = A.ROOT / "apps" / "smokewarn"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                subprocess.run(["node", str(A.GEN_JS), "new", "smokewarn", "--exe", _exe],
+                               cwd=str(A.ROOT), capture_output=True, timeout=120,
+                               creationflags=A.CREATE_NO_WINDOW)
+                if _warn_prof.exists():
+                    _wj = _json_tpl.loads(_warn_prof.read_text(encoding="utf-8"))
+                    # 用 Electron 的探测结果覆盖掉 notepad 的（否则会多出一条
+                    # "未探测到 fuse 表"的 issue，与本条断言无关）。
+                    _wj["runtime"] = "electron"
+                    _wj["detected"] = {
+                        # 用当天日期：否则会触发"探测结果已 N 天"的 issue
+                        "probedAt": time.strftime("%Y-%m-%d"),
+                        "runtime": "electron",
+                        "electron": "30.0.0",
+                        "fuses": {"version": 1, "count": 1, "hardened": [],
+                                  "table": {"EnableNodeCliInspectArguments": "on"}},
+                        "canUseNative": True,
+                        "windowLayerGlass": False,
+                        "hasPageGlass": True,
+                        "singleInstance": False,
+                        "userDataOverride": None,
+                        "prefersColorScheme": False,
+                        "markers": [],
+                    }
+                    _wj["appArgs"] = ["--manual"]
+                    _wj["autostart"] = {"enabled": False, "appArgs": ["--boot"]}
+                    _warn_prof.write_text(_json_tpl.dumps(_wj, ensure_ascii=False, indent=2),
+                                          encoding="utf-8")
+                    subprocess.run(["node", str(A.GEN_JS), "build", "smokewarn"],
+                                   cwd=str(A.ROOT), capture_output=True, timeout=120,
+                                   creationflags=A.CREATE_NO_WINDOW)
+                    _wd = subprocess.run(
+                        ["node", str(A.GEN_JS), "doctor", "--json"],
+                        cwd=str(A.ROOT), capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=180,
+                        creationflags=A.CREATE_NO_WINDOW)
+                    _wdata = _json_tpl.loads(_wd.stdout or "{}")
+                    _wrow = next((r for r in _wdata.get("profiles", [])
+                                  if r.get("name") == "smokewarn"), {})
+                    check("参数差异进 warnings 而不是 issues",
+                          len(_wrow.get("warnings") or []), 1,
+                          str(_wrow)[:200])
+                    # 只看这个 profile 的贡献：全机可能还有别的问题
+                    # （例如别的 profile 没 build），所以断言它的 issues 为空，
+                    # 而不是断言整机 problemCount == 0。
+                    check("参数差异不进入该 profile 的 issues",
+                          _wrow.get("issues") or [], [],
+                          str(_wrow.get("issues"))[:200])
+                    check("参数差异计入 warningCount",
+                          (_wdata.get("warningCount") or 0) >= 1, True,
+                          str(_wdata.get("warningCount")))
+                else:
+                    check("参数差异进 warnings 而不是 issues", False, True, "临时 profile 未生成")
+            finally:
+                try:
+                    _warn_prof.unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+                try:
+                    import shutil as _sh3
+                    _sh3.rmtree(_warn_apps, ignore_errors=True)
+                except Exception:                        # noqa: BLE001
+                    pass
+
+            # 40) 剩余的操作按钮不能是 ghost（只留 ✕ 图标按钮）
+            #
+            # 上一轮只修了弹窗 4 个 + 顶栏 2 个，剩下的 7 个仍是透明底 ——
+            # 同样"看不出能点"。这条断言防再漏。
+            _ghost_info = win.evaluate_js("""
+              (() => {
+                const all = [...document.querySelectorAll('button.btn')];
+                const ghosts = all.filter((b) => b.classList.contains('ghost'));
+                return JSON.stringify({
+                  total: all.length,
+                  // 同时给出 id 和文本 —— 只看 id 会把 ✕ 图标按钮误判成违规
+                  ghosts: ghosts.map((b) => ({
+                    id: b.id || null,
+                    text: b.textContent.trim(),
+                  })),
+                });
+              })()
+            """)
+            try:
+                _gi = _json_tpl.loads(_ghost_info or "{}")
+            except Exception:                            # noqa: BLE001
+                _gi = {}
+            # 允许 ghost 的只有关闭类图标按钮（文本是 ✕）
+            _bad_ghosts = [
+                (g.get("id") or g.get("text") or "?")
+                for g in (_gi.get("ghosts") or [])
+                if "✕" not in str(g.get("text") or "")
+            ]
+            check("除 ✕ 图标按钮外不应再有 ghost",
+                  _bad_ghosts, [], str(_bad_ghosts))
+
+            # 41) Esc 能关闭设置弹窗
+            _esc_ok = win.evaluate_js("""
+              (() => {
+                const m = document.getElementById('autostartModal');
+                m.classList.remove('hidden');
+                const before = !m.classList.contains('hidden');
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+                const after = m.classList.contains('hidden');
+                return JSON.stringify({ before, after });
+              })()
+            """)
+            try:
+                _eo = _json_tpl.loads(_esc_ok or "{}")
+            except Exception:                            # noqa: BLE001
+                _eo = {}
+            check("Esc 能关闭设置弹窗", _eo.get("after") is True, True, str(_eo))
+
+            # 42) 注入器拒绝同一 profile 的第二个会话
+            #
+            # 真实 bug：UI 有防重复，但双击 start.cmd 两次就绕过去了 ——
+            # 两个注入器抢同一个调试端口、写两份注册项。
+            # 验证方式：造一条"活着的"注册项（pid 用本测试进程），
+            # 起注入器，它应该在连端口之前就拒绝。
+            _fake_id = "_smoke_dup_session"
+            _fake = A.ROOT / "run" / "sessions" / f"{_fake_id}.json"
+            try:
+                _fake.parent.mkdir(parents=True, exist_ok=True)
+                _fake.write_text(_json_tpl.dumps({
+                    "id": _fake_id,
+                    "profile": "_smoke_dup_prof",
+                    "pid": os.getpid(),
+                    "alive": True,
+                    "startedAt": "2026-10-17T00:00:00Z",
+                    "lastTick": "2026-10-17T00:00:00Z",
+                }), encoding="utf-8")
+                # 造一个最小 profile（不启动应用，只跑到重复检查）
+                _sp = A.PROFILES_DIR / "_smoke_dup_prof.json"
+                _sp.write_text(_json_tpl.dumps({
+                    "name": "_smoke_dup_prof", "displayName": "_smoke_dup_prof",
+                    "exe": os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                        "System32", "notepad.exe"),
+                    "processName": "notepad", "styleId": "__smoke_dup__",
+                    "defaultPort": 19999, "appArgs": [],
+                }), encoding="utf-8")
+                try:
+                    _dup_run = subprocess.run(
+                        ["node", str(A.INJECTOR), "--profile", str(_sp), "--list"],
+                        cwd=str(A.ROOT), capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=40,
+                        creationflags=A.CREATE_NO_WINDOW)
+                    _out = (_dup_run.stdout or "") + (_dup_run.stderr or "")
+                    check("注入器拒绝重复会话",
+                          _dup_run.returncode == 3, True,
+                          f"exit={_dup_run.returncode} {_out[:160]}")
+                    check("拒绝信息指出已有会话的 pid",
+                          ("已有注入会话" in _out) and (str(os.getpid()) in _out),
+                          True, _out[:160])
+                finally:
+                    try:
+                        _sp.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+            finally:
+                try:
+                    _fake.unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+                for _suffix in (".stop",):
+                    try:
+                        (A.ROOT / "run" / "sessions" / f"{_fake_id}{_suffix}").unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                try:
+                    (A.ROOT / "run" / "logs" / f"{_fake_id}.log").unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+
         except Exception:
             RESULT["error"] = traceback.format_exc()
         finally:

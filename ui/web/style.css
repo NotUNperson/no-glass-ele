@@ -208,6 +208,16 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .btn:hover:not(:disabled) { background: var(--btn-hover); border-color: var(--btn-hv-bd); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+/* 键盘焦点必须看得见。
+ *
+ * 只用 :focus 会在鼠标点击时也画出焦点环（鼠标用户觉得吵），所以用
+ * :focus-visible —— 它只在键盘导航时匹配。原先完全没有 focus-visible，
+ * 键盘用户按 Tab 时不知道焦点在哪。 */
+.btn:focus-visible, .input:focus-visible, .theme-btn:focus-visible,
+.select-inline:focus-visible, .check input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .btn.primary { background: var(--accent-2); border-color: var(--accent); color: var(--on-accent); }
 .btn.primary:hover:not(:disabled) { background: var(--accent); }
 .btn.danger  { background: var(--danger-bg); border-color: var(--danger-bd); color: var(--danger-fg); }

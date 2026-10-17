@@ -216,7 +216,7 @@ node gen.js doctor
 | `ps` | 列出运行中的注入会话（含**外部启动**的），并把「残留会话」单独列出 |
 | `stop <id\|profile\|pid>` | 请求停止（优雅退出，**不关目标应用**）；`--force` 可强停外部注入器 |
 | `logs <id\|profile\|pid> [-n N]` | 查看某会话的日志 |
-| `prune` | 清理残留注册项（进程已退出的 + 硬关机留下的僵尸项）|
+| `prune [--logs]` | 清理残留注册项（进程已退出的 + 硬关机留下的僵尸项）。默认保留会话日志便于排障，`--logs` 一并删除 |
 | `autostart on\|off\|list [name]` | 管理开机自启动项（见下）|
 
 加 `--json` 可让 `probe` / `list` / `doctor` / `ps` 输出 JSON（供 UI 调用；人类可读输出不变）。

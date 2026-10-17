@@ -1645,6 +1645,10 @@ function bindUI() {
   $('wizCreate').onclick = wizCreate;
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('wizard').classList.contains('hidden')) closeWizard();
+    if (e.key !== 'Escape') return;
+    // 先关最上层的弹窗。设置弹窗原先不支持 Esc（只有向导支持），
+    // 键盘用户按 Esc 没反应会以为卡住了。
+    if (!$('autostartModal').classList.contains('hidden')) { closeAutostart(); return; }
+    if (!$('wizard').classList.contains('hidden')) closeWizard();
   });
 }

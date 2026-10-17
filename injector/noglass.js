@@ -83,6 +83,34 @@ function makeSessionId(cfg) {
   return `${slug}-${process.pid}`;
 }
 
+/**
+ * 找出同一个 profile 已经在跑的注入器（没有则返回 null）。
+ *
+ * 只读 run/sessions/*.json，不做进程表查询 —— 存活判定用
+ * `process.kill(pid, 0)`，毫秒级，且注入器启动路径上不该起 PowerShell。
+ *
+ * 跳过自己：本进程可能已经登记过（重复调用 main 的场景），
+ * 但那时 pid 相同，不会被判成"另一个"。
+ */
+function findLiveSessionFor(cfg) {
+  const wanted = cfg.profile.name || cfg.name;
+  if (!wanted) return null;
+  let files;
+  try { files = fs.readdirSync(SESS_DIR); } catch { return null; }
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    let meta;
+    try { meta = JSON.parse(fs.readFileSync(path.join(SESS_DIR, f), 'utf8')); } catch { continue; }
+    if (!meta || meta.profile !== wanted) continue;
+    const pid = Number(meta.pid);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    if (pid === process.pid) continue;                 // 自己
+    if (!pidAlive(pid)) continue;                      // 残留项，不算
+    return { id: meta.id || f.replace(/\.json$/, ''), pid };
+  }
+  return null;
+}
+
 class SessionRegistry {
   constructor(cfg, opts = {}) {
     this.id = makeSessionId(cfg);
@@ -211,6 +239,8 @@ function parseArgs(argv) {
     darkreaderTheme: null,
     // 运行时覆盖（electron / tauri）。一般不用手填 —— probe 会写进 profile。
     runtime: null,
+    // 跳过"同一 profile 已有注入会话"的检查。默认拒绝，见 findLiveSessionFor。
+    force: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i], next = () => argv[++i];
@@ -242,6 +272,7 @@ function parseArgs(argv) {
       case '--source': o.source = next(); break;
       case '--runtime': o.runtime = next(); break;
       case '-q': case '--quiet': o.quiet = true; break;
+      case '--force': o.force = true; break;
       case '-h': case '--help': printHelp(); process.exit(0); break;
       default:
         // --app-arg=<flag> / --app-arg <flag>：透传给目标应用
@@ -305,6 +336,8 @@ function resolveConfig(opts) {
       || 'electron',
     source: opts.source || 'cli',
     profileName: profName,
+    // 跳过"同一 profile 已有会话"的检查（见 findLiveSessionFor 的调用处）
+    force: opts.force === true,
   };
   if (cfg.inspectPort == null) cfg.inspectPort = cfg.port + 1;
 
@@ -371,6 +404,8 @@ noglass —— 给 Electron 应用注入「去毛玻璃」样式（通用版）
   --list            列出可注入页面后退出
   --isolate         用独立数据目录启动：本次产生的数据不写进你平时用的那份
                     （含 --launch。不是"多开一个实例"——本工具不做多实例）
+  --force           跳过"同一 profile 已有注入会话"的检查（默认拒绝）。
+                    两个注入器会抢同一个调试端口，一般不该用。
   --port <n>        CDP 端口（默认取 profile，否则 ${DEFAULT_PORT}）
   --inspect-port <n> 主进程调试端口，配合 --native（默认 port+1）
   --exe <path>      目标应用 exe 路径（默认取 profile，否则自动探测）
@@ -460,7 +495,16 @@ const psCount = (processName) => {
  * **安全前提（绝不能省）**：只有目标应用的进程已经退出才删。
  * 注入器退出 ≠ 目标应用退出 —— 停止注入时应用还在跑，而那个目录正是它
  * 当前的数据目录，删掉会让它立刻出问题（配置丢失、崩溃）。
- * 所以先查进程数，>0 就保留（宁可留一点垃圾，也不能破坏正在运行的应用）。
+ *
+ * 判活顺序（修过一个真 bug）：
+ *   1. **spawn 时拿到的 appPid** —— 最可靠，我们亲手起的进程
+ *   2. processName 查进程数 —— 兜底
+ *   3. 两者都拿不到 → **不删**，只警告
+ *
+ * 第 3 条是补的。原先只有 `psCount(cfg.processName) > 0` 一个判据，而
+ * `psCount` 在 processName 为空时直接返回 0（见上面的定义）—— 于是
+ * profile 没填 processName 时，注入器一退出就会删掉应用**正在使用**的数据目录。
+ * 概率不高（需要同时是 --isolate 且 processName 缺失），但后果是应用数据被删。
  *
  * 另外只删**本工具自己造的**目录（cfg.dataDirOwned）：
  * 用户显式传的 --data-dir 或 profile 指定的目录一律不碰。
@@ -468,12 +512,47 @@ const psCount = (processName) => {
 function cleanupOwnedDataDir(cfg) {
   if (!cfg || !cfg.dataDirOwned || !cfg.dataDir) return;
   try {
-    if (psCount(cfg.processName) > 0) {
-      warn(`隔离数据目录保留（${cfg.name} 仍在运行）：${cfg.dataDir}`);
+    // 1) 优先用 spawn 的 pid —— 即使 processName 写错也不会误判
+    if (cfg.appPid) {
+      if (pidAlive(cfg.appPid)) {
+        warn(`隔离数据目录保留（${cfg.name} 仍在运行，pid ${cfg.appPid}）：${cfg.dataDir}`);
+        return;
+      }
+      // pid 已退出：可以删，不必再查进程名
+      fs.rmSync(cfg.dataDir, { recursive: true, force: true });
       return;
     }
-    fs.rmSync(cfg.dataDir, { recursive: true, force: true });
+    // 2) 没有 appPid（例如应用是我们发现的、不是我们启动的）→ 按进程名兜底
+    if (cfg.processName) {
+      if (psCount(cfg.processName) > 0) {
+        warn(`隔离数据目录保留（${cfg.name} 仍在运行）：${cfg.dataDir}`);
+        return;
+      }
+      fs.rmSync(cfg.dataDir, { recursive: true, force: true });
+      return;
+    }
+    // 3) 两个判据都没有 → 不能确定应用是否在用这个目录，宁可留垃圾
+    warn(`隔离数据目录保留（无法确认 ${cfg.name} 是否已退出：profile 未设 processName，`
+      + `本次也未由本工具启动）：${cfg.dataDir}`);
   } catch { /* 删不掉就算了（占用/权限），不值得让退出流程报错 */ }
+}
+
+/**
+ * 判断某个 pid 是否还活着（Windows：OpenProcess + GetExitCodeProcess 的等价物）。
+ *
+ * 用 process.kill(pid, 0) 而不是 tasklist —— 后者要起一个进程（约 30-50ms），
+ * 而本函数在退出路径上、每次注入退出都会调。
+ */
+function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    // EPERM = 进程存在但没权限（Windows 上常见）→ 仍算活着
+    return e && e.code === 'EPERM';
+  }
 }
 
 /**
@@ -884,6 +963,23 @@ async function main() {
 
   // 会话登记：让 UI / CLI / 自启动脚本都能看到这个后台注入器。
   // 登记失败不致命（可能目录只读），只是失去可观测性。
+  //
+  // 先检查**同一个 profile 是否已有活着的注入器**（踩过）。
+  //
+  // 原先这里直接 registry.open()：UI 侧有防重复检查，但双击 start.cmd
+  // 两次就绕过去了 —— 两个注入器连同一个 CDP 端口、写两份注册项、
+  // UI 里两个标签，停一个另一个还在。
+  //
+  // 为什么不 require lib/sessions.js：注入器要能单独拷走（bundle），
+  // 保持零内部依赖。这里只读 run/sessions/*.json，逻辑很浅。
+  const dup = findLiveSessionFor(cfg);
+  if (dup && cfg.force !== true) {
+    warn(`「${cfg.profile.name || cfg.name}」已有注入会话在运行（pid ${dup.pid}，${dup.id}）。`);
+    warn('  同一个应用只允许一个注入器 —— 两个会抢同一个调试端口，且停止时互相不知道。');
+    warn('  确实要再起一个：加 --force（不推荐）。想换启动方式请先停掉现有的。');
+    process.exit(3);
+  }
+
   const registry = new SessionRegistry(cfg, { source: cfg.source });
   if (registry.open()) {
     // 把日志同时写一份到 run/logs/<id>.log，供 UI 统一查看
@@ -1014,6 +1110,9 @@ async function main() {
       throw new Error(`启动 ${cfg.name} 失败：${e.message}`);
     }
     registry.update({ appPid: appProc ? appProc.pid : null });
+    // 交给 cleanupOwnedDataDir 做判活 —— 这是最可靠的判据（见该函数说明）。
+    // 不设的话它只能退回按 processName 查，而 processName 可能缺失。
+    if (appProc) cfg.appPid = appProc.pid;
 
     log('等待调试端口就绪…');
     const deadline = Date.now() + cfg.timeout;
@@ -1166,7 +1265,7 @@ async function main() {
   // 否则 shutdown 在声明前被调用会踩到 TDZ，那是最难查的一类崩溃。
   let timer = null;
   let stopTimer = null;
-  let cssWatcher = null;
+  let cssWatchers = [];
 
   let eventsSeen = 0;
   const browserCdp = version.webSocketDebuggerUrl ? new CDP(version.webSocketDebuggerUrl) : null;
@@ -1204,7 +1303,7 @@ async function main() {
     shuttingDown = true;
     try { if (timer) clearInterval(timer); } catch { /* 忽略 */ }
     try { if (stopTimer) clearInterval(stopTimer); } catch { /* 忽略 */ }
-    try { if (cssWatcher) cssWatcher.close(); } catch { /* 忽略 */ }
+    for (const w of cssWatchers) { try { w.close(); } catch { /* 忽略 */ } }
     if (browserCdp) browserCdp.close();
     for (const s of sessions.values()) s.close();
     log(reason);
@@ -1241,29 +1340,43 @@ async function main() {
   let reloadTimer = null;
   const watchTargets = [cfg.css, cfg.cssExtra].filter(Boolean);
   if (watchTargets.length) {
-    try {
-      cssWatcher = fs.watch(path.dirname(watchTargets[0]), (evt, fname) => {
-        if (!fname) return;
-        const hit = watchTargets.some((t) => path.basename(t) === fname.toString());
-        if (!hit) return;
-        // 编辑器保存往往触发多次事件，合并一下
-        if (reloadTimer) clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(async () => {
-          try {
-            cfg.cssText = composeCss(cfg);
-            log('检测到样式表变更，正在重新注入…');
-            for (const s of sessions.values()) {
-              try { await s.applyCss(); } catch { /* 单个页面失败不影响其他 */ }
-            }
-            log(`已重新注入 ${sessions.size} 个页面。`);
-          } catch (e) {
-            warn(`重新注入失败：${e.message}`);
+    // 按**目录**去重后各挂一个 watcher（修过一个 bug）。
+    //
+    // 原先只 `fs.watch(path.dirname(watchTargets[0]))` —— 内置样式表和
+    // cssExtra 通常在不同目录（css/ vs 用户自定义位置），于是改 cssExtra
+    // 不会热重载，且没有任何提示。用户会以为"改了没生效"。
+    const watchDirs = [...new Set(watchTargets.map((t) => path.dirname(t)))];
+    const onCssEvent = (evt, fname) => {
+      if (!fname) return;
+      const hit = watchTargets.some((t) => path.basename(t) === fname.toString());
+      if (!hit) return;
+      // 编辑器保存往往触发多次事件，合并一下
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(async () => {
+        try {
+          cfg.cssText = composeCss(cfg);
+          log('检测到样式表变更，正在重新注入…');
+          for (const s of sessions.values()) {
+            try { await s.applyCss(); } catch { /* 单个页面失败不影响其他 */ }
           }
-        }, 250);
-      });
-      log('已启用样式热重载（改 CSS 后自动重新注入，无需重启应用）。');
-    } catch (e) {
-      warn(`样式热重载不可用：${e.message}`);
+          log(`已重新注入 ${sessions.size} 个页面。`);
+        } catch (e) {
+          warn(`重新注入失败：${e.message}`);
+        }
+      }, 250);
+    };
+    cssWatchers = [];
+    let watched = 0;
+    for (const dir of watchDirs) {
+      try {
+        cssWatchers.push(fs.watch(dir, onCssEvent));
+        watched++;
+      } catch (e) {
+        warn(`样式热重载：无法监听 ${dir}（${e.message}）`);
+      }
+    }
+    if (watched) {
+      log(`已启用样式热重载（监听 ${watched} 个目录，改 CSS 后自动重新注入）。`);
     }
   }
 
