@@ -20,6 +20,10 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
+# 生成的 .vbs（隐藏启动器）同理：Windows Script Host 按 ANSI 代码页读取，
+# 纯 ASCII 才安全；换行必须是 CRLF。
+*.vbs text eol=crlf
+
 # 这两个文件本身也保持 LF（否则 autocrlf=true 会把它们签出成 CRLF，无害但不整洁）
 .gitattributes text eol=lf
 .gitignore     text eol=lf

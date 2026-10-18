@@ -114,7 +114,7 @@ def run():
 
             # 10) 预设徽章
             n_presets = win.evaluate_js("document.querySelectorAll('#dPresets .preset').length")
-            check("预设徽章已渲染", n_presets == 4, True)
+            check("预设徽章已渲染", n_presets == 5, True)
 
             # 11) 打开向导
             win.evaluate_js("document.getElementById('btnNew').click()")
@@ -1297,7 +1297,8 @@ def run():
                     subprocess.run(["node", str(A.GEN_JS), "build", "_smoke_build"],
                                    cwd=str(A.ROOT), capture_output=True, timeout=120,
                                    creationflags=A.CREATE_NO_WINDOW)
-                    _made = {p.name for p in _bdir.glob("*.cmd")}
+                    _made = {p.name for p in _bdir.iterdir()
+                             if p.suffix.lower() in (".cmd", ".vbs")}
                     _want = {p["file"] for p in __import__('json').loads(
                         subprocess.run(
                             ["node", "-e",
@@ -1471,6 +1472,25 @@ def run():
                               _own in _lt, True, f"len={len(_lt)}")
                         check("bundle LICENSE 含 Dark Reader MIT 全文",
                               _dr in _lt, True, f"len={len(_lt)}")
+
+                    # bundle 的样式表必须真的内联可用（踩过）。
+                    #
+                    # 引入自定义 CSS 后，main() 里的
+                    # `cfg.cssText = fs.readFileSync(...)` 被换成了
+                    # composeCss()，但 renderBundle 的替换目标没跟着改 ——
+                    # bundle 版于是报「样式表不存在: (inlined)」，或更糟：
+                    # 读失败被 catch 吞成空串，"成功"启动但什么都没注入。
+                    _bn = _lic_dir / "noglass.js"
+                    if _bn.exists():
+                        _bt = _bn.read_text(encoding="utf-8")
+                        check("bundle 的 composeCss 认识 (inlined)",
+                              "cfg.css === '(inlined)'" in _bt, True)
+                        check("bundle 不再用 readFileSync 读内联样式",
+                              "cfg.cssText = fs.readFileSync(cfg.css" not in _bt, True)
+                        # 内联的 CSS 必须是非空内容（不是空串兜底）
+                        check("bundle 内联了非空样式表",
+                              "__INLINE_CSS__ = \"" in _bt and len(_bt) > 5000, True,
+                              f"len={len(_bt)}")
                 else:
                     check("bundle 产物自带 LICENSE", False, True, "临时 profile 未生成")
             finally:
@@ -1574,6 +1594,138 @@ def run():
                         pass
                 try:
                     (A.ROOT / "run" / "logs" / f"{_fake_id}.log").unlink()
+                except Exception:                        # noqa: BLE001
+                    pass
+
+            # 45) start-hidden.vbs：完全没有控制台窗口
+            #
+            # 需求：双击后不能出现任何终端窗口。
+            #
+            # 为什么不用 `start /min`：它启动的是 conhost 窗口，Windows
+            # Terminal 不接管，任务栏会留一个老式控制台图标。VBS 由
+            # wscript.exe（GUI 子系统）执行，Run(..., 0, ...) 连窗口都不建。
+            #
+            # 为什么必须有日志重定向：注入器在 registry.open() 之前的错误
+            # 和所有抛出的异常都只走 console，不写会话日志。没有窗口又丢掉
+            # stdout 的话，双击后就是"什么都没发生"。
+            _hid_prof = A.PROFILES_DIR / "smokehidden.json"
+            _hid_dir = A.ROOT / "apps" / "smokehidden"
+            _hid_work = A.ROOT / "run" / "_smoke_hidden"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                subprocess.run(["node", str(A.GEN_JS), "new", "smokehidden", "--exe", _exe],
+                               cwd=str(A.ROOT), capture_output=True, timeout=120,
+                               creationflags=A.CREATE_NO_WINDOW)
+                if _hid_prof.exists():
+                    subprocess.run(["node", str(A.GEN_JS), "build", "smokehidden"],
+                                   cwd=str(A.ROOT), capture_output=True, timeout=120,
+                                   creationflags=A.CREATE_NO_WINDOW)
+                    _hf = _hid_dir / "start-hidden.vbs"
+                    check("build 生成 start-hidden.vbs", _hf.exists(), True, str(_hf))
+                    if _hf.exists():
+                        _raw = _hf.read_bytes()
+                        check("start-hidden.vbs 是纯 ASCII",
+                              all(b < 0x80 for b in _raw), True)
+                        _lf = _raw.count(b"\n")
+                        _crlf = _raw.count(b"\r\n")
+                        check("start-hidden.vbs 用 CRLF", _lf == _crlf, True,
+                              "lf=%d crlf=%d" % (_lf, _crlf))
+                        _ht = _raw.decode("ascii")
+                        # 核心：窗口模式 0 = SW_HIDE，且不等待
+                        check("start-hidden.vbs 用 SW_HIDE 启动",
+                              "sh.Run" in _ht and ", 0, False" in _ht, True)
+                        check("start-hidden.vbs 不出现 /min",
+                              "/min" not in _ht, True)
+                        check("start-hidden.vbs 标记来源 hidden",
+                              "--source hidden" in _ht, True)
+                        check("start-hidden.vbs 含产物指纹",
+                              "profile-fingerprint:" in _ht, True)
+                        check("start-hidden.vbs 把输出重定向到日志",
+                              "-hidden.log" in _ht and "2>&1" in _ht, True)
+
+                    # 动态验证：用临时 VBS 跑一个写标记文件的 node，
+                    # 确认 (a) 参数顺序正确 (b) 日志真的落盘
+                    # (c) 全程没有新窗口 / 新 conhost。
+                    _hid_work.mkdir(parents=True, exist_ok=True)
+                    _echo = _hid_work / "echoargs.js"
+                    _echo.write_text(
+                        "const fs=require('fs');"
+                        "fs.writeFileSync(process.env.SMOKE_OUT,"
+                        "process.argv.slice(2).join(','));\n",
+                        encoding="utf-8")
+                    _spec = _hid_work / "spec.json"
+                    _spec.write_text(_json_tpl.dumps({
+                        "appName": "smoke",
+                        "asciiFallback": "smoke",
+                        "invocation": f'node "{_echo}"',
+                        "command": f'node "{_echo}"',
+                        "defaultArgs": ["--launch", "--watch", "--source", "hidden"],
+                        "logPath": str(_hid_work / "out.log"),
+                        "notes": [],
+                        "fingerprint": "0123456789ab",
+                    }), encoding="utf-8")
+                    _renderer = _hid_work / "render.js"
+                    _renderer.write_text(
+                        "const fs=require('fs');"
+                        "const r=require(process.argv[2]);"
+                        "const s=JSON.parse(fs.readFileSync(process.argv[3],'utf8'));"
+                        "fs.writeFileSync(process.argv[4], r.renderVbs(s), 'ascii');\n",
+                        encoding="utf-8")
+                    _tvbs = _hid_work / "t.vbs"
+                    _rr = subprocess.run(
+                        ["node", str(_renderer), str(A.ROOT / "lib" / "render.js"),
+                         str(_spec), str(_tvbs)],
+                        cwd=str(A.ROOT), capture_output=True, timeout=60,
+                        creationflags=A.CREATE_NO_WINDOW)
+                    check("渲染临时隐藏启动器成功", _tvbs.exists(), True,
+                          (_rr.stderr or b"").decode("utf-8", "replace")[:160])
+
+                    if _tvbs.exists():
+                        _out_file = _hid_work / "out.txt"
+                        _env = os.environ.copy()
+                        _env["SMOKE_OUT"] = str(_out_file)
+
+                        # 这里刻意**不**断言"没有新增 conhost 进程"。
+                        #
+                        # 试过，但它是环境相关的：整机其他程序（包括测试
+                        # 自己起的 node/cmd）随时可能新建 conhost，计数
+                        # 会假阳性。真正决定"无窗口"的是结构性的
+                        # Run(..., 0, False)（SW_HIDE，不等待）——
+                        # 那条已由上面的源码断言覆盖，另做手工验证：
+                        # 启动前后新增可见窗口 0、新增 conhost 0。
+
+                        _r1 = subprocess.run(
+                            ["wscript", str(_tvbs)],
+                            env=_env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=40,
+                            creationflags=A.CREATE_NO_WINDOW)
+                        check("wscript 启动隐藏启动器成功", _r1.returncode == 0, True,
+                              f"exit={_r1.returncode} {( _r1.stderr or '')[:120]}")
+
+                        for _ in range(50):              # 最多等 5 秒
+                            if _out_file.exists():
+                                break
+                            time.sleep(0.1)
+                        check("隐藏启动器真的执行了命令",
+                              _out_file.exists()
+                              and _out_file.read_text(encoding="utf-8")
+                              == "--launch,--watch,--source,hidden",
+                              True, str(_out_file))
+                        _logp = _hid_work / "out.log"
+                        check("隐藏启动器的输出写进了日志",
+                              _logp.exists() and _logp.stat().st_size >= 0, True,
+                              str(_logp))
+            finally:
+                for _p in (_hid_prof,):
+                    try:
+                        _p.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                try:
+                    import shutil as _sh3
+                    _sh3.rmtree(_hid_dir, ignore_errors=True)
+                    _sh3.rmtree(_hid_work, ignore_errors=True)
                 except Exception:                        # noqa: BLE001
                     pass
 

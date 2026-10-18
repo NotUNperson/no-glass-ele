@@ -379,7 +379,14 @@ function resolveConfig(opts) {
  */
 function composeCss(cfg) {
   let css = '';
-  try { css = fs.readFileSync(cfg.css, 'utf8'); } catch { css = ''; }
+  if (typeof __INLINE_CSS__ !== 'undefined' && __INLINE_CSS__ && cfg.css === '(inlined)') {
+    // bundle 版：样式表已经内联进这个文件，磁盘上没有对应文件。
+    // 这里必须自己接住 —— 否则 readFileSync 失败后被 catch 吞成空串，
+    // 注入器"成功"跑起来但什么都没注入。
+    css = __INLINE_CSS__;
+  } else {
+    try { css = fs.readFileSync(cfg.css, 'utf8'); } catch { css = ''; }
+  }
 
   if (cfg.cssExtra && fs.existsSync(cfg.cssExtra)) {
     let extra = '';
@@ -938,7 +945,10 @@ async function main() {
   const cfg = resolveConfig(opts);
   ({ log, warn } = makeLoggers(cfg));
 
-  if (!fs.existsSync(cfg.css)) throw new Error(`样式表不存在: ${cfg.css}`);
+  // bundle 版的样式表内联在本文件里，磁盘上没有对应路径 —— 跳过存在性检查
+  if (cfg.css !== '(inlined)' && !fs.existsSync(cfg.css)) {
+    throw new Error(`样式表不存在: ${cfg.css}`);
+  }
   cfg.cssText = composeCss(cfg);
 
   // ── Dark Reader 引擎（可选）──

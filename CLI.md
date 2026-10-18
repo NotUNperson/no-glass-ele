@@ -30,6 +30,10 @@ node gen.js build myapp
 
 > `start.cmd` **不依赖 Python**，它只用 `node`。所以纯 CLI 用户完全够用。
 
+同一个目录下还有 `start-hidden.vbs`：参数和 `start.cmd` 一样，但由
+`wscript.exe` 以隐藏窗口启动，**不会出现任何控制台**。输出写到
+`run/logs/<profile>-hidden.log`，出问题时先看那里。
+
 ---
 
 ## 二、安装与自检

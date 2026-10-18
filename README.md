@@ -46,7 +46,7 @@
 **进阶**
 
 - [传给应用的启动参数](#传给应用的启动参数) —— Chromium 渲染开关
-- [生成的启动器预设](#生成的启动器预设) —— 四个 `.cmd` 分别在什么时候生成
+- [生成的启动器预设](#生成的启动器预设) —— 五个预设分别在什么时候生成
 - [隔离是「数据隔离」，不是多开](#隔离是数据隔离不是多开)
 - [Tauri / WebView2 应用](#tauri--webview2-应用) —— 启动方式与 Electron 不同
 - [应用自己的启动参数](#应用自己的启动参数为什么注入器启动会弹窗) —— 为什么注入器启动会弹窗
@@ -138,6 +138,7 @@ node gen.js doctor
 ```
 
 生成物在 `apps/myapp/`，双击 `start.cmd` 即可。
+不想看到终端窗口就双击 `start-hidden.vbs`（全程无窗口，日志写进 `run/logs/`）。
 
 ---
 
@@ -763,6 +764,7 @@ node injector/noglass.js --profile profiles/myapp.json --launch --watch \
 | 文件 | 参数 | 何时生成 |
 |---|---|---|
 | `start.cmd` | `--launch --watch` | 总是 |
+| `start-hidden.vbs` | `--launch --watch --source hidden` | 总是 |
 | `start-debug.cmd` | `--launch --list` | 总是 |
 | `start-isolated.cmd` | `--isolate --watch` | 能隔离时（应用没写死 userData，或 profile 提供了隔离开关）|
 | `start-native.cmd` | `--native --launch --watch` | **仅当 fuse 允许 `--inspect`** |
@@ -770,13 +772,28 @@ node injector/noglass.js --profile profiles/myapp.json --launch --watch \
 最后一条是探测结果的直接应用：加固过的应用上 `--native` 必然失败，
 所以**不生成**那个脚本，而不是让你双击后吃一串报错。
 
-所有预设都支持追加参数（后者覆盖前者）：
+`start-hidden.vbs` 和 `start.cmd` 是同一套参数，区别只在窗口：
+它由 `wscript.exe`（GUI 子系统程序）执行，再用 `WScript.Shell.Run(..., 0, ...)`
+以 `SW_HIDE` 启动注入器，**全程不创建任何控制台窗口**，任务栏也不会留图标。
+
+> 为什么不用 `start /min`：那仍然是 conhost 窗口，Windows Terminal 不会接管它，
+> 任务栏会留下一个老式控制台图标。VBS 是唯一不引入额外依赖又能真正隐藏的做法。
+
+没有窗口就没有地方看报错，所以它的 stdout/stderr 全部写进
+`run/logs/<profile>-hidden.log`（bundle 版写在脚本旁边的 `hidden.log`）。
+日志开头会记下完整的命令行 —— 如果双击后看起来什么都没发生，先看这个文件。
+
+所有 `.cmd` 预设都支持追加参数（后者覆盖前者）：
 
 ```bat
 start.cmd --port 9500
 ```
 
-每个启动器第一件事是 `chcp 65001`（切到 UTF-8 代码页）—— 见 [`.cmd` 编码坑](#cmd-编码坑)。
+`.vbs` 预设也支持从命令行传参（`wscript start-hidden.vbs --port 9500`），
+但双击时没有命令行，只能用它的默认参数。
+
+每个 `.cmd` 启动器第一件事是 `chcp 65001`（切到 UTF-8 代码页）—— 见 [`.cmd` 编码坑](#cmd-编码坑)。
+`.vbs` 不经过 cmd 的代码页，但同样保持纯 ASCII + CRLF（Windows Script Host 按 ANSI 代码页读取）。
 
 ## 隔离是「数据隔离」，不是多开
 

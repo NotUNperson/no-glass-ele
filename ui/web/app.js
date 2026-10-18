@@ -326,7 +326,7 @@ function renderDetail(keepScroll = false) {
   }
 
   // 预设
-  const ALL = ['start', 'start-debug', 'start-isolated', 'start-native'];
+  const ALL = ['start', 'start-hidden', 'start-debug', 'start-isolated', 'start-native'];
   const have = new Set(meta.presets || []);
   $('dPresets').innerHTML = ALL.map((x) =>
     `<span class="preset ${have.has(x) ? 'available' : 'missing'}" title="${have.has(x) ? '已生成' : '未生成（不适用或未 build）'}">${x}.cmd</span>`

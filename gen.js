@@ -476,6 +476,46 @@ function cmdNew(args) {
 
 // ─────────────────────────── build ───────────────────────────
 
+/**
+ * 按预设的扩展名选渲染器。
+ *
+ * 为什么要有这一层：`.cmd` 与 `.vbs` 的转义规则、路径推导方式、
+ * 失败时的兜底都不同。把选择集中在一处，`planPresets` 只需要声明
+ * `file`，不必知道谁来渲染。
+ *
+ * `@HERE@` 在 .cmd 里换成 `%~dp0`（脚本所在目录，带尾反斜杠），
+ * 在 .vbs 里换成 `WScript.ScriptFullName` 的父目录。
+ */
+function writePreset(p, o) {
+  if (p.file.endsWith('.vbs')) {
+    // 日志：共享版放工具根目录的 run/logs（隐藏启动器没有窗口，日志是
+    // 唯一的排错入口）；bundle 版没有 ..\..\run 可写，落在脚本旁边。
+    const logPath = o.bundle
+      ? '@HERE@\\hidden.log'
+      : `@HERE@\\..\\..\\run\\logs\\${o.asciiFallback}-hidden.log`;
+    return render.renderVbs({
+      appName: o.appName,
+      asciiFallback: o.asciiFallback,
+      command: o.invocation,
+      defaultArgs: o.defaultArgs,
+      logPath,
+      notes: o.notes,
+      fingerprint: o.fingerprint,
+    });
+  }
+  // .cmd：@HERE@ → %~dp0（脚本所在目录，自带尾反斜杠）
+  return render.renderCmd({
+    title: p.title,
+    appName: o.appName,
+    asciiFallback: o.asciiFallback,
+    invocation: o.invocation.replace(/@HERE@/g, '%~dp0'),
+    defaultArgs: o.defaultArgs,
+    notes: o.notes,
+    preset: p.preset,
+    fingerprint: o.fingerprint,
+  });
+}
+
 function buildOne(name, opts = {}) {
   const prof = loadProfile(name);
   const presets = render.planPresets(prof);
@@ -511,15 +551,14 @@ function buildOne(name, opts = {}) {
     results.files.push(lf);
 
     for (const p of presets) {
-      const cmd = render.renderCmd({
-        title: p.title,
+      const cmd = writePreset(p, {
         appName: prof.displayName || name,
         asciiFallback: name,
-        invocation: 'node "%~dp0noglass.js"',
+        invocation: 'node "@HERE@\\noglass.js"',
         defaultArgs: p.args,
         notes: [...p.notes, 'Bundled build: profile and stylesheet are inlined in noglass.js.'],
-        preset: p.preset,
         fingerprint: fp,
+        bundle: true,
       });
       const cf = path.join(outDir, p.file);
       fs.writeFileSync(cf, cmd, 'ascii');
@@ -530,15 +569,14 @@ function buildOne(name, opts = {}) {
     const relInjector = path.relative(outDir, INJECTOR);
     const relProfile = path.relative(outDir, path.join(PROFILES_DIR, `${name}.json`));
     for (const p of presets) {
-      const cmd = render.renderCmd({
-        title: p.title,
+      const cmd = writePreset(p, {
         appName: prof.displayName || name,
         asciiFallback: name,
-        invocation: `node "${relInjector}" --profile "${relProfile}"`,
+        invocation: `node "@HERE@\\${relInjector}" --profile "@HERE@\\${relProfile}"`,
         defaultArgs: p.args,
         notes: p.notes,
-        preset: p.preset,
         fingerprint: fp,
+        bundle: false,
       });
       const cf = path.join(outDir, p.file);
       fs.writeFileSync(cf, cmd, 'ascii');
@@ -547,7 +585,7 @@ function buildOne(name, opts = {}) {
   }
 
   // 记录被跳过的预设，便于向用户解释原因
-  const all = ['start.cmd', 'start-debug.cmd', 'start-isolated.cmd', 'start-native.cmd'];
+  const all = ['start.cmd', 'start-hidden.vbs', 'start-debug.cmd', 'start-isolated.cmd', 'start-native.cmd'];
   const made = presets.map((p) => p.file);
   for (const f of all) {
     if (made.includes(f)) continue;
@@ -568,18 +606,24 @@ function buildOne(name, opts = {}) {
   //
   // 场景：应用重新 probe 后 fuse 加固了 → planPresets 不再产出
   // start-native.cmd，但上一次 build 留下的那个文件还在。于是：
-  //   · collectListData 用 readdirSync 列 .cmd 当作 presets → UI 继续显示"可用"
+  //   · collectListData 用 readdirSync 列预设 → UI 继续显示"可用"
   //   · 用户双击它 → 必然失败
-  // 只删预设白名单里的文件，不碰用户自己放进来的东西。
-  for (const f of all) {
+  //
+  // 按扩展名扫目录，而不是遍历一份固定的文件名白名单：预设换过形态
+  // （start-hidden 从 .cmd 改成 .vbs）时，白名单里已经没有旧名字，
+  // 旧文件会永久残留。只认 .cmd/.vbs 两种扩展名，用户自己放的其他
+  // 文件（helper.exe、notes.txt）不碰。
+  const PRESET_EXT = /\.(cmd|vbs)$/i;
+  let existing = [];
+  try { existing = fs.readdirSync(outDir); } catch { /* 目录刚建，空 */ }
+  for (const f of existing) {
+    if (!PRESET_EXT.test(f)) continue;
     if (made.includes(f)) continue;
     const stale = path.join(outDir, f);
     try {
-      if (fs.existsSync(stale)) {
-        fs.unlinkSync(stale);
-        results.removed = results.removed || [];
-        results.removed.push(stale);
-      }
+      fs.unlinkSync(stale);
+      results.removed = results.removed || [];
+      results.removed.push(stale);
     } catch { /* 删不掉不影响生成结果 */ }
   }
 
@@ -632,7 +676,9 @@ function collectListData() {
     const d = p.detected || {};
     const appDir = path.join(APPS_DIR, n);
     let cmds = [];
-    try { cmds = fs.readdirSync(appDir).filter((f) => f.endsWith('.cmd')); } catch { /* none */ }
+    try {
+      cmds = fs.readdirSync(appDir).filter((f) => f.endsWith('.cmd') || f.endsWith('.vbs'));
+    } catch { /* none */ }
 
     // 只把**本工具会生成的**预设算作"可用"（踩过）。
     //
@@ -674,7 +720,7 @@ function collectListData() {
       userDataOverride: d.userDataOverride === undefined ? null : d.userDataOverride,
       hardened: (d.fuses && d.fuses.hardened) || [],
       reservedPorts: p.reservedPorts || [],
-      presets: cmds.map((f) => f.replace(/\.cmd$/, '')),
+      presets: cmds.map((f) => f.replace(/\.(cmd|vbs)$/, '')),
       generated: cmds.length > 0,
       stale,
       probedAt: d.probedAt || null,
