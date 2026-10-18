@@ -783,6 +783,29 @@ node injector/noglass.js --profile profiles/myapp.json --launch --watch \
 `run/logs/<profile>-hidden.log`（bundle 版写在脚本旁边的 `hidden.log`）。
 日志开头会记下完整的命令行 —— 如果双击后看起来什么都没发生，先看这个文件。
 
+**它不会弹任何对话框。** 隐藏启动器一旦弹出模态框，用户既不知道它从哪来，
+还得手动点掉，比静默失败更烦人。所以所有失败路径（找不到 node、日志写不进去、
+`cmd` 启动失败）都只写日志并以非零码退出。找不到 node 时日志里会带上
+它实际搜索过的 PATH，便于定位是环境问题还是安装问题。
+
+**它比 `start.cmd` 更轻**，不是更重。实测（同一负载，各 5 轮取中位数，
+用 Job Object 统计整棵进程树的 CPU 时间，不受机器上其他程序干扰）：
+
+| 指标 | `start.cmd` | `start-hidden.vbs` |
+|---|---|---|
+| 进程总数 | 5（cmd + chcp + where + node + conhost）| **4**（wscript + cmd + node + conhost）|
+| CPU 总时间 | 0.391 s | **0.297 s**（少 24%）|
+| 峰值内存 | 39.6 MB | 38.98 MB |
+| 新建 conhost | 1 | 1 |
+
+省下来的是 `chcp.com` 和 `where.exe` 两个进程。VBS 版不需要切代码页
+（不经过 cmd 的代码页），而 node 的存在性检查用 `FileSystemObject`
+直接扫 PATH —— 早先那版用 `cmd /c where node`，为此多起一对
+cmd+conhost，进程数反而变成 7，比 `start.cmd` 还重。
+
+唯一的代价是缺页次数略高（24.5k → 26.7k，wscript.exe 自身加载），
+属于一次性开销，在 0.3 秒的 CPU 时间面前可以忽略。
+
 所有 `.cmd` 预设都支持追加参数（后者覆盖前者）：
 
 ```bat

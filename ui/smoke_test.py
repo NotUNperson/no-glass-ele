@@ -1611,6 +1611,7 @@ def run():
             _hid_prof = A.PROFILES_DIR / "smokehidden.json"
             _hid_dir = A.ROOT / "apps" / "smokehidden"
             _hid_work = A.ROOT / "run" / "_smoke_hidden"
+            _hid_work.mkdir(parents=True, exist_ok=True)
             try:
                 _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                                     "System32", "notepad.exe")
@@ -1643,6 +1644,50 @@ def run():
                               "profile-fingerprint:" in _ht, True)
                         check("start-hidden.vbs 把输出重定向到日志",
                               "-hidden.log" in _ht and "2>&1" in _ht, True)
+                        # Node 查找必须是纯 VBS（FileSystemObject 扫 PATH）。
+                        # 曾经用 `cmd /c where node`：实测为此多起一对
+                        # cmd+conhost，进程数 7 而 start.cmd 只有 5 ——
+                        # 一个"更轻量"的启动器反而更重。
+                        check("start-hidden.vbs 用纯 VBS 查找 node",
+                              "FindOnPath" in _ht
+                              and 'sh.Run("cmd /c where node' not in _ht, True)
+                        # 隐藏启动器绝不能弹模态框：用户不知道它从哪来，
+                        # 还得手动点掉。所有失败路径都写日志 + 非零退出。
+                        check("start-hidden.vbs 不弹对话框",
+                              "MsgBox" not in _ht, True)
+
+                        # 负向路径：PATH 里没有 node 时必须
+                        # 快速退出（不阻塞）、写日志说明原因、退出码 1。
+                        _nl = _hid_work / "no-node.log"
+                        _nv = _hid_work / "no-node.vbs"
+                        _nlog_line = [ln for ln in _ht.splitlines()
+                                      if ln.startswith("logFile = Replace(")]
+                        if _nlog_line:
+                            _nv.write_text(
+                                _ht.replace(_nlog_line[0],
+                                            'logFile = "%s"' % str(_nl).replace("\\", "\\\\")),
+                                encoding="ascii", newline="")
+                            _nenv = os.environ.copy()
+                            _nenv["PATH"] = os.path.join(
+                                os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+                            _t0 = time.time()
+                            try:
+                                _nr = subprocess.run(
+                                    ["wscript", str(_nv)], env=_nenv,
+                                    capture_output=True, text=True, timeout=15)
+                                _elapsed = time.time() - _t0
+                                check("缺 node 时不阻塞（没弹窗）", _elapsed < 5, True,
+                                      f"elapsed={_elapsed:.2f}s")
+                                check("缺 node 时退出码为 1", _nr.returncode == 1, True,
+                                      f"exit={_nr.returncode}")
+                                _ntext = (_nl.read_text(encoding="utf-8", errors="replace")
+                                          if _nl.exists() else "")
+                                check("缺 node 时日志写明原因",
+                                      "Node.js not found" in _ntext, True,
+                                      _ntext[:160])
+                            except subprocess.TimeoutExpired:
+                                check("缺 node 时不阻塞（没弹窗）", False, True,
+                                      "wscript 超时 —— 很可能弹了对话框")
 
                     # 动态验证：用临时 VBS 跑一个写标记文件的 node，
                     # 确认 (a) 参数顺序正确 (b) 日志真的落盘
