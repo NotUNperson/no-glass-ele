@@ -1537,6 +1537,77 @@ def run():
                             creationflags=A.CREATE_NO_WINDOW)
                     check("测试后中转器已恢复", _relay.exists(), True, str(_relay))
 
+            # 46) UI 的自启动开关必须真的能开/能关
+            #
+            # 真实 bug：set_autostart 拼 node -e 脚本时，
+            #   "ignoreConflicts:true}});"   ← 这段不是 f-string
+            # 里的 }} 不会被转义，结果拼出两个右花括号，node 直接报语法错误。
+            # 表现：设置面板里勾选/取消都失败，错误信息是一串 "Expected"。
+            #
+            # 这里直接调 Api 方法（跳过 webview），验证两个方向都返回 ok。
+            # 用临时 profile，不碰用户的真实配置。
+            _au_prof = A.PROFILES_DIR / "_smoke_autostart.json"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                _au_prof.write_text(_json_tpl.dumps({
+                    "name": "_smoke_autostart",
+                    "displayName": "_smoke_autostart",
+                    "exe": _exe,
+                    "processName": "notepad",
+                    "defaultPort": 19997,
+                    "appArgs": [],
+                    "autostart": {"enabled": False, "appArgs": None},
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                _api = A.Api()
+                _on = _api.set_autostart("_smoke_autostart", True)
+                check("UI 能开启自启动", bool(_on and _on.get("ok")), True,
+                      str(_on)[:200])
+                _off = _api.set_autostart("_smoke_autostart", False)
+                check("UI 能关闭自启动", bool(_off and _off.get("ok")), True,
+                      str(_off)[:200])
+                # 错误信息里不该出现 node 语法错误（那是本次 bug 的直接特征）
+                check("自启动开关不再报 node 语法错误",
+                      "Expected" not in str(_on) + str(_off), True,
+                      (str(_on) + str(_off))[:200])
+
+                # ── 开机专用参数的三态 ──
+                _r1 = _api.set_autostart_app_args("_smoke_autostart", ["--hidden"])
+                check("能设置开机专用参数",
+                      _r1.get("ok") and _r1.get("effective") == ["--hidden"], True,
+                      str(_r1)[:160])
+                _r2 = _api.set_autostart_app_args("_smoke_autostart", [])
+                check("能设为「明确无参数」",
+                      _r2.get("ok") and _r2.get("effective") == [], True,
+                      str(_r2)[:160])
+                _r3 = _api.set_autostart_app_args("_smoke_autostart", None)
+                check("能设回「继承顶层」",
+                      _r3.get("ok") and _r3.get("appArgs") is None, True,
+                      str(_r3)[:160])
+
+                # 继承语义：顶层有参数时，null 应该跟着顶层走
+                _p2 = A.read_profile("_smoke_autostart")
+                _p2["appArgs"] = ["--disable-lcd-text"]
+                A.write_profile("_smoke_autostart", _p2)
+                check("null 时继承顶层 appArgs",
+                      A.effective_app_args(A.read_profile("_smoke_autostart"))
+                      == ["--disable-lcd-text"], True)
+                _api.set_autostart_app_args("_smoke_autostart", [])
+                check("[] 时覆盖顶层 appArgs",
+                      A.effective_app_args(A.read_profile("_smoke_autostart")) == [],
+                      True)
+            finally:
+                try:
+                    _au_prof.unlink()
+                except Exception:                    # noqa: BLE001
+                    pass
+                # 若测试把它留在了启用列表里，清掉注册项
+                try:
+                    A.Api().set_autostart("_smoke_autostart", False)
+                except Exception:                    # noqa: BLE001
+                    pass
+
             # 42) 注入器拒绝同一 profile 的第二个会话
             #
             # 真实 bug：UI 有防重复，但双击 start.cmd 两次就绕过去了 ——

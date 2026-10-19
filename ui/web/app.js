@@ -1423,6 +1423,7 @@ async function loadAutostartState() {
   // ── profile 勾选列表 ──
   const enabledSet = new Set((res.enabled || []).map((x) => x.name));
   const legacySet = new Set((res.legacy || []).map((x) => x.profile));
+  const byName = new Map((res.enabled || []).map((x) => [x.name, x]));
   const list = $('asList');
   const names = res.profiles || [];
   if (!names.length) {
@@ -1431,13 +1432,30 @@ async function loadAutostartState() {
     list.innerHTML = names.map((n) => {
       const on = enabledSet.has(n);
       const legacy = legacySet.has(n) ? '<span class="tag legacy" title="存在旧式启动项">旧</span>' : '';
+      const ent = byName.get(n);
+      // 开机参数：null = 继承顶层，[] = 明确无参数。
+      // 用占位符区分这两种，否则用户没法表达"开机时不要任何参数"。
+      const raw = ent ? ent.appArgsRaw : null;
+      const inherited = ent ? (ent.topAppArgs || []) : [];
+      const val = raw === null ? '' : raw.join(', ');
+      const ph = inherited.length
+        ? `继承：${inherited.join(', ')}`
+        : '继承：无';
       return `
-        <label class="as-item">
-          <input type="checkbox" data-as-name="${esc(n)}" ${on ? 'checked' : ''}>
-          <span class="nm">${esc(n)}</span>
-          ${legacy}
-          <span class="tag${on ? '' : ' hidden'}">已启用</span>
-        </label>`;
+        <div class="as-item-wrap">
+          <label class="as-item">
+            <input type="checkbox" data-as-name="${esc(n)}" ${on ? 'checked' : ''}>
+            <span class="nm">${esc(n)}</span>
+            ${legacy}
+            <span class="tag${on ? '' : ' hidden'}">已启用</span>
+          </label>
+          <div class="as-args${on ? '' : ' hidden'}" data-as-args-for="${esc(n)}">
+            <input class="input as-args-input" type="text"
+                   data-as-args="${esc(n)}" value="${esc(val)}"
+                   placeholder="${esc(ph)}">
+            <span class="dim tiny">开机专用参数（留空 = 继承上面的启动参数）</span>
+          </div>
+        </div>`;
     }).join('');
   }
 
@@ -1481,6 +1499,7 @@ async function toggleAutostart(name, enabled) {
     await loadAutostartState();
     return;
   }
+
   // 关掉最后一项时，问是否删除中转器
   if (!enabled && res.shouldPromptDelete) {
     const st = STATE.autostart && STATE.autostart.settings;
@@ -1496,6 +1515,51 @@ async function toggleAutostart(name, enabled) {
   toast(enabled ? `已启用 ${name} 的开机自启动` : `已关闭 ${name} 的开机自启动`, 'ok');
   await loadAutostartState();
   await refresh();
+}
+
+/**
+ * 保存某个 profile 的「开机专用参数」（autostart.appArgs）。
+ *
+ * 三态语义（与 lib/autostart.js 的 effectiveAppArgs 一致）：
+ *   输入框留空       → 继承顶层 appArgs
+ *   输入一个特殊标记 → 明确无参数
+ *   填了内容         → 用这组
+ *
+ * 为什么需要"明确无参数"这一态：有些应用手动启动要 --hidden（静默到托盘），
+ * 但开机时反而要显示窗口。这时开机参数必须是 []，而不是继承。
+ * 留空表达不了，所以用占位符 + 一个显式的勾选项。
+ */
+async function saveAutostartAppArgs(name, text) {
+  const raw = String(text == null ? '' : text).trim();
+  let args;
+  if (raw === '') {
+    args = null;                       // 继承顶层
+  } else if (raw === '-') {
+    args = [];                         // 明确无参数
+  } else {
+    args = raw.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+  }
+  const res = await api().set_autostart_app_args(name, args);
+  if (!res || res.ok === false) {
+    toast((res && res.error) || '保存开机参数失败', 'err', 6000);
+    return;
+  }
+  const eff = res.effective || [];
+  const what = args === null
+    ? `继承顶层（${eff.join(', ') || '无'}）`
+    : (args.length ? args.join(' ') : '无参数');
+  toast(`${name} 开机参数：${what}`, 'ok', 4000);
+
+  // 刻意**不**调 loadAutostartState()：那会重绘整个 asList，
+  // 用户正在这个输入框里、刚敲完回车，重绘会把焦点和光标位置一起丢掉。
+  // 这里只更新占位符（它显示"继承的是什么"）。
+  const el = $('asList').querySelector(`[data-as-args="${name}"]`);
+  if (el) {
+    const ent = (STATE.autostart && STATE.autostart.enabled || [])
+      .find((x) => x.name === name);
+    const top = (ent && ent.topAppArgs) || [];
+    el.placeholder = top.length ? `继承：${top.join(', ')}` : '继承：无';
+  }
 }
 
 /** 检测可用的 pythonw（真跑一次）。 */
@@ -1557,6 +1621,20 @@ function bindUI() {
     if (cb && cb.dataset && cb.dataset.asName) {
       toggleAutostart(cb.dataset.asName, cb.checked);
     }
+  });
+  // 开机专用参数：失焦或回车时保存。
+  //
+  // 用 change（失焦触发）而不是 input：每敲一个字符就存一次会写盘，
+  // 而且用户还没敲完就被重载会丢焦点。
+  $('asList').addEventListener('change', (e) => {
+    const el = e.target;
+    if (!el || !el.dataset || !el.dataset.asArgs) return;
+    saveAutostartAppArgs(el.dataset.asArgs, el.value);
+  });
+  $('asList').addEventListener('keydown', (e) => {
+    const el = e.target;
+    if (!el || !el.dataset || !el.dataset.asArgs) return;
+    if (e.key === 'Enter') { el.blur(); }   // 触发上面的 change
   });
   // 点运行器行：切到手动指定
   $('asRunners').addEventListener('click', async (e) => {

@@ -271,6 +271,15 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .as-list .as-item .nm { flex: 1; }
 .as-list .as-item .tag { font-size: 11px; color: var(--ok); }
 .as-list .as-item .tag.legacy { color: var(--warn); }
+/* 每个启用项下面的「开机专用参数」输入框 */
+.as-list .as-item-wrap { margin-bottom: 2px; }
+.as-list .as-args {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 8px 6px 28px;          /* 左缩进对齐上面的名字 */
+}
+.as-list .as-args .as-args-input {
+  flex: 0 1 240px; font-family: var(--mono); font-size: 11px;
+}
 .as-runners { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
 .as-runners .as-runner {
   display: flex; align-items: center; gap: 8px;

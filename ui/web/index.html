@@ -280,6 +280,12 @@
         <label class="lbl">参与自启动的应用</label>
         <div id="asList" class="as-list"></div>
         <p class="hint" id="asRelayState"></p>
+        <p class="hint">
+          勾选后，每个应用下面会出现一个<b>开机专用参数</b>输入框：
+          留空 = 继承「传给应用的启动参数」；填 <code>-</code> = 开机时明确不带任何参数；
+          填内容（逗号或空格分隔）= 开机时用这组。
+          典型用法：应用手动启动要 <code>--hidden</code> 静默到托盘，但开机时反而要显示窗口。
+        </p>
       </div>
 
       <div class="wiz-step">

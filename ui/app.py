@@ -1286,10 +1286,18 @@ class Api:
         # 启用了自启动的 profile（纯读 JSON）
         enabled = []
         for name, prof in scan_enabled_profiles():
+            au = prof.get("autostart") or {}
+            raw = au.get("appArgs", None)
             enabled.append({
                 "name": name,
                 "displayName": prof.get("displayName") or name,
+                # 实际生效的参数（已折算 null → 顶层 appArgs）
                 "appArgs": effective_app_args(prof),
+                # 原始配置：null = 继承顶层；[] = 明确无参数；[...] = 用它。
+                # 前端要靠这个区分「继承」和「显式空」，否则编辑框没法回显。
+                "appArgsRaw": list(raw) if isinstance(raw, list) else None,
+                # 顶层 appArgs，供前端显示「继承的是什么」
+                "topAppArgs": list(prof.get("appArgs") or []),
             })
 
         # 旧式 per-profile 项（只列文件名，不解析内容）
@@ -1336,12 +1344,15 @@ class Api:
             return {"ok": False, "error": str(e)}
 
         fn = "enable" if enabled else "disable"
+        # 注意最后一段是普通字符串、不是 f-string：那里的 } 不会被转义，
+        # 写成 }} 会拼出两个右花括号，node -e 直接报语法错误
+        # （表现为设置面板里显示一串 "Expected"）。
         script = (
             "const a=require('./lib/autostart');"
             f"const r=a.{fn}({json.dumps(name)},"
             f"{{exe:{json.dumps(prof.get('exe') or '')},"
             f"processName:{json.dumps(prof.get('processName') or '')},"
-            "ignoreConflicts:true}});"
+            "ignoreConflicts:true});"
             "process.stdout.write(JSON.stringify(r));"
         )
         data, err = self._node_json(script)
@@ -1370,6 +1381,45 @@ class Api:
         if data is None:
             return {"ok": False, "error": err or "删除失败"}
         return data
+
+    def set_autostart_app_args(self, name, args):
+        """
+        设置某个 profile 的「开机启动专用参数」（autostart.appArgs）。
+
+        三态，与 lib/autostart.js 的 effectiveAppArgs 保持一致：
+          None  → 继承顶层 appArgs（删除这个键的效果）
+          []    → 明确无参数（覆盖顶层的）
+          [...] → 用这组
+
+        为什么单独一个 API 而不是走 save_profile：整份 profile 保存时，
+        前端表单不包含这个字段（它只存在于 autostart 弹窗里），
+        走 save_profile 有把它冲掉的风险。这里只改一个键。
+        """
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(name or "")):
+            return {"ok": False, "error": "profile 名不合法"}
+        if args is not None:
+            if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
+                return {"ok": False, "error": "参数必须是字符串数组或 null"}
+            args = [a for a in args if a.strip()]
+        try:
+            prof = read_profile(name)
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
+        au = prof.get("autostart")
+        if not isinstance(au, dict):
+            au = {}
+        if args is None:
+            au.pop("appArgs", None)
+        else:
+            au["appArgs"] = args
+        prof["autostart"] = au
+        try:
+            write_profile(name, prof)
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "appArgs": args,
+                "effective": effective_app_args(prof)}
 
     def set_autostart_settings(self, patch):
         """写 local/autostart.json（合并式）。"""
