@@ -274,12 +274,19 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* 每个启用项下面的「开机专用参数」输入框 */
 .as-list .as-item-wrap { margin-bottom: 2px; }
 .as-list .as-args {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   padding: 0 8px 6px 28px;          /* 左缩进对齐上面的名字 */
 }
 .as-list .as-args .as-args-input {
-  flex: 0 1 240px; font-family: var(--mono); font-size: 11px;
+  flex: 1 1 180px; min-width: 120px;
+  font-family: var(--mono); font-size: 11px;
 }
+.as-list .as-args .btn { flex: 0 0 auto; }
+.as-list .as-args .check { flex: 0 0 auto; white-space: nowrap; }
+.as-list .as-args .as-args-input:disabled { opacity: .45; }
+/* 底部「有未保存的修改」提示 */
+#asStatus.dirty-dot { color: var(--warn); }
+.as-runners .as-runner.picked { background: var(--btn-hover); }
 .as-runners { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
 .as-runners .as-runner {
   display: flex; align-items: center; gap: 8px;
@@ -444,6 +451,24 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .modal {
   position: fixed; inset: 0; background: var(--overlay);
   display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+/* 页面内确认框（替代 window.confirm，后者会阻塞渲染线程） */
+.confirm-layer {
+  position: fixed; inset: 0; background: var(--overlay);
+  display: flex; align-items: center; justify-content: center; z-index: 200;
+}
+.confirm-box {
+  width: min(440px, 92vw);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 9px; padding: 16px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .35);
+}
+.confirm-msg {
+  font-size: 13px; line-height: 1.6; color: var(--text-1);
+  white-space: pre-wrap; word-break: break-word;
+}
+.confirm-actions {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
 }
 .modal-box {
   width: min(660px, 94vw); max-height: 88vh; display: flex; flex-direction: column;

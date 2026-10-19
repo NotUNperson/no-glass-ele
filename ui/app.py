@@ -1283,6 +1283,19 @@ class Api:
         except Exception:                                # noqa: BLE001
             pass
 
+        # 每个 profile 的顶层 appArgs —— 所有 profile 都要有，不能只给已启用的。
+        # 「复制正常参数」按钮在勾选的瞬间就要能读到它，而那一刻
+        # autostart.enabled 还是 false，不在 scan_enabled_profiles 的结果里。
+        top_args = {}
+        for f in sorted(PROFILES_DIR.glob("*.json")):
+            if f.name.startswith("_"):
+                continue
+            try:
+                prof = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:                            # noqa: BLE001
+                continue
+            top_args[f.stem] = list(prof.get("appArgs") or [])
+
         # 启用了自启动的 profile（纯读 JSON）
         enabled = []
         for name, prof in scan_enabled_profiles():
@@ -1332,6 +1345,8 @@ class Api:
             "legacy": legacy,
             "settings": read_autostart_settings(),
             "profiles": names,
+            # 全部 profile 的顶层 appArgs（含未启用的）—— 「复制正常参数」要用
+            "topAppArgs": top_args,
         }
 
     def set_autostart(self, name, enabled):
@@ -1420,6 +1435,58 @@ class Api:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "appArgs": args,
                 "effective": effective_app_args(prof)}
+
+    def apply_autostart(self, changes, settings=None):
+        """
+        一次性应用自启动弹窗里的全部改动（「保存设置」按钮）。
+
+        changes: [{name, enabled, appArgs?}]
+            appArgs 三态：null = 继承顶层；[] = 明确无参数；[...] = 用它。
+            不传这个键则保持 profile 里的原值。
+
+        settings: 可选的设置补丁（节奏 / 开关 / pythonw），走 write_autostart_settings。
+
+        为什么合成一个 API：弹窗里所有改动应该是一个事务 —— 用户点一次
+        保存，要么都生效要么都报错。分成多次调用会出现"勾选成功、
+        参数失败"的半成品状态。
+
+        为什么不用循环调 set_autostart：每个 profile 要起一个 node，
+        enable() 里还有冲突检测（起 PowerShell，约 1.5 秒）。批量版
+        只起一个 node，见 lib/autostart.js 的 applyBatch。
+        """
+        if not isinstance(changes, list):
+            return {"ok": False, "error": "changes 必须是数组"}
+
+        script = (
+            "const a=require('./lib/autostart');"
+            f"const r=a.applyBatch({json.dumps(changes, ensure_ascii=False)});"
+            "process.stdout.write(JSON.stringify(r));"
+        )
+        data, err = self._node_json(script, timeout=120)
+        if data is None:
+            return {"ok": False, "error": err or "应用失败"}
+
+        out = dict(data)
+        out["ok"] = bool(data.get("ok")) and not data.get("errors")
+
+        # 设置单独走 Python（毫秒级）。只有传了才写，避免无谓的磁盘写。
+        if isinstance(settings, dict) and settings:
+            s = write_autostart_settings(settings)
+            if not s.get("ok"):
+                out["ok"] = False
+                out["error"] = s.get("error") or "设置写入失败"
+            else:
+                out["settings"] = s.get("settings")
+                # 改了运行器要重建中转器（.lnk 里存的是 pythonw 绝对路径）
+                if "pythonw" in settings and out.get("anyEnabled"):
+                    r2, err2 = self._node_json(
+                        "const a=require('./lib/autostart');"
+                        "const r=a.ensureRelayLnk();"
+                        "process.stdout.write(JSON.stringify(r));"
+                    )
+                    if r2 is not None and not r2.get("ok"):
+                        out["relayWarning"] = r2.get("error") or err2
+        return out
 
     def set_autostart_settings(self, patch):
         """写 local/autostart.json（合并式）。"""

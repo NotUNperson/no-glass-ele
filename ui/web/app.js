@@ -37,6 +37,12 @@ let STATE = {
   logBuffers: {},
   cssDirty: false,
   wizard: null,        // 向导状态
+  // 自启动弹窗的草稿。打开时从 get_autostart_state 填充，之后所有交互
+  // 只改这里；点「保存设置」才一次性提交。
+  //
+  // 为什么要有草稿：弹窗里既有「保存设置」按钮，又有即时生效的勾选，
+  // 用户无法预期关掉弹窗后哪些改动留下了。统一成"全都要保存"最直观。
+  autostartDraft: null,
 };
 
 // 每个会话在缓冲里保留的最大行数。与后端 LogBuffer 的上限（app.py 的
@@ -70,6 +76,55 @@ function unwrap(res, quiet = false) {
     return null;
   }
   return res;
+}
+
+/**
+ * 页面内确认框（替代 window.confirm）。
+ *
+ * 为什么不用 window.confirm：
+ *   · 它是浏览器/WebView 的原生模态框，会**阻塞整个渲染线程** ——
+ *     实测在 pywebview 里一旦弹出，脚本注入和自动化都会卡住，
+ *     只能人工点掉。
+ *   · 样式与主题无关，深色模式下刺眼。
+ *   · 无法被 Esc / 键盘以外的交互取消，也不受页面 z-index 管理。
+ *
+ * @returns {Promise<boolean>}
+ */
+function askConfirm(message, { okText = '确定', cancelText = '取消', danger = false } = {}) {
+  return new Promise((resolve) => {
+    const box = document.createElement('div');
+    box.className = 'confirm-layer';
+    box.innerHTML = `
+      <div class="confirm-box">
+        <div class="confirm-msg">${esc(message)}</div>
+        <div class="confirm-actions">
+          <button class="btn" data-cf="0">${esc(cancelText)}</button>
+          <button class="btn ${danger ? 'danger' : 'primary'}" data-cf="1">${esc(okText)}</button>
+        </div>
+      </div>`;
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey, true);
+      box.remove();
+      resolve(v);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); finish(false); }
+      else if (e.key === 'Enter') { e.stopPropagation(); finish(true); }
+    };
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-cf]');
+      if (b) { finish(b.dataset.cf === '1'); return; }
+      if (e.target === box) finish(false);      // 点遮罩 = 取消
+    });
+    // 捕获阶段拦 Esc/Enter，避免同时触发弹窗自己的快捷键
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(box);
+    const btn = box.querySelector('[data-cf="1"]');
+    if (btn) btn.focus();
+  });
 }
 
 const esc = (s) => String(s == null ? '' : s)
@@ -1408,8 +1463,38 @@ async function openAutostart() {
   await loadAutostartState();
 }
 
-function closeAutostart() {
+/**
+ * 关闭自启动弹窗。
+ *
+ * 有未保存改动时先确认 —— 因为整个弹窗的改动都要点「保存设置」才生效，
+ * 直接关掉会静默丢弃用户刚做的一切。
+ *
+ * @returns {boolean} 是否真的关掉了
+ */
+/**
+ * 关闭自启动弹窗。
+ *
+ * 有未保存改动时先确认 —— 因为整个弹窗的改动都要点「保存设置」才生效，
+ * 直接关掉会静默丢弃用户刚做的一切。
+ *
+ * 用页面内的 askConfirm 而不是 window.confirm：后者会阻塞渲染线程
+ * （在 pywebview 里表现为整个界面卡死，只能人工点掉）。
+ *
+ * @returns {Promise<boolean>} 是否真的关掉了
+ */
+async function closeAutostart(force = false) {
+  const draft = STATE.autostartDraft;
+  if (!force && draft && draft.dirty) {
+    const ok = await askConfirm(
+      '有未保存的自启动修改。直接关闭将丢弃这些修改，确定吗？',
+      { okText: '丢弃并关闭', cancelText: '继续编辑', danger: true }
+    );
+    if (!ok) return false;
+  }
   $('autostartModal').classList.add('hidden');
+  STATE.autostartDraft = null;
+  setAutostartDirty(false);
+  return true;
 }
 
 async function loadAutostartState() {
@@ -1420,53 +1505,98 @@ async function loadAutostartState() {
   }
   STATE.autostart = res;
 
-  // ── profile 勾选列表 ──
-  const enabledSet = new Set((res.enabled || []).map((x) => x.name));
-  const legacySet = new Set((res.legacy || []).map((x) => x.profile));
+  // 从磁盘状态重建草稿。所有交互都改草稿，点「保存设置」才落盘。
+  const draft = { dirty: false, profiles: {}, settings: {}, selectedRunner: null };
   const byName = new Map((res.enabled || []).map((x) => [x.name, x]));
+  for (const n of (res.profiles || [])) {
+    const ent = byName.get(n);
+    const raw = ent ? ent.appArgsRaw : null;
+    draft.profiles[n] = {
+      enabled: !!ent,
+      // 三态：inherit（继承顶层）/ none（明确无参数）/ custom（用这组）
+      argsMode: raw === null ? 'inherit' : (raw.length === 0 ? 'none' : 'custom'),
+      argsText: raw === null ? '' : raw.join(', '),
+    };
+  }
+  const st = res.settings || {};
+  draft.settings = {
+    initialDelayMs: st.initialDelayMs || 0,
+    delayMs: st.delayMs || 0,
+    neverWarnStartup: !!st.neverWarnStartup,
+    neverPromptDelete: !!st.neverPromptDelete,
+    pythonw: st.pythonw === undefined ? null : st.pythonw,
+  };
+  STATE.autostartDraft = draft;
+
+  renderAutostartList();
+  renderAutostartSettings();
+  setAutostartDirty(false);
+}
+
+/** 取某个 profile 的顶层 appArgs（不管它有没有启用自启动）。 */
+function topArgsOf(name) {
+  const m = (STATE.autostart && STATE.autostart.topAppArgs) || {};
+  return Array.isArray(m[name]) ? m[name] : [];
+}
+
+/** 渲染 profile 勾选列表（读草稿，不读磁盘）。 */
+function renderAutostartList() {
+  const res = STATE.autostart || {};
+  const draft = STATE.autostartDraft;
+  if (!draft) return;
+
+  const legacySet = new Set((res.legacy || []).map((x) => x.profile));
   const list = $('asList');
   const names = res.profiles || [];
+
   if (!names.length) {
     list.innerHTML = '<p class="dim tiny">还没有 profile。</p>';
-  } else {
-    list.innerHTML = names.map((n) => {
-      const on = enabledSet.has(n);
-      const legacy = legacySet.has(n) ? '<span class="tag legacy" title="存在旧式启动项">旧</span>' : '';
-      const ent = byName.get(n);
-      // 开机参数：null = 继承顶层，[] = 明确无参数。
-      // 用占位符区分这两种，否则用户没法表达"开机时不要任何参数"。
-      const raw = ent ? ent.appArgsRaw : null;
-      const inherited = ent ? (ent.topAppArgs || []) : [];
-      const val = raw === null ? '' : raw.join(', ');
-      const ph = inherited.length
-        ? `继承：${inherited.join(', ')}`
-        : '继承：无';
-      return `
-        <div class="as-item-wrap">
-          <label class="as-item">
-            <input type="checkbox" data-as-name="${esc(n)}" ${on ? 'checked' : ''}>
-            <span class="nm">${esc(n)}</span>
-            ${legacy}
-            <span class="tag${on ? '' : ' hidden'}">已启用</span>
-          </label>
-          <div class="as-args${on ? '' : ' hidden'}" data-as-args-for="${esc(n)}">
-            <input class="input as-args-input" type="text"
-                   data-as-args="${esc(n)}" value="${esc(val)}"
-                   placeholder="${esc(ph)}">
-            <span class="dim tiny">开机专用参数（留空 = 继承上面的启动参数）</span>
-          </div>
-        </div>`;
-    }).join('');
+    return;
   }
 
-  // ── 中转器状态 ──
-  const relay = res.relay || {};
-  $('asRelayState').textContent = relay.exists
-    ? '中转器快捷方式已创建（启用任一应用时自动维护）。'
-    : '中转器快捷方式尚未创建 —— 勾选任一应用后会自动创建。';
+  list.innerHTML = names.map((n) => {
+    const d = draft.profiles[n] || { enabled: false, argsMode: 'inherit', argsText: '' };
+    const on = d.enabled;
+    const legacy = legacySet.has(n)
+      ? '<span class="tag legacy" title="存在旧式启动项">旧</span>' : '';
+    const inherited = topArgsOf(n);
+    const ph = inherited.length ? `继承：${inherited.join(', ')}` : '继承：无';
+    const noneMode = d.argsMode === 'none';
+    return `
+      <div class="as-item-wrap">
+        <label class="as-item">
+          <input type="checkbox" data-as-name="${esc(n)}" ${on ? 'checked' : ''}>
+          <span class="nm">${esc(n)}</span>
+          ${legacy}
+          <span class="tag${on ? '' : ' hidden'}">已启用</span>
+        </label>
+        <div class="as-args${on ? '' : ' hidden'}" data-as-args-for="${esc(n)}">
+          <input class="input as-args-input" type="text"
+                 data-as-args="${esc(n)}" value="${esc(noneMode ? '' : d.argsText)}"
+                 placeholder="${esc(ph)}" ${noneMode ? 'disabled' : ''}>
+          <button class="btn small" data-as-copy="${esc(n)}"
+                  ${inherited.length ? '' : 'disabled'}
+                  title="把 profile 里的正常启动参数复制过来">复制正常参数</button>
+          <label class="check tiny" title="开机时不带任何参数，覆盖上面的启动参数">
+            <input type="checkbox" data-as-none="${esc(n)}" ${noneMode ? 'checked' : ''}>
+            不带任何参数
+          </label>
+        </div>
+      </div>`;
+  }).join('');
+}
 
-  // ── 节奏与开关 ──
-  const st = res.settings || {};
+/** 渲染设置区（读草稿）。 */
+function renderAutostartSettings() {
+  const draft = STATE.autostartDraft;
+  if (!draft) return;
+  const st = draft.settings;
+
+  const relay = (STATE.autostart || {}).relay || {};
+  $('asRelayState').textContent = relay.exists
+    ? '中转器快捷方式已创建（保存后按需维护）。'
+    : '中转器快捷方式尚未创建 —— 保存并启用任一应用后会创建。';
+
   $('asInitial').value = Math.round((st.initialDelayMs || 0) / 1000);
   $('asDelay').value = Math.round((st.delayMs || 0) / 1000);
   $('asNeverWarn').checked = !!st.neverWarnStartup;
@@ -1478,9 +1608,33 @@ async function loadAutostartState() {
   updateAutostartEstimate();
 }
 
+/** 标记草稿脏/净，并更新底部状态。 */
+function setAutostartDirty(dirty) {
+  if (STATE.autostartDraft) STATE.autostartDraft.dirty = !!dirty;
+  $('asStatus').textContent = dirty ? '● 有未保存的修改' : '';
+  $('asStatus').className = dirty ? 'dim tiny dirty-dot' : 'dim tiny';
+}
+
+/** 把某个 profile 的草稿改动标记为脏并重绘它那一行。 */
+function touchAutostart(name) {
+  setAutostartDirty(true);
+  const d = STATE.autostartDraft.profiles[name];
+  if (!d) return;
+  // 只更新这一行的显隐与状态，避免整表重绘导致输入框失焦
+  const wrap = $('asList').querySelector(`[data-as-args-for="${name}"]`);
+  if (wrap) wrap.classList.toggle('hidden', !d.enabled);
+  const row = $('asList').querySelector(`input[data-as-name="${name}"]`);
+  if (row) {
+    const tag = row.closest('.as-item').querySelector('.tag');
+    if (tag) tag.classList.toggle('hidden', !d.enabled);
+  }
+}
+
 /** 显示「预计 N 秒内全部启动」。 */
 function updateAutostartEstimate() {
-  const n = $('asList').querySelectorAll('input[type=checkbox]:checked').length;
+  const draft = STATE.autostartDraft;
+  if (!draft) return;
+  const n = Object.values(draft.profiles).filter((x) => x.enabled).length;
   const initial = Number($('asInitial').value) || 0;
   const delay = Number($('asDelay').value) || 0;
   if (!n) {
@@ -1491,75 +1645,49 @@ function updateAutostartEstimate() {
   $('asEstimate').textContent = `预计 ${total} 秒内全部启动（${n} 个应用，最后一个在第 ${total} 秒）。`;
 }
 
-/** 勾选/取消某个 profile 的自启动（立即生效，不等“保存设置”）。 */
-async function toggleAutostart(name, enabled) {
-  const res = await api().set_autostart(name, enabled);
-  if (!res || res.ok === false) {
-    toast((res && res.error) || '操作失败', 'err', 6000);
-    await loadAutostartState();
-    return;
-  }
-
-  // 关掉最后一项时，问是否删除中转器
-  if (!enabled && res.shouldPromptDelete) {
-    const st = STATE.autostart && STATE.autostart.settings;
-    if (!(st && st.neverPromptDelete)) {
-      const del = window.confirm(
-        '现在没有任何应用启用自启动了。\n\n'
-        + '要删除中转器快捷方式吗？\n'
-        + '（留着的话，开机它会起来、发现没东西可启动、然后退出）'
-      );
-      if (del) await api().remove_relay_lnk();
-    }
-  }
-  toast(enabled ? `已启用 ${name} 的开机自启动` : `已关闭 ${name} 的开机自启动`, 'ok');
-  await loadAutostartState();
-  await refresh();
+/** 勾选/取消某个 profile 的自启动 —— 只改草稿，点「保存设置」才落盘。 */
+function toggleAutostart(name, enabled) {
+  const d = STATE.autostartDraft && STATE.autostartDraft.profiles[name];
+  if (!d) return;
+  d.enabled = !!enabled;
+  touchAutostart(name);
+  updateAutostartEstimate();
 }
 
 /**
- * 保存某个 profile 的「开机专用参数」（autostart.appArgs）。
+ * 读取某个 profile 的「开机专用参数」草稿，折成提交用的三态值。
  *
- * 三态语义（与 lib/autostart.js 的 effectiveAppArgs 一致）：
- *   输入框留空       → 继承顶层 appArgs
- *   输入一个特殊标记 → 明确无参数
- *   填了内容         → 用这组
+ * 与 lib/autostart.js 的 effectiveAppArgs 一一对应：
+ *   inherit → null（沿用顶层 appArgs）
+ *   none    → []（明确无参数，覆盖顶层）
+ *   custom  → [...]
  *
- * 为什么需要"明确无参数"这一态：有些应用手动启动要 --hidden（静默到托盘），
+ * 为什么要"明确无参数"这一态：有些应用手动启动要 --hidden（静默到托盘），
  * 但开机时反而要显示窗口。这时开机参数必须是 []，而不是继承。
- * 留空表达不了，所以用占位符 + 一个显式的勾选项。
  */
-async function saveAutostartAppArgs(name, text) {
-  const raw = String(text == null ? '' : text).trim();
-  let args;
-  if (raw === '') {
-    args = null;                       // 继承顶层
-  } else if (raw === '-') {
-    args = [];                         // 明确无参数
-  } else {
-    args = raw.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
-  }
-  const res = await api().set_autostart_app_args(name, args);
-  if (!res || res.ok === false) {
-    toast((res && res.error) || '保存开机参数失败', 'err', 6000);
-    return;
-  }
-  const eff = res.effective || [];
-  const what = args === null
-    ? `继承顶层（${eff.join(', ') || '无'}）`
-    : (args.length ? args.join(' ') : '无参数');
-  toast(`${name} 开机参数：${what}`, 'ok', 4000);
+function draftArgsValue(name) {
+  const d = STATE.autostartDraft.profiles[name];
+  if (!d || d.argsMode === 'inherit') return null;
+  if (d.argsMode === 'none') return [];
+  return String(d.argsText || '').split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+}
 
-  // 刻意**不**调 loadAutostartState()：那会重绘整个 asList，
-  // 用户正在这个输入框里、刚敲完回车，重绘会把焦点和光标位置一起丢掉。
-  // 这里只更新占位符（它显示"继承的是什么"）。
+/** 把 profile 的正常启动参数复制到开机参数输入框（供在此基础上改）。 */
+function copyNormalArgs(name) {
+  const d = STATE.autostartDraft.profiles[name];
+  if (!d) return;
+  const top = topArgsOf(name);
+  if (!top.length) return;
+  d.argsText = top.join(', ');
+  d.argsMode = 'custom';
+  setAutostartDirty(true);
   const el = $('asList').querySelector(`[data-as-args="${name}"]`);
   if (el) {
-    const ent = (STATE.autostart && STATE.autostart.enabled || [])
-      .find((x) => x.name === name);
-    const top = (ent && ent.topAppArgs) || [];
-    el.placeholder = top.length ? `继承：${top.join(', ')}` : '继承：无';
+    el.value = d.argsText;
+    el.disabled = false;
   }
+  const cb = $('asList').querySelector(`[data-as-none="${name}"]`);
+  if (cb) cb.checked = false;
 }
 
 /** 检测可用的 pythonw（真跑一次）。 */
@@ -1572,33 +1700,87 @@ async function detectRunners() {
     $('asRunnerState').textContent = '检测失败：' + ((res && res.error) || '未知错误');
     return;
   }
-  $('asRunnerState').textContent = res.selected
-    ? '当前会使用：' + res.selected
+  // 草稿里已选了运行器就显示草稿的（还没保存，但用户想看到自己的选择）
+  const draftPick = STATE.autostartDraft && STATE.autostartDraft.selectedRunner;
+  const effective = draftPick || res.selected;
+  $('asRunnerState').textContent = effective
+    ? (draftPick ? '将切换为：' : '当前会使用：') + effective
     : '没有可用运行器';
-  box.innerHTML = (res.items || []).map((it) => `
-    <div class="as-runner ${it.ok ? '' : 'bad'}" data-runner="${esc(it.path)}" data-ok="${it.ok ? '1' : '0'}">
+  box.innerHTML = (res.items || []).map((it) => {
+    const picked = draftPick ? it.path === draftPick : it.selected;
+    return `
+    <div class="as-runner ${it.ok ? '' : 'bad'}${picked ? ' picked' : ''}"
+         data-runner="${esc(it.path)}" data-ok="${it.ok ? '1' : '0'}">
       <span>${it.ok ? '✓' : '✗'}</span>
       <span style="flex:1">${esc(it.path)}</span>
       <span class="ver">${esc(it.version || '不可用')}</span>
-      ${it.selected ? '<span class="pick">当前</span>' : ''}
-    </div>`).join('') || '<p class="dim tiny">没有找到任何候选。</p>';
+      ${picked ? `<span class="pick">${draftPick ? '将切换' : '当前'}</span>` : ''}
+    </div>`;
+  }).join('') || '<p class="dim tiny">没有找到任何候选。</p>';
 }
 
+/**
+ * 保存整个自启动弹窗的改动（唯一的落盘入口）。
+ *
+ * 一次事务：profile 开关 + 开机参数 + 节奏/开关/运行器。
+ * 任一步失败都保留草稿（不清 dirty），用户不用重填。
+ */
 async function saveAutostartSettings() {
-  const patch = {
+  const draft = STATE.autostartDraft;
+  if (!draft) return;
+
+  const changes = Object.entries(draft.profiles).map(([name, d]) => ({
+    name,
+    enabled: !!d.enabled,
+    appArgs: draftArgsValue(name),
+  }));
+
+  const settings = {
     initialDelayMs: Math.max(0, Math.min(120, Number($('asInitial').value) || 0)) * 1000,
     delayMs: Math.max(0, Math.min(120, Number($('asDelay').value) || 0)) * 1000,
     neverWarnStartup: $('asNeverWarn').checked,
     neverPromptDelete: $('asNeverPrompt').checked,
   };
-  const res = await api().set_autostart_settings(patch);
-  if (!res || res.ok === false) {
-    toast((res && res.error) || '保存失败', 'err', 6000);
-    return;
+  if (draft.selectedRunner !== null) settings.pythonw = draft.selectedRunner;
+
+  const btn = $('asSave');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  let res;
+  try {
+    res = await api().apply_autostart(changes, settings);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
   }
-  if (res.relayWarning) toast('设置已保存，但重建中转器失败：' + res.relayWarning, 'warn', 8000);
-  else toast('自启动设置已保存', 'ok');
+
+  if (!res || res.ok === false) {
+    const errs = (res && res.errors) || [];
+    const detail = errs.length
+      ? errs.map((e) => `${e.name}: ${e.error}`).join('；')
+      : (res && res.error) || '保存失败';
+    toast(detail, 'err', 8000);
+    return;                      // 草稿保留，用户可直接重试
+  }
+
+  // 关掉最后一项时，问是否删除中转器（沿用原行为）
+  if (res.shouldPromptDelete && !settings.neverPromptDelete) {
+    const del = await askConfirm(
+      '现在没有任何应用启用自启动了。要删除中转器快捷方式吗？'
+      + '（留着的话，开机它会起来、发现没东西可启动、然后退出）',
+      { okText: '删除中转器', cancelText: '保留', danger: true }
+    );
+    if (del) await api().remove_relay_lnk();
+  }
+
+  if (res.relayWarning) {
+    toast('已保存，但重建中转器失败：' + res.relayWarning, 'warn', 8000);
+  } else {
+    toast('自启动设置已保存', 'ok');
+  }
   await loadAutostartState();
+  await refresh();
 }
 
 // ─────────────────────────── 绑定 ───────────────────────────
@@ -1609,35 +1791,55 @@ function bindUI() {
   $('btnNew').onclick = openWizard;
   // 开机自启动弹窗
   $('btnAutostart').onclick = openAutostart;
-  $('asClose').onclick = closeAutostart;
-  $('asClose2').onclick = closeAutostart;
+  // 注意不能直接赋 closeAutostart：onclick 会把 MouseEvent 当第一个参数
+  // 传进去，而 force 是布尔 —— 事件对象是 truthy，警告就被跳过了。
+  $('asClose').onclick = () => closeAutostart();
+  $('asClose2').onclick = () => closeAutostart();
   $('asSave').onclick = saveAutostartSettings;
   $('asDetect').onclick = detectRunners;
   $('asOpenUser').onclick = () => api().open_startup_folder('user');
   $('asOpenSystem').onclick = () => api().open_startup_folder('system');
-  // 勾选变化：立即生效 + 更新预计时间
+  // 勾选变化：只改草稿（点「保存设置」才落盘）
   $('asList').addEventListener('change', (e) => {
     const cb = e.target;
-    if (cb && cb.dataset && cb.dataset.asName) {
+    if (!cb || !cb.dataset) return;
+
+    if (cb.dataset.asName) {
       toggleAutostart(cb.dataset.asName, cb.checked);
+      return;
+    }
+
+    // 开机参数输入框
+    if (cb.dataset.asArgs) {
+      const d = STATE.autostartDraft.profiles[cb.dataset.asArgs];
+      if (!d) return;
+      d.argsText = cb.value;
+      // 有内容就是 custom；清空则回到 inherit
+      d.argsMode = String(cb.value || '').trim() ? 'custom' : 'inherit';
+      setAutostartDirty(true);
+      return;
+    }
+
+    // 「不带任何参数」复选框
+    if (cb.dataset.asNone) {
+      const name = cb.dataset.asNone;
+      const d = STATE.autostartDraft.profiles[name];
+      if (!d) return;
+      d.argsMode = cb.checked ? 'none' : (String(d.argsText || '').trim() ? 'custom' : 'inherit');
+      const el = $('asList').querySelector(`[data-as-args="${name}"]`);
+      if (el) el.disabled = cb.checked;
+      setAutostartDirty(true);
+      return;
     }
   });
-  // 开机专用参数：失焦或回车时保存。
-  //
-  // 用 change（失焦触发）而不是 input：每敲一个字符就存一次会写盘，
-  // 而且用户还没敲完就被重载会丢焦点。
-  $('asList').addEventListener('change', (e) => {
-    const el = e.target;
-    if (!el || !el.dataset || !el.dataset.asArgs) return;
-    saveAutostartAppArgs(el.dataset.asArgs, el.value);
+  // 「复制正常参数」按钮
+  $('asList').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-as-copy]');
+    if (!b) return;
+    copyNormalArgs(b.dataset.asCopy);
   });
-  $('asList').addEventListener('keydown', (e) => {
-    const el = e.target;
-    if (!el || !el.dataset || !el.dataset.asArgs) return;
-    if (e.key === 'Enter') { el.blur(); }   // 触发上面的 change
-  });
-  // 点运行器行：切到手动指定
-  $('asRunners').addEventListener('click', async (e) => {
+  // 点运行器行：只记进草稿，点「保存设置」才切换并重建中转器
+  $('asRunners').addEventListener('click', (e) => {
     const row = e.target.closest('.as-runner');
     if (!row) return;
     if (row.dataset.ok !== '1') {
@@ -1645,17 +1847,45 @@ function bindUI() {
       return;
     }
     const p = row.dataset.runner;
-    const r = await api().set_autostart_settings({ pythonw: p });
-    if (r && r.ok) {
-      toast('已切换到该运行器，并重建中转器', 'ok');
-      if (r.relayWarning) toast('但重建中转器失败：' + r.relayWarning, 'warn', 8000);
-      await loadAutostartState();
-    } else {
-      toast((r && r.error) || '切换失败', 'err');
-    }
+    if (!STATE.autostartDraft) return;
+    STATE.autostartDraft.selectedRunner = p;
+    STATE.autostartDraft.settings.pythonw = p;
+    setAutostartDirty(true);
+    $('asRunnerState').textContent = `将切换为：${p}`;
+    // 标记选中的那一行
+    $('asRunners').querySelectorAll('.as-runner').forEach((el) => {
+      el.classList.toggle('picked', el === row);
+    });
   });
-  $('asInitial').addEventListener('input', updateAutostartEstimate);
-  $('asDelay').addEventListener('input', updateAutostartEstimate);
+  // 节奏改动也只进草稿
+  $('asInitial').addEventListener('input', () => {
+    if (STATE.autostartDraft) {
+      STATE.autostartDraft.settings.initialDelayMs =
+        Math.max(0, Math.min(120, Number($('asInitial').value) || 0)) * 1000;
+    }
+    setAutostartDirty(true);
+    updateAutostartEstimate();
+  });
+  $('asDelay').addEventListener('input', () => {
+    if (STATE.autostartDraft) {
+      STATE.autostartDraft.settings.delayMs =
+        Math.max(0, Math.min(120, Number($('asDelay').value) || 0)) * 1000;
+    }
+    setAutostartDirty(true);
+    updateAutostartEstimate();
+  });
+  $('asNeverWarn').addEventListener('change', () => {
+    if (STATE.autostartDraft) {
+      STATE.autostartDraft.settings.neverWarnStartup = $('asNeverWarn').checked;
+    }
+    setAutostartDirty(true);
+  });
+  $('asNeverPrompt').addEventListener('change', () => {
+    if (STATE.autostartDraft) {
+      STATE.autostartDraft.settings.neverPromptDelete = $('asNeverPrompt').checked;
+    }
+    setAutostartDirty(true);
+  });
   $('btnDoctor').onclick = async () => {
     unwrap(await api().run_task('doctor'));
     focusTaskTab();          // 输出在任务标签里，切过去才看得见
@@ -1726,7 +1956,10 @@ function bindUI() {
     if (e.key !== 'Escape') return;
     // 先关最上层的弹窗。设置弹窗原先不支持 Esc（只有向导支持），
     // 键盘用户按 Esc 没反应会以为卡住了。
-    if (!$('autostartModal').classList.contains('hidden')) { closeAutostart(); return; }
+    if (!$('autostartModal').classList.contains('hidden')) {
+      closeAutostart();            // 异步：有未保存改动时会先弹页面内确认
+      return;
+    }
     if (!$('wizard').classList.contains('hidden')) closeWizard();
   });
 }

@@ -901,8 +901,14 @@ def run():
             check("detect_pythonw 可调用", det.get("ok") is True and isinstance(det.get("items"), list),
                   True, str(det)[:140])
 
+            # 关闭弹窗。此时可能有未保存改动（前面点过检测按钮等），
+            # 会弹页面内确认框 —— 点「丢弃并关闭」。
             win.evaluate_js("document.getElementById('asClose').click()")
-            time.sleep(0.3)
+            time.sleep(0.5)
+            win.evaluate_js(
+                "(() => { const b = document.querySelector("
+                "'.confirm-box [data-cf=\"1\"]'); if (b) b.click(); })()")
+            time.sleep(0.4)
             check("弹窗能关闭",
                   win.evaluate_js(
                       "document.getElementById('autostartModal').classList.contains('hidden')"),
@@ -1427,21 +1433,30 @@ def run():
                   _bad_ghosts, [], str(_bad_ghosts))
 
             # 41) Esc 能关闭设置弹窗
+            #
+            # 注意：closeAutostart 现在是异步的（有未保存改动时会先弹
+            # 页面内确认框）。这里重新加载状态把草稿重置为"干净"，
+            # 验证无改动时 Esc 直接关。
+            win.evaluate_js("loadAutostartState()")
+            time.sleep(1.2)
             _esc_ok = win.evaluate_js("""
               (() => {
                 const m = document.getElementById('autostartModal');
                 m.classList.remove('hidden');
                 const before = !m.classList.contains('hidden');
                 document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
-                const after = m.classList.contains('hidden');
-                return JSON.stringify({ before, after });
+                return JSON.stringify({ before });
               })()
             """)
             try:
                 _eo = _json_tpl.loads(_esc_ok or "{}")
             except Exception:                            # noqa: BLE001
                 _eo = {}
-            check("Esc 能关闭设置弹窗", _eo.get("after") is True, True, str(_eo))
+            time.sleep(0.4)
+            _esc_after = win.evaluate_js(
+                "document.getElementById('autostartModal').classList.contains('hidden')")
+            check("Esc 能关闭设置弹窗", _esc_after is True, True,
+                  str(_eo) + f" after={_esc_after}")
 
             # 44) bundle 产物必须自带许可证
             #
@@ -1607,6 +1622,84 @@ def run():
                     A.Api().set_autostart("_smoke_autostart", False)
                 except Exception:                    # noqa: BLE001
                     pass
+
+            # 47) 自启动弹窗：整个弹窗手动保存（草稿模型）
+            #
+            # 用户报告：弹窗里有「保存设置」按钮，但勾选其实是即时生效的，
+            # 关掉弹窗后无法预期哪些改动留下了。
+            #
+            # 这里验证前端源码层面的契约（真实交互另由 pywebview 手测覆盖）：
+            #   · 勾选 handler 不再调 api().set_autostart
+            #   · 只有 saveAutostartSettings 调 apply_autostart
+            #   · closeAutostart 有未保存确认
+            _js = (A.ROOT / "ui" / "web" / "app.js").read_text(encoding="utf-8")
+
+            _toggle_body = _js.split("function toggleAutostart(", 1)
+            _has_toggle = len(_toggle_body) == 2
+            check("toggleAutostart 存在", _has_toggle, True)
+            if _has_toggle:
+                # 取到下一个顶层 function 之前的内容
+                _seg = _toggle_body[1].split("\nfunction ", 1)[0]
+                check("勾选不再即时写盘",
+                      "api().set_autostart(" not in _seg, True,
+                      _seg[:160])
+
+            check("保存走批量接口 apply_autostart",
+                  "api().apply_autostart(" in _js, True)
+            check("关闭时检查未保存改动",
+                  "有未保存的自启动修改" in _js, True)
+            # 事件绑定不能把 MouseEvent 当 force 传进去
+            check("关闭按钮不会误传事件对象当 force",
+                  "$('asClose').onclick = () => closeAutostart()" in _js, True)
+
+            # 批量 API：一次调用完成多个 profile 的改动
+            _bp2 = A.PROFILES_DIR / "smokebatch1.json"
+            _bp3 = A.PROFILES_DIR / "smokebatch2.json"
+            try:
+                _exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                    "System32", "notepad.exe")
+                for _nm, _port in (("smokebatch1", 19991), ("smokebatch2", 19992)):
+                    (_bp2 if _nm == "smokebatch1" else _bp3).write_text(
+                        _json_tpl.dumps({
+                            "name": _nm, "displayName": _nm, "exe": _exe,
+                            "processName": "notepad", "defaultPort": _port,
+                            "appArgs": ["--disable-lcd-text"],
+                            "autostart": {"enabled": False, "appArgs": None},
+                        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                _bapi = A.Api()
+                _br = _bapi.apply_autostart([
+                    {"name": "smokebatch1", "enabled": True, "appArgs": ["--hidden"]},
+                    {"name": "smokebatch2", "enabled": True, "appArgs": []},
+                ], None)
+                check("批量应用成功", _br.get("ok") is True, True, str(_br)[:200])
+                check("批量应用覆盖两个 profile",
+                      sorted(_br.get("applied") or []),
+                      ["smokebatch1", "smokebatch2"], str(_br.get("applied")))
+                _p1 = A.read_profile("smokebatch1")
+                _p2b = A.read_profile("smokebatch2")
+                check("批量写入 enabled",
+                      _p1["autostart"]["enabled"] and _p2b["autostart"]["enabled"], True)
+                check("批量写入 appArgs（自定义）",
+                      _p1["autostart"]["appArgs"], ["--hidden"])
+                check("批量写入 appArgs（明确空）",
+                      _p2b["autostart"]["appArgs"], [])
+            finally:
+                for _p in (_bp2, _bp3):
+                    try:
+                        _p.unlink()
+                    except Exception:                # noqa: BLE001
+                        pass
+
+            # topAppArgs 必须覆盖**全部** profile，不只是已启用的 ——
+            # 「复制正常参数」在勾选瞬间就要能读到（那一刻 enabled 还是 false）。
+            _st_top = A.Api().get_autostart_state()
+            check("get_autostart_state 返回全部 profile 的 topAppArgs",
+                  isinstance(_st_top.get("topAppArgs"), dict)
+                  and len(_st_top.get("topAppArgs") or {}) == len(_st_top.get("profiles") or []),
+                  True,
+                  f"top={len(_st_top.get('topAppArgs') or {})} "
+                  f"profiles={len(_st_top.get('profiles') or [])}")
 
             # 42) 注入器拒绝同一 profile 的第二个会话
             #
