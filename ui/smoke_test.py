@@ -9,6 +9,7 @@ UI 冒烟测试 —— 真的开一个窗口，验证渲染与 API 桥，然后�
 有硬超时保护，绝不会挂住会话。
 """
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -1457,6 +1458,25 @@ def run():
                 "document.getElementById('autostartModal').classList.contains('hidden')")
             check("Esc 能关闭设置弹窗", _esc_after is True, True,
                   str(_eo) + f" after={_esc_after}")
+
+            # 48) 样式表必须覆盖 ::backdrop
+            #
+            # 真实缺口（2026-10-22 实测）：`*`、`*::before`、`*::after`
+            # 选不中 `::backdrop`（<dialog> 全屏遮罩 / popover 背板用的
+            # 伪元素）。实测 dialog::backdrop 的 backdrop-filter 仍是
+            # blur(10px)；加上 ::backdrop 选择器后变 none。
+            #
+            # 同时锁住「不要清 --tw-* 变量」这个结论：实测
+            # `--x: initial` 会让 `var(--x, blur(8px))` 触发 fallback，
+            # 结果从 blur(12px) 变成 blur(8px) —— 比不处理更差。
+            _css_text = (A.ROOT / "css" / "no-glass.css").read_text(encoding="utf-8")
+            # 只看规则体，排除注释里的提及
+            _css_rules = re.sub(r"/\*.*?\*/", "", _css_text, flags=re.S)
+            check("样式表选择器包含 ::backdrop", "::backdrop" in _css_rules, True)
+            check("样式表仍置 backdrop-filter: none",
+                  "backdrop-filter: none !important" in _css_rules, True)
+            check("样式表不清 --tw-* 变量",
+                  "--tw-backdrop" not in _css_rules, True)
 
             # 44) bundle 产物必须自带许可证
             #

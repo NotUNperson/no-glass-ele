@@ -31,10 +31,26 @@
    干掉所有背景模糊 —— 这就是全部内容
    说明：模糊工具类通常没有 !important，
         所以这里的 none !important 一定胜出。
+
+   ::backdrop 是 <dialog> 全屏遮罩 / popover 背板用的伪元素，
+   `*`、`*::before`、`*::after` 都选不中它。实测（2026-10-22，
+   Todo清单，822 个元素）：只写前三个选择器时，dialog::backdrop 的
+   backdrop-filter 仍是 blur(10px)；加上 ::backdrop 后变 none。
    -------------------------------------------------------------------------- */
 *,
 *::before,
-*::after {
+*::after,
+::backdrop {
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;
 }
+
+/* 为什么不去清 --tw-backdrop-* 之类的框架变量（实测结论，2026-10-22）：
+   · `backdrop-filter: none !important` 已经覆盖所有写法 ——
+     实测 var(--x)、var(--x, fallback)、字面量三种都变成 none；
+   · 反过来，清变量在某些写法下**更差**：`--x: initial` 会让
+     `backdrop-filter: var(--x, blur(8px))` 触发 fallback，结果从
+     blur(12px) 变成 blur(8px) —— 模糊没去掉，只是变小了；
+   · `--x: ;`（空值）会被当作无效声明丢弃，变量保持原值，等于没做；
+   · 代价是每个元素多 9 个自定义属性的样式计算，收益为 0。
+   所以这里只碰 backdrop-filter 本身。 */
