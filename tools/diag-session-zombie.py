@@ -22,6 +22,7 @@ run/sessions/<profile>-<pid>.json 残留在磁盘上。而存活判断只看
 ────
   python tools/diag-session-zombie.py            # 只观察，不写任何文件
   python tools/diag-session-zombie.py --repro    # 写伪造注册项并观察（结束后自动清理）
+  python tools/diag-session-zombie.py --guard    # 测启动守卫能否识破 PID 复用
   python tools/diag-session-zombie.py --clean    # 只清理可能残留的伪造项
 
 安全
@@ -75,13 +76,14 @@ def observe(label):
     return True
 
 
-def write_fake():
+def write_fake(with_heartbeat=True):
     """写一个伪造的陈旧注册项，pid 指向本进程（一个确实存在的进程）。"""
     sessions.ensure_dirs()
     meta = {
         "id": FAKE_ID,
         "pid": os.getpid(),              # 真实存在的 PID —— 模拟"PID 被复用"
         "profile": "__diag__",
+        "profilePath": str(ROOT / "profiles" / "__diag__.json"),
         "displayName": "【诊断】僵尸会话",
         "appName": "__diag__",
         "processName": None,
@@ -96,16 +98,48 @@ def write_fake():
         "emulateColorScheme": None,
         "darkreader": None,
         "darkreaderTheme": None,
-        # 关键：心跳时间设成很久以前。修复后这应当被识别为 zombie；
+        # 心跳时间设成很久以前：修复后这应当被识别为 zombie；
         # 修复前它会被当成"运行中"，且点停止没反应。
         "startedAt": "2020-01-01T00:00:00.000Z",
-        "lastTick": "2020-01-01T00:00:00.000Z",
+        "lastTick": "2020-01-01T00:00:00.000Z" if with_heartbeat else None,
         "appPid": None,
         "source": "diag",
     }
     FAKE_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
                          encoding="utf-8")
     return FAKE_FILE
+
+
+def guard():
+    """
+    专测启动守卫的 PID 复用识别。
+
+    关键：lastTick 留空（模拟非 watch 会话），这样 zombie 判定返回 False，
+    守卫只能靠「命令行里有没有 noglass.js」来识破 —— 正是开机自启失败
+    的真实场景。
+    """
+    print(f"注册表目录：{sessions.SESS_DIR}")
+    print("\n写入伪造注册项（pid=本进程，lastTick=null）…")
+    f = write_fake(with_heartbeat=False)
+    print(f"  已写 {f}")
+    print(f"  该 pid 指向的进程存活：{sessions._pid_alive(os.getpid())}")
+    print("  但它不是 node.exe/noglass.js —— 应被判为 PID 复用残留。")
+
+    print("\n调用启动守卫 sessions.find_live_session('__diag__')…")
+    try:
+        live = sessions.find_live_session("__diag__")
+    except Exception as e:                               # noqa: BLE001
+        print(f"  抛错：{e}")
+        live = "error"
+    print(f"  判定结果：{live!r}")
+    still = FAKE_FILE.exists()
+    print(f"  伪造注册项还在吗：{still}   ← False 即被清理")
+
+    ok = live is None and not still
+    print("\n【结论】")
+    print("  期望：None + 注册项被清理。")
+    print("  若仍是运行中：守卫又只看 pid 了 —— 开机自启会被误拦。")
+    return ok
 
 
 def clean():
@@ -127,6 +161,8 @@ def main():
     ap = argparse.ArgumentParser(description="复现僵尸会话标签")
     ap.add_argument("--repro", action="store_true",
                     help="写伪造注册项并观察（结束后自动清理）")
+    ap.add_argument("--guard", action="store_true",
+                    help="只测启动守卫对 PID 复用的识别（结束后自动清理）")
     ap.add_argument("--clean", action="store_true", help="只清理伪造项后退出")
     args = ap.parse_args()
 
@@ -134,6 +170,14 @@ def main():
         print("清理伪造项：")
         clean()
         return 0
+
+    if args.guard:
+        try:
+            ok = guard()
+        finally:
+            print("\n清理：")
+            clean()
+        return 0 if ok else 1
 
     print(f"注册表目录：{sessions.SESS_DIR}")
     observe("当前状态（未伪造）")

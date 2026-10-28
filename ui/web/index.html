@@ -284,6 +284,9 @@
         <label class="lbl">参与自启动的应用</label>
         <div id="asList" class="as-list"></div>
         <p class="hint" id="asRelayState"></p>
+        <div class="row hidden" id="asRepairRow">
+          <button class="btn small" id="asRepair">重建中转器（指向当前目录）</button>
+        </div>
         <p class="hint">
           勾选后，每个应用下面会出现<b>开机专用参数</b>：
           输入框留空 = 继承「传给应用的启动参数」；点「复制正常参数」把 profile 里的那组复制过来再改；

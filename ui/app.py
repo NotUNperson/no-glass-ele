@@ -288,13 +288,19 @@ class TaskRunner:
                             "error": f"{profile_name} 已经在运行中（会话 {sid}）。"
                                      f"想换启动方式（例如改用隔离数据）请先停止它。"}
         else:
-            # 无窗口模式也要防重复：查注册表 + 进程表
+            # 无窗口模式也要防重复：查注册表 + 进程表。
+            #
+            # 不能只看 alive：硬关机留下的注册项在开机后会撞上 Windows
+            # PID 复用，那个 pid 可能已经是 svchost 或别的软件（实测
+            # autostart.log 里反复出现「已经在运行中（pid …）」）。
+            # find_live_session 会核对命令行，确认不是本工具的注入器
+            # 就删掉残留项，只拦真会话。
             try:
-                for r in sessions.list_all():
-                    if r.get("profile") == profile_name and r.get("alive"):
-                        return {"ok": False,
-                                "error": f"{profile_name} 已经在运行中"
-                                         f"（pid {r.get('pid')}）。"}
+                live = sessions.find_live_session(profile_name)
+                if live:
+                    return {"ok": False,
+                            "error": f"{profile_name} 已经在运行中"
+                                     f"（pid {live.get('pid')}）。"}
             except Exception:                            # noqa: BLE001
                 pass
 
@@ -1397,6 +1403,35 @@ class Api:
             return {"ok": False, "error": err or "删除失败"}
         return data
 
+    def get_relay_status(self):
+        """
+        读中转器 .lnk 的实际 target/args/workdir，判断是否指向当前仓库。
+
+        为什么单独一个 API、由前端在弹窗打开后异步调用：仓库搬家后
+        .lnk 里的绝对路径不会自动更新，界面需要知道它是否还指向老目录。
+        但 get_autostart_state() 必须保持纯 Python 毫秒级（smoke_test 有
+        性能断言），不能为了这个字段塞一次 node + PowerShell。
+        """
+        script = (
+            "const a=require('./lib/autostart');"
+            "process.stdout.write(JSON.stringify(a.readRelayLnk()));"
+        )
+        data, err = self._node_json(script, timeout=60)
+        if data is None:
+            return {"ok": False, "error": err or "读取中转器失败"}
+        return data
+
+    def repair_relay_lnk(self):
+        """重建中转器快捷方式，让它指向当前仓库（仓库搬家后用）。"""
+        script = (
+            "const a=require('./lib/autostart');"
+            "process.stdout.write(JSON.stringify(a.ensureRelayLnk()));"
+        )
+        data, err = self._node_json(script, timeout=120)
+        if data is None:
+            return {"ok": False, "error": err or "重建中转器失败"}
+        return data
+
     def set_autostart_app_args(self, name, args):
         """
         设置某个 profile 的「开机启动专用参数」（autostart.appArgs）。
@@ -1909,8 +1944,10 @@ def run_autostart_all(dry_run=False):
     2. **失败隔离。** 某个 profile 的 exe 不存在 / JSON 坏了 / 注入器秒退 →
        记日志、继续下一条，绝不中断整个流程。
 
-    3. **除日志外不做任何写操作。** 不改 profile、不删残留、不重建 .lnk。
-       这是"开机自启"不是"维护"，写操作留给人主动触发。
+    3. **除日志与「已被证明失效的会话注册项」外不做写操作。**
+       清理残留是启动守卫的一部分（硬关机 + PID 复用会让开机自启全部
+       被误拦），但仍然不改 profile、不删日志、不重建 .lnk。
+       这是"开机自启"不是"维护"，其余写操作留给人主动触发。
 
     4. **没有启用项时**：写日志；若未设 neverWarnStartup 则拉起 UI 提示。
        此时**不等待延迟**（没东西要启动，没必要空等）。

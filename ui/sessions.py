@@ -36,6 +36,7 @@ sessions.py —— 注入会话的读取与停止请求（Python 侧）
 import datetime
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -344,6 +345,234 @@ def discover_external(force=False):
     _ext_thread.start()
     with _ext_lock:
         return list(_ext_cache["data"])
+
+
+# ─────────────────── 启动守卫：进程身份校验 ───────────────────
+
+# 一次列出所有 node.exe 进程（不只 noglass.js）。
+#
+# 为什么用 '[]' 而不是空输出：必须区分「查询成功但一个都没有」与
+# 「PowerShell 起不来」。前者能证明某个 pid 已被别的进程占用（可以删残留），
+# 后者什么都不能确定（只能退回心跳判断）。
+#
+# 为什么要连无关的 node 进程一起列：PID 复用的新主人很可能也是 node.exe
+# （VS Code、开发服务器…）。只筛 noglass.js 的话，这类 pid 不在结果里，
+# 就只能靠映像名猜；列出全部 node 后可以直接看它的命令行。
+_NODE_PS = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "$p = @(Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | "
+    "Select-Object ProcessId,CommandLine); "
+    "if ($p.Count -eq 0) { '[]' } else { $p | ConvertTo-Json -Compress }"
+)
+
+
+def _query_node_processes():
+    """
+    列出所有 node.exe 进程，返回 {pid: commandLine|None}。
+
+    查询失败返回 None；查询成功但没有进程返回空字典。
+    None 值表示「进程在，但命令行读不到」（跨权限），不能当成空字符串。
+    """
+    if os.name != "nt":
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", _NODE_PS],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=PS_TIMEOUT_SEC,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        raw = (r.stdout or "").strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+
+    out = {}
+    for d in data:
+        try:
+            pid = int(d.get("ProcessId"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if pid > 0:
+            cl = d.get("CommandLine")
+            out[pid] = None if cl is None else str(cl)
+    return out
+
+
+def _cmdline_profile(command_line):
+    """从命令行里取 --profile 的值（支持带引号/不带引号）。"""
+    m = re.search(r'--profile\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))',
+                  str(command_line or ""))
+    if not m:
+        return None
+    return m.group(1) or m.group(2) or m.group(3) or None
+
+
+def _cmdline_matches_session(meta, command_line):
+    """
+    命令行的 noglass 进程是否就是 meta 这条注册项对应的那个注入器。
+
+    先比 profile 绝对路径；路径写法不同（相对路径、搬家后的另一份副本）
+    就退一步比文件名。没有 --profile 的旧式启动不猜，按「是」处理 ——
+    宁可拦住，也不能误删一条真会话。
+    """
+    cl = str(command_line or "")
+    if "noglass.js" not in cl.lower():
+        return False
+    prof = _cmdline_profile(cl)
+    if not prof:
+        return True
+
+    meta_path = meta.get("profilePath")
+    if meta_path:
+        try:
+            if os.path.normcase(os.path.normpath(prof)) == \
+                    os.path.normcase(os.path.normpath(meta_path)):
+                return True
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            if Path(prof).stem.lower() == Path(meta_path).stem.lower():
+                return True
+        except Exception:                                # noqa: BLE001
+            pass
+
+    try:
+        return Path(prof).stem.lower() == str(meta.get("profile") or "").lower()
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _pid_image_name(pid):
+    """
+    用 tasklist 取某个 pid 的映像名。
+
+    PowerShell 进程表查询失败时的廉价兜底：只要映像名不是 node.exe，
+    就能确定这个 pid 已被别的软件占用，没必要再保守拦截。
+    """
+    if os.name != "nt":
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        line = (r.stdout or "").strip()
+        if not line.startswith('"'):
+            return None                     # 没匹配到进程（或本地化的提示行）
+        return line.split('","', 1)[0].strip('"').lower() or None
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _remove_registration(meta):
+    """删除一条已被证明失效的注册项（JSON + 停止文件）。不碰日志。"""
+    for key in ("__file", "__stopFile"):
+        p = meta.get(key)
+        if not p:
+            continue
+        try:
+            Path(p).unlink()
+        except Exception:                                # noqa: BLE001
+            pass
+
+
+def find_live_session(profile_name):
+    """
+    找出某个 profile **真正**还在跑的注入会话；没有则返回 None。
+
+    为什么不能只看 pid：硬关机留下的注册项在开机后会撞上 Windows PID
+    复用，pid 随便被 svchost / 别的软件拿到，只看存活就会永远报
+    「已经在运行中」，开机自启全部失败（实测日志里有 pid 25324/17088）。
+
+    判定：
+      · pid 存活 → 一次进程表查询核对命令行（noglass.js + profile）；
+      · 查询成功且不匹配 → 删除该注册项，继续；
+      · 查询失败 → 心跳 zombie + tasklist 映像名兜底（不删真会话）；
+      · 再查已缓存的外部发现，覆盖「旧版本启动 / 注册项被删」的注入器。
+
+    本函数只删除**已被证明失效**的注册项，不会对任何 pid 发 kill。
+    """
+    regs = list_registered(force=True)
+    candidates = [r for r in regs
+                  if r.get("alive") and r.get("profile") == profile_name]
+
+    # 没有候选就不查进程表 —— 正常启动路径不付 PowerShell 的开销。
+    procs = _query_node_processes() if candidates else None
+    live = None
+    removed = False
+    for r in candidates:
+        if procs is None:
+            # 无法核对命令行：心跳过期才当残留；否则再用 tasklist 看一眼
+            # 映像名 —— 只要不是 node.exe，就能确定是 PID 复用。
+            if r.get("zombie"):
+                continue
+            _image = _pid_image_name(r.get("pid"))
+            if _image and _image != "node.exe":
+                _remove_registration(r)
+                removed = True
+                continue
+            if live is None:
+                live = r
+            continue
+
+        _pid = int(r.get("pid") or 0)
+        if _pid not in procs:
+            # 不是 node.exe。再用 tasklist 确认一次（WMI 可能漏掉刚启动的）。
+            _image = _pid_image_name(_pid)
+            if _image and _image != "node.exe":
+                _remove_registration(r)
+                removed = True
+            elif live is None:
+                # 映像名是 node.exe 或读不到 → 无法证明是残留，保守拦住。
+                live = r
+            continue
+
+        cl = procs.get(_pid)
+        if not cl:
+            # 是 node.exe，但命令行读不到（跨权限）—— 不能证明不是真会话。
+            if live is None:
+                live = r
+        elif _cmdline_matches_session(r, cl):
+            if live is None:
+                live = r
+        else:
+            # 同一个 pid 是 node.exe，但命令行不是本 profile 的 noglass.js
+            # （无关 node 进程，或另一个 profile 的注入器）→ 旧会话已死。
+            _remove_registration(r)
+            removed = True
+
+    if removed:
+        # 下一次 list_registered 必须重新读盘，否则 UI 还会显示刚删掉的项。
+        with _reg_lock:
+            _reg_cache["at"] = 0.0
+
+    if live is not None:
+        return live
+
+    # 未登记的外部注入器（旧版本启动 / 注册项被手工删掉）。
+    # 只读 30 秒缓存，不阻塞启动路径；缓存项也要复核 pid 是否还活着。
+    try:
+        for r in discover_external():
+            if r.get("profile") != profile_name:
+                continue
+            if not _pid_alive(r.get("pid")):
+                continue
+            return r
+    except Exception:                                    # noqa: BLE001
+        pass
+    return None
 
 
 # ─────────────────────── 合并视图 ───────────────────────

@@ -47,6 +47,11 @@ const NATIVE_EVERY = 25;      // watch 模式下约每 N 次扫描补一次窗�
 const STOP_POLL_MS = 1000;    // 停止文件检查间隔
 const LIVENESS_EVERY = 5;     // 每 N 次巡检做一次目标应用存活性检查
 
+// 启动守卫的心跳阈值。必须与 lib/sessions.js 的 ZOMBIE_* 保持一致，
+// 否则 CLI/UI 说「残留」、注入器说「还活着」，两边会给出相反结论。
+const SESSION_ZOMBIE_GRACE_SEC = 60;   // 启动宽限期：首次写心跳之前
+const SESSION_ZOMBIE_STALE_SEC = 90;   // 心跳过期：4.5 × 20s 巡检间隔
+
 // ─────────────────────── 会话注册表（run/ 目录）───────────────────────
 /**
  * 为什么要一个注册表：
@@ -83,32 +88,220 @@ function makeSessionId(cfg) {
   return `${slug}-${process.pid}`;
 }
 
+/** 从命令行里取 --profile 的值（支持带引号/不带引号）。 */
+function parseProfileArg(commandLine) {
+  const m = String(commandLine || '').match(/--profile\s+(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  return m ? (m[1] || m[2] || m[3] || null) : null;
+}
+
+/** Windows 路径比较：统一绝对化 + 小写。解析失败返回 false。 */
+function samePath(a, b) {
+  try {
+    return path.resolve(String(a)).toLowerCase() === path.resolve(String(b)).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * 找出同一个 profile 已经在跑的注入器（没有则返回 null）。
+ * 某个注册项是否还对应**同一个注入器**。
  *
- * 只读 run/sessions/*.json，不做进程表查询 —— 存活判定用
- * `process.kill(pid, 0)`，毫秒级，且注入器启动路径上不该起 PowerShell。
+ * 只认两件事：命令行里有 noglass.js；--profile 指向同一个 profile。
+ * 为什么还要比 profile：pid 被复用时，新进程可能恰好也是本工具的注入器
+ * （另一个 profile），那种情况不能算同一条会话。
  *
- * 跳过自己：本进程可能已经登记过（重复调用 main 的场景），
- * 但那时 pid 相同，不会被判成"另一个"。
+ * 没有 --profile 的旧式启动不猜 —— 按「是」处理，宁可拦住也不误删。
+ */
+function sessionProcessMatches(meta, commandLine, wanted) {
+  const cl = String(commandLine || '');
+  if (!/noglass\.js/i.test(cl)) return false;
+  const clProfile = parseProfileArg(cl);
+  if (!clProfile) return true;
+
+  const metaPath = meta && meta.profilePath;
+  if (metaPath && samePath(clProfile, metaPath)) return true;
+
+  // 相对路径 / 搬家后的另一份副本：退一步比文件名。
+  // 同名 profile 说明它们操作的是同一个应用与调试端口，拦住是对的。
+  const stem = path.basename(clProfile, '.json').toLowerCase();
+  if (metaPath && stem === path.basename(metaPath, '.json').toLowerCase()) return true;
+  return stem === String((meta && meta.profile) || wanted || '').toLowerCase();
+}
+
+/**
+ * 一次列出所有 node.exe 进程（不只 noglass.js）。
+ *
+ * 返回 Map<pid, commandLine|null>；查询失败返回 null。
+ *
+ * 为什么必须区分 null 和空 Map：
+ *   · 空 Map = 查询成功，一个 node 进程都没有 → 可以确定那个 pid 已被
+ *     别的进程占用，注册项是残留，放心删；
+ *   · null = PowerShell 起不来/超时 → 什么都不能确定，只能退回心跳判定。
+ *
+ * 为什么连**无关的** node 进程也列出来：PID 复用的新主人很可能也是
+ * node.exe（VS Code、开发服务器……）。只筛 noglass.js 的话，这类 pid
+ * 不在结果里，就只能靠映像名猜；列出全部 node 后可以直接看它的命令行，
+ * 明确不是本工具才删。
+ *
+ * 只在**同 profile 的注册项还活着**时才调用，正常启动路径不付这个开销
+ * （一次 PowerShell 约 0.5–1.5 秒）。
+ */
+function listNodeProcesses() {
+  if (process.platform !== 'win32') return null;
+  const cmd = [
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;',
+    '$p = @(Get-CimInstance Win32_Process -Filter "Name = \'node.exe\'" |',
+    '  Select-Object ProcessId,CommandLine);',
+    "if ($p.Count -eq 0) { '[]' } else { $p | ConvertTo-Json -Compress }",
+  ].join(' ');
+  const raw = ps(cmd);
+  if (!raw) return null;
+  let data;
+  try { data = JSON.parse(raw); } catch { return null; }
+  if (!Array.isArray(data)) data = [data];
+  const out = new Map();
+  for (const p of data) {
+    const pid = Number(p && p.ProcessId);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    // null 表示「进程在，但命令行读不到」（跨权限），不能当成空字符串。
+    out.set(pid, p && p.CommandLine != null ? String(p.CommandLine) : null);
+  }
+  return out;
+}
+
+/**
+ * 用 tasklist 取某个 pid 的映像名。
+ *
+ * PowerShell 进程表查询失败时的廉价兜底：映像名不是 node.exe 就能确定
+ * 这个 pid 已被别的软件占用（硬关机后 PID 复用的典型情形）。
+ */
+function pidImageName(pid) {
+  if (process.platform !== 'win32') return null;
+  try {
+    const out = execFileSync('tasklist',
+      ['/FI', `PID eq ${Number(pid)}`, '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true }).trim();
+    const m = out.match(/^"([^"]+)"/);
+    return m ? m[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 心跳过期判定。与 lib/sessions.js 的 isZombie() 逐条对应。 */
+function sessionIsZombie(meta) {
+  const started = Date.parse((meta && meta.startedAt) || '');
+  if (Number.isNaN(started)) return false;
+  if ((Date.now() - started) / 1000 < SESSION_ZOMBIE_GRACE_SEC) return false;
+
+  const tick = Date.parse((meta && meta.lastTick) || '');
+  // 从未写过心跳：可能是非 watch 会话（不进巡检循环）。不能判它死。
+  if (Number.isNaN(tick)) return false;
+  return (Date.now() - tick) / 1000 > SESSION_ZOMBIE_STALE_SEC;
+}
+
+/** 删除一条残留注册项（JSON + 停止文件），并在会话日志里留一行。 */
+function removeSessionRegistration(entry, reason) {
+  const id = entry.meta.id || path.basename(entry.file, '.json');
+  try { fs.unlinkSync(entry.file); } catch { /* 已经没了 */ }
+  try { fs.unlinkSync(entry.stopFile); } catch { /* 不存在是常态 */ }
+  log(`清理残留会话登记：${id}（pid ${entry.meta.pid} ${reason}）`);
+}
+
+/**
+ * 找出同一个 profile 已经在跑的**真**注入器（没有则返回 null）。
+ *
+ * 老实现只问 `process.kill(pid, 0)`，不校验进程身份。硬关机/强杀留下的
+ * 注册项在开机后会撞上 Windows PID 复用：任意进程（svchost、别的软件）
+ * 拿到那个 PID，守卫就永远报「已有注入会话在运行」，start.cmd 再也起不来。
+ *
+ * 现在的判定顺序：
+ *   1. pid 已死 → 删残留，继续；
+ *   2. pid 活着 → 一次进程表查询，核对命令行是不是 noglass.js + 同一 profile；
+ *   3. 明确不是 → 删残留，继续；
+ *   4. 查询失败 → 心跳 + tasklist 映像名兜底（不是 node.exe 也删）。
+ *
+ * 跳过自己：本进程可能已经登记过（重复调用 main 的场景），pid 相同。
  */
 function findLiveSessionFor(cfg) {
   const wanted = cfg.profile.name || cfg.name;
   if (!wanted) return null;
   let files;
   try { files = fs.readdirSync(SESS_DIR); } catch { return null; }
+
+  const candidates = [];
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
+    const file = path.join(SESS_DIR, f);
     let meta;
-    try { meta = JSON.parse(fs.readFileSync(path.join(SESS_DIR, f), 'utf8')); } catch { continue; }
+    try { meta = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
     if (!meta || meta.profile !== wanted) continue;
     const pid = Number(meta.pid);
     if (!Number.isInteger(pid) || pid <= 0) continue;
     if (pid === process.pid) continue;                 // 自己
-    if (!pidAlive(pid)) continue;                      // 残留项，不算
-    return { id: meta.id || f.replace(/\.json$/, ''), pid };
+
+    const entry = {
+      file,
+      stopFile: path.join(SESS_DIR, `${meta.id || f.replace(/\.json$/, '')}.stop`),
+      meta,
+    };
+    if (!pidAlive(pid)) {
+      removeSessionRegistration(entry, '进程已退出');
+      continue;
+    }
+    candidates.push(entry);
   }
-  return null;
+  if (!candidates.length) return null;
+
+  const procs = listNodeProcesses();
+  let live = null;
+  for (const entry of candidates) {
+    const pid = Number(entry.meta.pid);
+    if (procs === null) {
+      // 查询失败：先按心跳兜底，再用 tasklist 看一眼映像名。
+      // 映像名不是 node.exe 就能确定是 PID 复用，不必保守拦截。
+      if (sessionIsZombie(entry.meta)) {
+        removeSessionRegistration(entry, '心跳已过期且无法校验进程身份');
+      } else {
+        const image = pidImageName(pid);
+        if (image && image !== 'node.exe') {
+          removeSessionRegistration(entry, '已被其它进程占用（进程表查询失败，按映像名判定）');
+        } else if (!live) {
+          live = entry;
+        }
+      }
+      continue;
+    }
+
+    if (!procs.has(pid)) {
+      // 不是 node.exe。再用 tasklist 确认一次（WMI 可能漏掉刚启动的进程）。
+      const image = pidImageName(pid);
+      if (image && image !== 'node.exe') {
+        removeSessionRegistration(entry, '已被其它进程占用');
+      } else if (!live) {
+        // 映像名是 node.exe 或读不到 → 无法证明它是残留，保守拦住。
+        live = entry;
+      }
+      continue;
+    }
+
+    const commandLine = procs.get(pid);
+    if (!commandLine) {
+      // 是 node.exe，但命令行读不到（跨权限）—— 不能证明不是真会话。
+      if (!live) live = entry;
+    } else if (sessionProcessMatches(entry.meta, commandLine, wanted)) {
+      if (!live) live = entry;
+    } else {
+      // 同一个 pid 确实是 node.exe，但命令行不是本 profile 的 noglass.js
+      // （无关 node 进程，或另一个 profile 的注入器）→ 旧会话已死。
+      removeSessionRegistration(entry, '已被其它 node 进程占用');
+    }
+  }
+  if (!live) return null;
+  return {
+    id: live.meta.id || path.basename(live.file, '.json'),
+    pid: Number(live.meta.pid),
+  };
 }
 
 class SessionRegistry {
@@ -981,7 +1174,9 @@ async function main() {
   // UI 里两个标签，停一个另一个还在。
   //
   // 为什么不 require lib/sessions.js：注入器要能单独拷走（bundle），
-  // 保持零内部依赖。这里只读 run/sessions/*.json，逻辑很浅。
+  // 保持零内部依赖。这里读 run/sessions/*.json，并在必要时做一次
+  // 进程表核对（见 findLiveSessionFor —— 只验 pid 存在会把 PID 复用
+  // 当成"还在运行"，硬关机后重启必现）。
   const dup = findLiveSessionFor(cfg);
   if (dup && cfg.force !== true) {
     warn(`「${cfg.profile.name || cfg.name}」已有注入会话在运行（pid ${dup.pid}，${dup.id}）。`);

@@ -1012,7 +1012,14 @@ function cmdAutostart(args) {
     say(`${C.b}开机自启动${C.x}`);
     say();
     if (st.relay && st.relay.exists) {
-      say(`  ${C.g}中转器已就位${C.x} ${dim('（一个快捷方式拉起全部已启用的应用）')}`);
+      if (autostart.relayIsStale(st.relay)) {
+        say(`  ${C.y}中转器仍指向旧目录${C.x} ${dim('（.lnk 里是创建时的绝对路径，仓库搬家后不会自动更新）')}`);
+        say(dim(`    实际参数：${st.relay.args || '（读不到）'}`));
+        say(dim(`    应指向：  ${st.relay.expectedArgs}`));
+        say(dim('    修复：node gen.js autostart repair'));
+      } else {
+        say(`  ${C.g}中转器已就位${C.x} ${dim('（一个快捷方式拉起全部已启用的应用）')}`);
+      }
       say(dim(`    ${st.relay.lnk}`));
     } else {
       say(`  ${C.y}中转器不存在${C.x} ${dim('—— 启用任一 profile 时会自动创建')}`);
@@ -1038,6 +1045,21 @@ function cmdAutostart(args) {
     say();
     say(dim('  开启：node gen.js autostart on <profile>'));
     say(dim('  关闭：node gen.js autostart off <profile>'));
+    say(dim('  搬家后重建中转器：node gen.js autostart repair'));
+    return;
+  }
+
+  // ── repair（仓库搬家后重建中转器）──
+  //
+  // 中转器 .lnk 保存的是创建时的绝对路径。仓库搬到新目录后，快捷方式
+  // 仍然指向旧目录 —— 老目录还在时开机会静默启动老副本，用户完全无感。
+  // 这个动作只重写那一个 .lnk，不动任何 profile。
+  if (action === 'repair') {
+    const r = autostart.ensureRelayLnk();
+    if (!r.ok) { bad(`重建中转器失败：${r.error}`); process.exit(1); }
+    ok(`中转器已重建：${r.lnk}`);
+    say(dim(`  运行器：${r.pythonw}`));
+    say(dim(`  参数：  ${r.args}`));
     return;
   }
 
@@ -1198,7 +1220,7 @@ function cmdAutostart(args) {
     return;
   }
 
-  bad(`未知动作：${action}（可用：on / off / list / run / log / config / cleanup）`);
+  bad(`未知动作：${action}（可用：on / off / list / repair / run / log / config / cleanup）`);
   process.exit(2);
 }
 
@@ -1264,9 +1286,15 @@ function collectDoctorData() {
   //   doctor 在热路径上（UI 的 get_overview 会调它），实测 -c 要 100ms+ 起进程，
   //   不能放这里 —— 真正的实测留给 UI 的「检测」按钮和 `gen.js env`。
   let relayExists = false;
+  let relayStale = false;
+  let relayActualArgs = '';
   try {
-    const st = autostart.listManaged();
+    // 详情走 readAutostartAllCached()：上面的自启动索引已经预热过，
+    // 这里不会额外起 PowerShell。
+    const st = autostart.listManaged({ withRelayDetail: true });
     relayExists = !!(st.relay && st.relay.exists);
+    relayStale = autostart.relayIsStale(st.relay);
+    relayActualArgs = (st.relay && st.relay.args) || '';
   } catch { /* 忽略 */ }
   // pythonw 只在**有 profile 启用自启动时**才需要 —— 没启用就不查，
   // 省掉一次进程启动（doctor 在热路径上，UI 的 get_overview 会调它）。
@@ -1417,6 +1445,13 @@ function collectDoctorData() {
       issues.push(
         'autostart.enabled 为 true，但中转器快捷方式不存在 → 开机不会启动任何东西。' +
         ' 重新执行 `node gen.js autostart on ' + n + '` 会重建它。'
+      );
+    }
+    if (auEnabled && relayExists && relayStale) {
+      issues.push(
+        '中转器快捷方式仍指向其它目录 → 开机启动的是那份副本，不是当前仓库。' +
+        ` 实际参数：${relayActualArgs || '（读不到）'}。` +
+        ' 修复：node gen.js autostart repair（或 UI 自启动弹窗的「重建中转器」）。'
       );
     }
     if (autostart.appArgsDiffer(p)) {
@@ -1754,6 +1789,8 @@ ${C.b}命令${C.x}
   ${C.c}list${C.x}                          列出 profiles 与探测状态
   ${C.c}doctor${C.x}                        校验 exe 存在性、端口冲突、fuse 与预设矛盾
   ${C.c}env${C.x}                           环境自检：Node / Python / pywebview / PowerShell
+  ${C.c}autostart${C.x} <on|off|list|repair|run|log|config|cleanup> [profile]
+                                   管理开机自启动（repair = 搬家后重建中转器）
 
 ${C.b}后台会话${C.x}
   ${C.c}ps${C.x}                            列出运行中的注入会话（含外部启动的）

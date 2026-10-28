@@ -1461,6 +1461,9 @@ async function openAutostart() {
   $('asStatus').textContent = '';
   $('asRunners').classList.add('hidden');
   await loadAutostartState();
+  // 路径检查要起 node + PowerShell（约 0.5–1 秒），异步做，
+  // 不挡弹窗主体渲染。
+  checkRelayStatus();
 }
 
 /**
@@ -1606,6 +1609,82 @@ function renderAutostartSettings() {
     : '自动检测';
 
   updateAutostartEstimate();
+}
+
+/**
+ * 异步检查中转器 .lnk 是否指向当前仓库。
+ *
+ * 为什么单独一次调用：.lnk 里是创建时的绝对路径，仓库搬家后不会自动
+ * 更新；老目录还在时开机会静默启动那份副本。这个检查要起 node +
+ * PowerShell，不能塞进 get_autostart_state（那个接口有毫秒级性能断言）。
+ */
+async function checkRelayStatus() {
+  const el = $('asRelayState');
+  const row = $('asRepairRow');
+  if (!el || !row) return;
+
+  const relay = (STATE.autostart && STATE.autostart.relay) || {};
+  if (!relay.exists) {
+    row.classList.add('hidden');
+    el.textContent = '中转器快捷方式尚未创建 —— 保存并启用任一应用后会创建。';
+    return;
+  }
+
+  el.textContent = '中转器路径检查中…';
+  let res = null;
+  try {
+    res = await api().get_relay_status();
+  } catch (e) {
+    res = null;
+  }
+
+  if (!res || res.ok === false) {
+    row.classList.add('hidden');
+    el.textContent = '中转器快捷方式已创建（无法读取路径：'
+      + ((res && res.error) || '未知错误') + '）。';
+    return;
+  }
+  if (!res.exists) {
+    row.classList.add('hidden');
+    el.textContent = '中转器快捷方式尚未创建 —— 保存并启用任一应用后会创建。';
+    return;
+  }
+  if (res.stale) {
+    row.classList.remove('hidden');
+    el.textContent = '⚠ 中转器仍指向其它目录：' + (res.args || '（读不到参数）')
+      + ' —— 开机时启动的是那份副本，不是当前目录。';
+    return;
+  }
+
+  row.classList.add('hidden');
+  el.textContent = '中转器快捷方式已创建，指向当前目录。';
+}
+
+/** 重建中转器，让它指向当前仓库（仓库搬家后用）。 */
+async function repairRelay() {
+  const btn = $('asRepair');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '重建中…';
+  let res = null;
+  try {
+    res = await api().repair_relay_lnk();
+  } catch (e) {
+    res = { ok: false, error: String(e) };
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+
+  if (!res || res.ok === false) {
+    toast('重建中转器失败：' + ((res && res.error) || '未知错误'), 'err', 8000);
+    return;
+  }
+  toast('中转器已指向当前目录', 'ok');
+  if (STATE.autostart) {
+    STATE.autostart.relay = { ...(STATE.autostart.relay || {}), exists: true };
+  }
+  await checkRelayStatus();
 }
 
 /** 标记草稿脏/净，并更新底部状态。 */
@@ -1781,6 +1860,7 @@ async function saveAutostartSettings() {
   }
   await loadAutostartState();
   await refresh();
+  checkRelayStatus();
 }
 
 // ─────────────────────────── 绑定 ───────────────────────────
@@ -1799,6 +1879,7 @@ function bindUI() {
   $('asDetect').onclick = detectRunners;
   $('asOpenUser').onclick = () => api().open_startup_folder('user');
   $('asOpenSystem').onclick = () => api().open_startup_folder('system');
+  $('asRepair').onclick = repairRelay;
   // 勾选变化：只改草稿（点「保存设置」才落盘）
   $('asList').addEventListener('change', (e) => {
     const cb = e.target;

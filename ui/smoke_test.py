@@ -606,6 +606,40 @@ def run():
             check("list_sessions 可调用", ls.get("ok") is True, True)
             check("list_sessions 返回列表", isinstance(ls.get("sessions"), list), True)
 
+            # 20b) 启动守卫必须识破「PID 活着但不是注入器」的残留项
+            #
+            # 真实事故：硬关机后 run/sessions/*.json 残留，开机后 PID 被
+            # svchost / 别的软件复用，守卫只问「pid 存在」就永远报
+            # 「已经在运行中」，cmd 和开机自启全部失败。
+            #
+            # 这里伪造一条 lastTick=null（zombie=False）的注册项，pid 指向
+            # 冒烟测试自己的 python 进程 —— 只能靠进程身份识别。
+            import json as _json_guard
+            _sess = A.sessions
+            _guard_name = "__smoke_pid_guard__"
+            _guard_id = f"{_guard_name}-{os.getpid()}"
+            _guard_file = _sess.SESS_DIR / f"{_guard_id}.json"
+            try:
+                _sess.ensure_dirs()
+                _guard_file.write_text(_json_guard.dumps({
+                    "id": _guard_id,
+                    "pid": os.getpid(),
+                    "profile": _guard_name,
+                    "profilePath": str(A.PROFILES_DIR / f"{_guard_name}.json"),
+                    "port": 1,
+                    "startedAt": "2020-01-01T00:00:00.000Z",
+                }), encoding="utf-8")
+                _live = _sess.find_live_session(_guard_name)
+                check("启动守卫识破 PID 复用残留", _live is None, True,
+                      f"live={_live!r}")
+                check("PID 复用残留被清理", _guard_file.exists(), False)
+            finally:
+                for _p in (_guard_file, _sess.SESS_DIR / f"{_guard_id}.stop"):
+                    try:
+                        _p.unlink()
+                    except Exception:                    # noqa: BLE001
+                        pass
+
             # 21) 自定义 CSS 读写往返（用临时 profile 名，测完删掉）
             tmp_name = "_smoke_css_test"
             w = api.save_custom_css(tmp_name, "/* smoke */\n.x { color: red; }\n")
@@ -712,6 +746,15 @@ def run():
                   win.evaluate_js(
                       "!document.getElementById('autostartModal').classList.contains('hidden')"),
                   True)
+            # 弹窗打开后会异步检查中转器 .lnk 的真实路径（node+PowerShell）。
+            # 等它结束，否则下面统计 get_autostart_state 的 node 调用次数时
+            # 可能把它算进去（误报性能回归）。
+            for _ in range(100):
+                _relay_txt = win.evaluate_js(
+                    "document.getElementById('asRelayState').textContent") or ""
+                if "检查中" not in _relay_txt:
+                    break
+                time.sleep(0.1)
             n_as = win.evaluate_js("document.querySelectorAll('#asList .as-item').length")
             n_prof = len(A.list_profiles_on_disk())
             check("弹窗列出了全部 profile", n_as == n_prof, True,
@@ -849,6 +892,15 @@ def run():
                   isinstance(_fast.get("enabled"), list)
                   and isinstance(_fast.get("legacy"), list),
                   True, str({k: _fast.get(k) for k in ('enabled', 'legacy')})[:140])
+
+            # 中转器路径详情：单独 API（要起 node + PowerShell），
+            # 不能塞进 get_autostart_state 的毫秒级路径。
+            rs = api.get_relay_status()
+            check("get_relay_status 可调用",
+                  rs.get("ok") is True or bool(rs.get("error")), True, str(rs)[:160])
+            if rs.get("ok"):
+                check("中转器状态含 stale 布尔",
+                      isinstance(rs.get("stale"), bool), True, str(rs)[:160])
 
             # 设置往返
             w_set = api.set_autostart_settings({"neverWarnStartup": True})
@@ -1001,6 +1053,9 @@ def run():
             if detail.get("exists"):
                 check("显式要求时才读详情（target 非 null）",
                       detail.get("target") is not None, True, str(detail)[:120])
+                check("详情含 current / expectedArgs",
+                      ("current" in detail) and ("expectedArgs" in detail),
+                      True, str(detail)[:140])
             else:
                 check("显式要求时才读详情（中转器不存在，跳过）", True, True)
 
@@ -1721,26 +1776,20 @@ def run():
                   f"top={len(_st_top.get('topAppArgs') or {})} "
                   f"profiles={len(_st_top.get('profiles') or [])}")
 
-            # 42) 注入器拒绝同一 profile 的第二个会话
+            # 42) 启动守卫：真会话要拦，PID 复用残留要清
             #
-            # 真实 bug：UI 有防重复，但双击 start.cmd 两次就绕过去了 ——
-            # 两个注入器抢同一个调试端口、写两份注册项。
-            # 验证方式：造一条"活着的"注册项（pid 用本测试进程），
-            # 起注入器，它应该在连端口之前就拒绝。
+            # 真实 bug 有两面：
+            #   · 同一 profile 的第二个注入器必须拒绝（抢同一个调试端口）；
+            #   · 硬关机残留 + PID 被复用给无关进程时**不能**拒绝。
+            # 这里分别造一个「命令行像 noglass.js 的真进程」和
+            # 「pid 活着但命令行不是注入器」的残留项来验证。
             _fake_id = "_smoke_dup_session"
             _fake = A.ROOT / "run" / "sessions" / f"{_fake_id}.json"
+            _sp = A.PROFILES_DIR / "_smoke_dup_prof.json"
+            _fake_js = A.ROOT / "run" / "_smoke_fake_noglass.js"
+            _fake_proc = None
             try:
                 _fake.parent.mkdir(parents=True, exist_ok=True)
-                _fake.write_text(_json_tpl.dumps({
-                    "id": _fake_id,
-                    "profile": "_smoke_dup_prof",
-                    "pid": os.getpid(),
-                    "alive": True,
-                    "startedAt": "2026-10-17T00:00:00Z",
-                    "lastTick": "2026-10-17T00:00:00Z",
-                }), encoding="utf-8")
-                # 造一个最小 profile（不启动应用，只跑到重复检查）
-                _sp = A.PROFILES_DIR / "_smoke_dup_prof.json"
                 _sp.write_text(_json_tpl.dumps({
                     "name": "_smoke_dup_prof", "displayName": "_smoke_dup_prof",
                     "exe": os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
@@ -1748,33 +1797,84 @@ def run():
                     "processName": "notepad", "styleId": "__smoke_dup__",
                     "defaultPort": 19999, "appArgs": [],
                 }), encoding="utf-8")
+
+                # 42a) 真会话：命令行确实是一个 noglass.js 进程
+                _fake_js.write_text("setTimeout(() => {}, 30000);\n",
+                                    encoding="utf-8")
+                _fake_proc = subprocess.Popen(
+                    ["node", str(_fake_js), "--profile", str(_sp)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=A.CREATE_NO_WINDOW)
+                time.sleep(0.4)
+                _fake.write_text(_json_tpl.dumps({
+                    "id": _fake_id,
+                    "profile": "_smoke_dup_prof",
+                    "profilePath": str(_sp),
+                    "pid": _fake_proc.pid,
+                    "alive": True,
+                    "startedAt": "2026-10-17T00:00:00Z",
+                    "lastTick": "2026-10-17T00:00:00Z",
+                }), encoding="utf-8")
+                _dup_run = subprocess.run(
+                    ["node", str(A.INJECTOR), "--profile", str(_sp), "--list"],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=40,
+                    creationflags=A.CREATE_NO_WINDOW)
+                _out = (_dup_run.stdout or "") + (_dup_run.stderr or "")
+                check("注入器拒绝重复会话",
+                      _dup_run.returncode == 3, True,
+                      f"exit={_dup_run.returncode} {_out[:160]}")
+                check("拒绝信息指出已有会话的 pid",
+                      ("已有注入会话" in _out) and (str(_fake_proc.pid) in _out),
+                      True, _out[:160])
+                check("真会话的注册项未被误删", _fake.exists(), True)
+
+                # 42b) PID 复用：pid 活着，但命令行不是 noglass.js。
+                # 故意不写 lastTick，zombie=False —— 只能靠进程身份识别。
                 try:
-                    _dup_run = subprocess.run(
-                        ["node", str(A.INJECTOR), "--profile", str(_sp), "--list"],
-                        cwd=str(A.ROOT), capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", timeout=40,
-                        creationflags=A.CREATE_NO_WINDOW)
-                    _out = (_dup_run.stdout or "") + (_dup_run.stderr or "")
-                    check("注入器拒绝重复会话",
-                          _dup_run.returncode == 3, True,
-                          f"exit={_dup_run.returncode} {_out[:160]}")
-                    check("拒绝信息指出已有会话的 pid",
-                          ("已有注入会话" in _out) and (str(os.getpid()) in _out),
-                          True, _out[:160])
-                finally:
-                    try:
-                        _sp.unlink()
-                    except Exception:                    # noqa: BLE001
-                        pass
-            finally:
-                try:
-                    _fake.unlink()
-                except Exception:                        # noqa: BLE001
+                    _fake_proc.kill()
+                    _fake_proc.wait(timeout=5)
+                except Exception:                    # noqa: BLE001
                     pass
-                for _suffix in (".stop",):
+                _fake_proc = None
+                _fake.write_text(_json_tpl.dumps({
+                    "id": _fake_id,
+                    "profile": "_smoke_dup_prof",
+                    "profilePath": str(_sp),
+                    "pid": os.getpid(),              # 冒烟测试自己，活着但不是注入器
+                    "alive": True,
+                    "startedAt": "2020-01-01T00:00:00Z",
+                }), encoding="utf-8")
+                _stale_run = subprocess.run(
+                    ["node", str(A.INJECTOR), "--profile", str(_sp), "--list"],
+                    cwd=str(A.ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=40,
+                    creationflags=A.CREATE_NO_WINDOW)
+                _stale_out = (_stale_run.stdout or "") + (_stale_run.stderr or "")
+                check("PID 复用残留不会被当成运行中",
+                      "已有注入会话" not in _stale_out, True, _stale_out[:160])
+                check("PID 复用残留被自动清理",
+                      _fake.exists(), False, f"清理日志：{_stale_out[:160]}")
+            finally:
+                if _fake_proc is not None:
                     try:
-                        (A.ROOT / "run" / "sessions" / f"{_fake_id}{_suffix}").unlink()
-                    except Exception:                    # noqa: BLE001
+                        _fake_proc.kill()
+                        _fake_proc.wait(timeout=5)
+                    except Exception:                # noqa: BLE001
+                        pass
+                for _p in (_fake,
+                           A.ROOT / "run" / "sessions" / f"{_fake_id}.stop",
+                           _sp, _fake_js):
+                    try:
+                        _p.unlink()
+                    except Exception:                # noqa: BLE001
+                        pass
+                # 注入器自己登记后正常退出会删；这里兜底清理异常中断的残留。
+                for _p in (A.ROOT / "run" / "sessions").glob("_smoke_dup_prof-*.json"):
+                    try:
+                        _p.unlink()
+                    except Exception:                # noqa: BLE001
                         pass
                 try:
                     (A.ROOT / "run" / "logs" / f"{_fake_id}.log").unlink()

@@ -63,6 +63,7 @@ Python 那两行显示 ✗ 也完全没关系。
 | `logs <id\|profile\|pid> [-n N]` | 看某个会话的日志 |
 | `prune [--logs]` | 清理残留注册项（硬关机留下的）。加 `--logs` 同时删日志 |
 | `autostart on\|off\|list` | 管理开机自启动项（**需要 Python**，见第六节）|
+| `autostart repair` | 重建中转器快捷方式，指向当前仓库（仓库搬家后用）|
 | `env` | 环境自检 |
 
 加 `--json` 可让 `probe` / `list` / `doctor` / `ps` / `logs` / `prune` 输出 JSON
@@ -145,7 +146,11 @@ node gen.js autostart log            # 看日志
 node gen.js autostart log -n 300     # 看更多行
 node gen.js autostart config         # 看延迟/运行器设置
 node gen.js autostart cleanup        # 删中转器快捷方式
+node gen.js autostart repair         # 仓库搬家后重建（.lnk 里是绝对路径）
 ```
+
+`.lnk` 保存的是创建时的绝对路径，换目录后不会自动更新。老目录还在时
+开机会静默启动老副本；`autostart list` 和 `doctor` 会把这种情况标出来。
 
 ### 给开机单独设置参数
 
